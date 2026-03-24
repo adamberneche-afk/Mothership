@@ -1,5 +1,7 @@
 import { Octokit } from '@octokit/rest';
 import { execSync } from 'child_process';
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
@@ -8,20 +10,20 @@ export default async function handler(req, res) {
   const { owner, repo, mode } = req.body;
 
   try {
-     // Fetch Global Context from Hub
-     const universalLessonsPath = path.join(process.cwd(), 'universal_lessons.md');
-     const globalNorthStarPath = path.join(process.cwd(), 'north_star_framework.md');
-     const hubLessonsPath = path.join(process.cwd(), 'hub_lessons.md');
-     
-     const universalLessons = fs.existsSync(universalLessonsPath) 
-         ? fs.readFileSync(universalLessonsPath, 'utf8') 
-         : "";
-     const globalNorthStar = fs.existsSync(globalNorthStarPath) 
-         ? fs.readFileSync(globalNorthStarPath, 'utf8') 
-         : "";
-     const hubLessons = fs.existsSync(hubLessonsPath) 
-         ? fs.readFileSync(hubLessonsPath, 'utf8') 
-         : "";
+      // Fetch Global Context from Hub
+      const universalLessonsPath = join(process.cwd(), 'universal_lessons.md');
+      const globalNorthStarPath = join(process.cwd(), 'north_star_framework.md');
+      const hubLessonsPath = join(process.cwd(), 'hub_lessons.md');
+      
+      const universalLessons = existsSync(universalLessonsPath) 
+          ? readFileSync(universalLessonsPath, 'utf8') 
+          : "";
+      const globalNorthStar = existsSync(globalNorthStarPath) 
+          ? readFileSync(globalNorthStarPath, 'utf8') 
+          : "";
+      const hubLessons = existsSync(hubLessonsPath) 
+          ? readFileSync(hubLessonsPath, 'utf8') 
+          : "";
 
     // Fetch Local Context from the Spoke repo
     let localContext = "";
