@@ -1,0 +1,22 @@
+name: Hub Self-Reflection
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  self-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Hub for self-analysis
+        env:
+          HUB_VERCEL_URL: ${{ secrets.HUB_VERCEL_URL }}
+          GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
+        run: |
+          curl -X POST "${HUB_VERCEL_URL}/api/autonomous_agent" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "owner": "${{ github.repository_owner }}",
+              "repo": "${{ github.event.repository.name }}",
+              "mode": "refactor"
+            }'
