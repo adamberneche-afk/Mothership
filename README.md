@@ -72,6 +72,12 @@ A separate Vercel endpoint, distinct from `autonomous_agent.js`, that runs month
 
 Because this is a proposal mechanism (a PR someone reviews), not an unattended action, it's lower-stakes than issue creation - but it still shouldn't run live before Sprint 0's safety rails have been verified working, since it shares the same `DRY_RUN_MODE` switch and the same underlying AI call.
 
+### Maintenance (`scripts/prune-logs.js`)
+
+Runs weekly (`.github/workflows/prune-logs.yml`, Sunday) as a plain GitHub Actions script - no AI, no Vercel call. For every spoke in `spokes.json`, it partitions `ai_decision_log.json` entries older than `RETENTION_DAYS` (default 90) out into `ai_decision_log_archive.json`, then truncates the live log to what's left. The archive write always happens **before** the live-log truncation, so a failure between the two leaves an entry duplicated in both files rather than lost - safe to just re-run.
+
+This is a plain Node script, not a Vercel endpoint, because it doesn't need the AI model or anything Vercel-specific - only a GitHub token with cross-repo write access. That means it needs its own copy of that token as a **GitHub Actions secret on this repo** (`GLOBAL_GITHUB_TOKEN`) - the Vercel env var of the same name isn't visible to an Actions runner. Supports `workflow_dispatch` with a `dry_run` input that reports what would move without writing anything.
+
 ## Setup Instructions
 
 ### 1. Deploy to Vercel
@@ -119,6 +125,16 @@ This repository's own `.github/workflows/self-reflect.yml` pings the hub's `/api
 | `VERCEL_BYPASS_TOKEN` | A "Protection Bypass for Automation" secret from the Vercel dashboard (Project Settings → Deployment Protection) - required if the deployment has Vercel Deployment Protection enabled, which returns a 403 to any caller that doesn't send it |
 
 Set these under this repository's own Settings → Secrets and variables → Actions. (The hub authenticates to GitHub server-side using its own `GLOBAL_GITHUB_TOKEN` Vercel env var - the workflow doesn't need to send a GitHub token itself.)
+
+### 6. Enable Maintenance (Log Pruning)
+
+Unlike self-analysis and recursive learning, `.github/workflows/prune-logs.yml` doesn't call the Vercel deployment at all - it's a plain Actions script that talks to GitHub directly. It needs its own repository secret:
+
+| Secret | Value |
+|--------|-------|
+| `GLOBAL_GITHUB_TOKEN` | The same GitHub Personal Access Token used as the Vercel env var of the same name - an Actions runner can't read Vercel's environment, so it needs its own copy here |
+
+Set this under this repository's own Settings → Secrets and variables → Actions.
 
 ## How It Works
 
