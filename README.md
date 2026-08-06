@@ -78,6 +78,17 @@ Runs weekly (`.github/workflows/prune-logs.yml`, Sunday) as a plain GitHub Actio
 
 This is a plain Node script, not a Vercel endpoint, because it doesn't need the AI model or anything Vercel-specific - only a GitHub token with cross-repo write access. That means it needs its own copy of that token as a **GitHub Actions secret on this repo** (`GLOBAL_GITHUB_TOKEN`) - the Vercel env var of the same name isn't visible to an Actions runner. Supports `workflow_dispatch` with a `dry_run` input that reports what would move without writing anything.
 
+### Health Reporting (`scripts/health-report.js`)
+
+Runs weekly (`.github/workflows/health-report.yml`) as a plain GitHub Actions script - no AI, no Vercel call. Unlike the `health-report.yml` this repo used to have (deleted for being a non-functional copy-paste of `tso`'s own health tooling - referenced files and a Prisma setup that don't exist here), this one reports on the **hub/swarm's own health**, not any one spoke's codebase:
+
+- For every spoke registered in `spokes.json` (if none are registered yet, the report says so and stops there), counts issues the hub has filed (`cto-hub-auto` label) in the last 7 days, and pulls that spoke's `ai_decision_log.json` entries from the same window.
+- Computes a skip rate (real findings vs. everything skipped) and a per-outcome breakdown per spoke.
+- Infers each spoke's live/dry-run status **from the observed decision-log outcomes**, since a GitHub Actions runner has no way to read the hub's Vercel environment variables directly - if the log shows a `created` entry this window, it reports "live"; if only `dry_run_would_create` entries, it reports "dry-run"; if nothing at all, it says so distinctly from "no findings" (that usually means the spoke's heartbeat isn't actually running).
+- Publishes the report as a single **pinned issue on this repo**, tagged `mothership-health-report`, updated in place on every run rather than creating a new one each time - a deliberate callback to the disaster this whole system exists to avoid repeating.
+
+Like `prune-logs.js`, this needs its own `GLOBAL_GITHUB_TOKEN` Actions secret (see setup below, step 7) - the Vercel env var of the same name isn't visible to an Actions runner.
+
 ## Setup Instructions
 
 ### 1. Deploy to Vercel
@@ -136,6 +147,10 @@ Unlike self-analysis and recursive learning, `.github/workflows/prune-logs.yml` 
 | `GLOBAL_GITHUB_TOKEN` | The same GitHub Personal Access Token used as the Vercel env var of the same name - an Actions runner can't read Vercel's environment, so it needs its own copy here |
 
 Set this under this repository's own Settings → Secrets and variables → Actions.
+
+### 7. Enable Health Reporting
+
+Unlike self-analysis, `.github/workflows/health-report.yml` doesn't call the Vercel deployment at all either - it's a plain Actions script that talks to GitHub directly, and needs the exact same `GLOBAL_GITHUB_TOKEN` secret as step 6 above. If you've already set that up for log pruning, health reporting works with no further setup.
 
 ## How It Works
 
