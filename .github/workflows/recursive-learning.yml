@@ -1,0 +1,22 @@
+name: Recursive Learning
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'  # Monthly, 1st of the month at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Hub for cross-spoke aggregation
+        env:
+          HUB_VERCEL_URL: ${{ secrets.HUB_VERCEL_URL }}
+          # See self-reflect.yml - required while the deployment has Vercel
+          # Deployment Protection enabled.
+          VERCEL_BYPASS_TOKEN: ${{ secrets.VERCEL_BYPASS_TOKEN }}
+        run: |
+          curl -X POST "${HUB_VERCEL_URL}/api/recursive_learning" \
+            -H "Content-Type: application/json" \
+            -H "x-vercel-protection-bypass: ${VERCEL_BYPASS_TOKEN}" \
+            -d '{}'
