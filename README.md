@@ -31,13 +31,15 @@ Global value proposition that defines the emotional UX outcomes:
 The Vercel serverless worker that:
 1. Fetches global context (universal lessons + North Star + hub lessons) from the hub
 2. Fetches local context (project lessons + North Star) from the spoke
-3. Fetches the spoke's latest commit diff - if there's no usable diff, it stops here and does nothing (no AI call, no issue)
-4. Combines contexts and the diff into a prompt for the configured AI model
-5. Requests a strict JSON response that must include a `has_findings` flag
-6. Validates the response's shape before acting on it - a parse failure, a missing field, or `has_findings: false` all result in the run being skipped, not an issue being posted
-7. If dry-run mode is on (the default), a well-formed finding is reported back but never filed as an issue
-8. In live mode, a hard per-repo/per-day cap on issue creation applies before an issue is ever filed
-9. Only when the response is well-formed, reports real findings, dry-run is off, AND the day's cap hasn't been reached does it post a GitHub issue with reasoning and a code patch
+3. Checks the spoke's `ai_decision_log.json` for a prior decision on this exact commit+mode - if one exists (and wasn't an AI-call failure), replays that outcome and stops here without spending an AI call
+4. Fetches the spoke's latest commit diff - if there's no usable diff, it stops here and does nothing (no AI call, no issue)
+5. Combines contexts, the diff, and the last few logged decisions into a prompt for the configured AI model
+6. Requests a strict JSON response that must include a `has_findings` flag
+7. Validates the response's shape before acting on it - a parse failure, a missing field, or `has_findings: false` all result in the run being skipped, not an issue being posted
+8. If dry-run mode is on (the default), a well-formed finding is reported back but never filed as an issue
+9. In live mode, a hard per-repo/per-day cap on issue creation applies before an issue is ever filed
+10. Only when the response is well-formed, reports real findings, dry-run is off, AND the day's cap hasn't been reached does it post a GitHub issue with reasoning and a code patch
+11. Every outcome (skip, dry-run finding, rate-capped, created) gets appended to the spoke's `ai_decision_log.json`, best-effort - a logging failure never fails the request itself
 
 ### Safety Rails
 
@@ -47,6 +49,15 @@ The handler that used to file ~1,974 fabricated issues over 4 months (see `DOCS_
 - **`RATE_CAP_PER_REPO_PER_DAY`** (defaults to `3`) - once dry-run is off, this hard-caps how many issues the handler will file against a single repo per UTC day, counted by querying that repo's existing issues (no separate database - there's nowhere else for a stateless Vercel function to keep a count). Once the cap is hit for the day, further findings return `Skipped` with the reason stated, until the next UTC day.
 
 Every issue the handler files is tagged with the `cto-hub-auto` label - this is what the rate cap counts against, and what later tooling (health reporting) filters on to distinguish hub-filed issues from anything a human filed manually.
+
+### Decision Logging (`ai_decision_log.json`)
+
+Every decision the handler makes for a spoke - skip (no diff, no findings, invalid AI response), dry-run finding, rate-capped, or created - gets appended to that spoke's `ai_decision_log.json` as `{ timestamp, mode, commitSha, outcome, issueUrl, summary }`. This serves two purposes:
+
+- **Avoids redundant AI calls**: if this exact commit was already decided in this mode, the handler replays the logged outcome instead of calling the AI model again. An outcome of `ai_error` (the AI call itself failed, e.g. returned no content) is the one exception - that's not a real decision, so it doesn't block a retry on the next run.
+- **Gives the model memory**: the last 5 entries are fed back into the prompt as "PRIOR DECISIONS" context, so the model is less likely to re-report something it already looked at and dismissed.
+
+Writes are best-effort (read-modify-write with retry on a stale `sha`, per repo, via the GitHub API) - a logging failure never fails the actual request, since the real decision has already been made by the time the log write happens. There is no separate database here; the log file itself is the durable state, same as everything else this handler persists.
 
 ## Setup Instructions
 
@@ -108,15 +119,14 @@ Note: `api/autonomous_agent.js` also supports `mode: hunt`, but the generated sp
 When the hub receives a request:
 1. Loads global context from its own files (universal lessons, North Star, hub lessons)
 2. Fetches local context (`lessons.md`, `NORTH_STAR.md`) from the target spoke repository via GitHub API
-3. Fetches the diff of the spoke's latest commit. If there's no usable diff, the request stops here with a "Skipped" response - no AI call, no issue.
-4. Constructs a prompt combining the role/mode, global standards, local context, and the actual diff
-5. Calls the configured AI model with strict JSON response requirements, including a `has_findings` flag
-6. Validates the response: invalid JSON, `has_findings: false`, or a response missing required fields all result in a "Skipped" response
-7. If `DRY_RUN_MODE` is on, a valid response with real findings is reported back as `DryRunFinding` and stops here - no issue is filed
-8. Otherwise, checks the per-repo/per-day rate cap (`RATE_CAP_PER_REPO_PER_DAY`) - if today's count for this repo is already at the cap, the request stops here with a "Skipped" response
-9. Only a valid response with real findings, with dry-run off and under the day's cap, gets posted as a GitHub issue (tagged `cto-hub-auto`) with value impact analysis and a code patch
-
-`ai_decision_log.json` is part of the spoke setup contract (`setup_spoke.py` creates it) but nothing currently reads or writes it - it's reserved for a future decision-history feature, not an active part of the flow today.
+3. Determines the spoke's latest commit sha, then checks `ai_decision_log.json` for a prior decision on this exact commit+mode - if found (and it wasn't a failed AI call), replays that outcome and stops here, skipping both the diff fetch and the AI call
+4. Fetches the diff of the spoke's latest commit. If there's no usable diff, the request stops here with a "Skipped" response - no AI call, no issue - and logs `no_diff_skip`.
+5. Constructs a prompt combining the role/mode, global standards, local context, the last few logged decisions, and the actual diff
+6. Calls the configured AI model with strict JSON response requirements, including a `has_findings` flag
+7. Validates the response: invalid JSON, `has_findings: false`, or a response missing required fields all result in a "Skipped" response, logged as `invalid_ai_response` or `no_findings`
+8. If `DRY_RUN_MODE` is on, a valid response with real findings is reported back as `DryRunFinding`, logged as `dry_run_would_create`, and stops here - no issue is filed
+9. Otherwise, checks the per-repo/per-day rate cap (`RATE_CAP_PER_REPO_PER_DAY`) - if today's count for this repo is already at the cap, the request stops here with a "Skipped" response, logged as `rate_capped`
+10. Only a valid response with real findings, with dry-run off and under the day's cap, gets posted as a GitHub issue (tagged `cto-hub-auto`) with value impact analysis and a code patch, logged as `created` with the issue's URL
 
 ### Sharing Lessons Across Spokes
 There's currently no automated process that aggregates insights across spokes or updates `universal_lessons.md`/`north_star_framework.md` based on cross-project patterns - that's a manual step (edit the files in this repo directly) rather than something the hub does on its own. What *is* automatic: every spoke's heartbeat picks up whatever the hub's global files currently say, so an edit here takes effect for every spoke on its next run.
