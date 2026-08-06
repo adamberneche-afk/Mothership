@@ -35,7 +35,18 @@ The Vercel serverless worker that:
 4. Combines contexts and the diff into a prompt for the configured AI model
 5. Requests a strict JSON response that must include a `has_findings` flag
 6. Validates the response's shape before acting on it - a parse failure, a missing field, or `has_findings: false` all result in the run being skipped, not an issue being posted
-7. Only when the response is well-formed AND reports real findings does it post a GitHub issue with reasoning and a code patch
+7. If dry-run mode is on (the default), a well-formed finding is reported back but never filed as an issue
+8. In live mode, a hard per-repo/per-day cap on issue creation applies before an issue is ever filed
+9. Only when the response is well-formed, reports real findings, dry-run is off, AND the day's cap hasn't been reached does it post a GitHub issue with reasoning and a code patch
+
+### Safety Rails
+
+The handler that used to file ~1,974 fabricated issues over 4 months (see `DOCS_VS_CODEBASE.md`) now has two independent guards on top of the response-validation fix above, both controlled by Vercel env vars:
+
+- **`DRY_RUN_MODE`** (defaults to `true`) - a well-formed, real finding is reported in the response as `{ status: 'DryRunFinding', wouldCreate: {...} }` instead of actually calling the GitHub API to create an issue. A misconfigured or missing env var fails safe (no issue gets filed), not open. Only set this to the literal string `"false"` after watching dry-run output for a while and being satisfied the findings look real.
+- **`RATE_CAP_PER_REPO_PER_DAY`** (defaults to `3`) - once dry-run is off, this hard-caps how many issues the handler will file against a single repo per UTC day, counted by querying that repo's existing issues (no separate database - there's nowhere else for a stateless Vercel function to keep a count). Once the cap is hit for the day, further findings return `Skipped` with the reason stated, until the next UTC day.
+
+Every issue the handler files is tagged with the `cto-hub-auto` label - this is what the rate cap counts against, and what later tooling (health reporting) filters on to distinguish hub-filed issues from anything a human filed manually.
 
 ## Setup Instructions
 
@@ -53,6 +64,8 @@ Go to Vercel Project Settings → Environment Variables:
 | `AI_MODEL` | e.g., `nvidia/nemotron-3-nano-30b-a3b-bf16` | The AI model to use |
 | `AI_BASE_URL` | e.g., `https://integrate.api.nvidia.com/v1` | API endpoint for the model provider |
 | `GLOBAL_GITHUB_TOKEN` | GitHub Personal Access Token with `repo` scope | Enables the hub to access all spoke repositories |
+| `DRY_RUN_MODE` | `true` (default) or `false` | Optional. While `true`, well-formed findings are reported but never filed as issues. See [Safety Rails](#safety-rails). |
+| `RATE_CAP_PER_REPO_PER_DAY` | e.g., `3` (default) | Optional. Hard cap on issues filed per repo per UTC day once dry-run is off. |
 
 ### 3. Configure Spoke Repositories
 For each project you want to manage:
@@ -72,13 +85,14 @@ For each project you want to manage:
 - Verify that the hub receives the request and creates a GitHub issue in the spoke repo (or returns a "Skipped" status if there's nothing to report - that's expected, not a failure)
 
 ### 5. (Optional) Enable Hub Self-Analysis
-This repository's own `.github/workflows/self-reflect.yml` pings the hub's `/api/autonomous_agent` endpoint against itself (`mode: refactor`) weekly. It needs one repository secret that isn't part of the Vercel setup above - without it, the workflow runs but the request has nowhere to go:
+This repository's own `.github/workflows/self-reflect.yml` pings the hub's `/api/autonomous_agent` endpoint against itself (`mode: refactor`) weekly. It needs two repository secrets that aren't part of the Vercel setup above - without them, the workflow runs but the request either has nowhere to go or gets rejected before it reaches the handler:
 
 | Secret | Value |
 |--------|-------|
 | `HUB_VERCEL_URL` | This hub's deployed Vercel URL (same value as `VERCEL_URL` on spokes) |
+| `VERCEL_BYPASS_TOKEN` | A "Protection Bypass for Automation" secret from the Vercel dashboard (Project Settings → Deployment Protection) - required if the deployment has Vercel Deployment Protection enabled, which returns a 403 to any caller that doesn't send it |
 
-Set this under this repository's own Settings → Secrets and variables → Actions. (The hub authenticates to GitHub server-side using its own `GLOBAL_GITHUB_TOKEN` Vercel env var - the workflow doesn't need to send a token itself.)
+Set these under this repository's own Settings → Secrets and variables → Actions. (The hub authenticates to GitHub server-side using its own `GLOBAL_GITHUB_TOKEN` Vercel env var - the workflow doesn't need to send a GitHub token itself.)
 
 ## How It Works
 
@@ -98,7 +112,9 @@ When the hub receives a request:
 4. Constructs a prompt combining the role/mode, global standards, local context, and the actual diff
 5. Calls the configured AI model with strict JSON response requirements, including a `has_findings` flag
 6. Validates the response: invalid JSON, `has_findings: false`, or a response missing required fields all result in a "Skipped" response
-7. Only a valid response with real findings gets posted as a GitHub issue with value impact analysis and a code patch
+7. If `DRY_RUN_MODE` is on, a valid response with real findings is reported back as `DryRunFinding` and stops here - no issue is filed
+8. Otherwise, checks the per-repo/per-day rate cap (`RATE_CAP_PER_REPO_PER_DAY`) - if today's count for this repo is already at the cap, the request stops here with a "Skipped" response
+9. Only a valid response with real findings, with dry-run off and under the day's cap, gets posted as a GitHub issue (tagged `cto-hub-auto`) with value impact analysis and a code patch
 
 `ai_decision_log.json` is part of the spoke setup contract (`setup_spoke.py` creates it) but nothing currently reads or writes it - it's reserved for a future decision-history feature, not an active part of the flow today.
 
