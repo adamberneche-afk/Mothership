@@ -24,29 +24,40 @@ function check(name, condition) {
 
 // --- Fakes -----------------------------------------------------------------
 
-function makeFakeOctokit({ decisionLog = null, issuesCreatedToday = [] } = {}) {
-  const calls = { issuesCreate: [], getContent: [] };
+// `decisionLog: null` simulates the file not existing yet (getContent 404s).
+// Pass an array (even []) to simulate an existing log with that content.
+function makeFakeOctokit({ decisionLog = null, issuesCreatedToday = [], commitSha = 'abc123', diffFiles } = {}) {
+  const calls = { issuesCreate: [], getContent: [], createOrUpdateFileContents: [] };
+  let currentLog = decisionLog;
+  let currentSha = decisionLog !== null ? 'fake-sha-0' : null;
+  const files = diffFiles ?? [
+    { filename: 'src/thing.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n-old\n+new' }
+  ];
+
   return {
     calls,
     repos: {
       getContent: async ({ path }) => {
         calls.getContent.push(path);
-        if (path === 'ai_decision_log.json' && decisionLog !== null) {
-          return { data: { content: Buffer.from(JSON.stringify(decisionLog)).toString('base64'), sha: 'fake-sha' } };
+        if (path === 'ai_decision_log.json') {
+          if (currentLog === null) throw new Error('404 not found');
+          return { data: { content: Buffer.from(JSON.stringify(currentLog)).toString('base64'), sha: currentSha } };
         }
         if (path === 'lessons.md' || path === 'NORTH_STAR.md') {
           return { data: { content: Buffer.from('fake local context').toString('base64') } };
         }
         throw new Error('404 not found');
       },
-      listCommits: async () => ({ data: [{ sha: 'abc123' }] }),
-      getCommit: async () => ({
-        data: {
-          files: [
-            { filename: 'src/thing.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n-old\n+new' }
-          ]
+      createOrUpdateFileContents: async (params) => {
+        calls.createOrUpdateFileContents.push(params);
+        if (params.path === 'ai_decision_log.json') {
+          currentLog = JSON.parse(Buffer.from(params.content, 'base64').toString('utf8'));
+          currentSha = `fake-sha-${calls.createOrUpdateFileContents.length}`;
         }
-      })
+        return { data: {} };
+      },
+      listCommits: async () => ({ data: commitSha ? [{ sha: commitSha }] : [] }),
+      getCommit: async () => ({ data: { files } })
     },
     issues: {
       listForRepo: async () => ({ data: issuesCreatedToday }),
@@ -153,11 +164,63 @@ async function testNoFindingsResponseCarriesDryRun() {
   check('dryRun field is present', body.dryRun === true);
 }
 
+// --- Sprint 1: decision logging dedup + write ------------------------------
+
+async function testDecisionLogSkipsAlreadyDecidedCommit() {
+  console.log('Sprint 1: a logged (non-ai_error) decision for this commit+mode skips the AI call');
+  const decisionLog = [
+    { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'abc123', outcome: 'no_findings', issueUrl: null, summary: null }
+  ];
+  const octokit = makeFakeOctokit({ decisionLog, commitSha: 'abc123' });
+  const fetchImpl = makeFakeFetch(FINDING_JSON);
+  const { body } = await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokit, fetchImpl, dryRunOverride: true }
+  );
+  check('AI was never called', fetchImpl.callCount() === 0);
+  check('status is Skipped', body.status === 'Skipped');
+  check('priorDecision reflects the logged outcome', body.priorDecision?.outcome === 'no_findings');
+}
+
+async function testAiErrorDoesNotBlockRetry() {
+  console.log("Sprint 1: a logged 'ai_error' outcome does NOT block retrying the same commit+mode");
+  const decisionLog = [
+    { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'abc123', outcome: 'ai_error', issueUrl: null, summary: null }
+  ];
+  const octokit = makeFakeOctokit({ decisionLog, commitSha: 'abc123' });
+  const fetchImpl = makeFakeFetch(FINDING_JSON);
+  const { body } = await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokit, fetchImpl, dryRunOverride: true }
+  );
+  check('AI was called (not skipped)', fetchImpl.callCount() === 1);
+  check('a real decision was reached', body.status === 'DryRunFinding');
+}
+
+async function testDecisionLogWritesEntryOnNormalRun() {
+  console.log('Sprint 1: a normal run appends a well-formed entry to the decision log');
+  const octokit = makeFakeOctokit({ decisionLog: null, commitSha: 'abc123' }); // no log file yet
+  const fetchImpl = makeFakeFetch(FINDING_JSON);
+  await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokit, fetchImpl, dryRunOverride: true }
+  );
+  const writes = octokit.calls.createOrUpdateFileContents;
+  check('exactly one write to the decision log', writes.length === 1);
+  const writtenEntries = JSON.parse(Buffer.from(writes[0].content, 'base64').toString('utf8'));
+  check('log now has one entry', writtenEntries.length === 1);
+  check('entry has the right commitSha/mode/outcome', writtenEntries[0].commitSha === 'abc123' && writtenEntries[0].mode === 'debug' && writtenEntries[0].outcome === 'dry_run_would_create');
+  check('no sha sent when the file did not exist yet', writes[0].sha === undefined);
+}
+
 async function main() {
   await testDryRunNeverCreatesIssue();
   await testRateCapBlocksAtLimit();
   await testRateCapAllowsUnderLimit();
   await testNoFindingsResponseCarriesDryRun();
+  await testDecisionLogSkipsAlreadyDecidedCommit();
+  await testAiErrorDoesNotBlockRetry();
+  await testDecisionLogWritesEntryOnNormalRun();
 
   console.log('');
   if (failures > 0) {

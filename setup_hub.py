@@ -34,6 +34,20 @@ const MAX_DIFF_CHARS = 12000;
 // filters on too.
 const HUB_ISSUE_LABEL = 'cto-hub-auto';
 
+const DECISION_LOG_PATH = 'ai_decision_log.json';
+// Overflow guard so the log can't grow unbounded before a real retention
+// policy exists (that's scripts/prune-logs.js's job, not this handler's).
+const DECISION_LOG_MAX_ENTRIES = 500;
+// How many of the most recent decisions get fed back into the prompt as
+// context, so the model doesn't re-report something already logged.
+const PRIOR_DECISIONS_CONTEXT_COUNT = 5;
+
+const MODE_INSTRUCTIONS = {
+  debug: 'Review the RECENT CODE CHANGES below for bugs, unsafe patterns, and code quality issues actually present in this diff. Only report something you can point to directly in the diff text.',
+  hunt: "Review the RECENT CODE CHANGES below for silent logic errors - places where the code runs without crashing but produces a wrong result. You cannot execute code or run tests; base findings only on what's visible in the diff text.",
+  refactor: 'Review the RECENT CODE CHANGES below for opportunities to simplify complex logic, remove redundancy, or improve maintainability. Only report something you can point to directly in the diff text.'
+};
+
 // Counts issues carrying HUB_ISSUE_LABEL that were created since UTC
 // midnight today, for the rate cap below. Derived on-demand from GitHub's
 // primary issue list (not the Search API, which lags real-time) - there is
@@ -57,6 +71,57 @@ async function countHubIssuesCreatedTodayUTC(octokit, owner, repo) {
   return count;
 }
 
+// Reads the spoke's decision log. Missing file (404), an unreachable repo,
+// or corrupted JSON all come back as an empty log rather than throwing -
+// the log is a memory aid, not a source of truth the rest of the handler
+// depends on to function.
+async function readDecisionLog(octokit, owner, repo) {
+  try {
+    const { data } = await octokit.repos.getContent({ owner, repo, path: DECISION_LOG_PATH });
+    let entries = [];
+    try {
+      const parsed = JSON.parse(Buffer.from(data.content, 'base64').toString('utf8'));
+      if (Array.isArray(parsed)) entries = parsed;
+    } catch (e) {
+      entries = []; // corrupted log - treat as empty rather than fail the request
+    }
+    return { entries, sha: data.sha };
+  } catch (e) {
+    return { entries: [], sha: null };
+  }
+}
+
+// Appends one entry to the spoke's decision log via read-modify-write.
+// Best-effort: a logging failure must never fail the request - the actual
+// decision (skip/create/etc.) has already been made and returned by the
+// time this runs. Retries a few times on a stale sha (another invocation
+// wrote in between) by re-reading and reapplying the write.
+async function appendDecisionLogEntry(octokit, owner, repo, entry) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const { entries, sha } = await readDecisionLog(octokit, owner, repo);
+      const updated = [...entries, entry].slice(-DECISION_LOG_MAX_ENTRIES);
+      const content = Buffer.from(JSON.stringify(updated, null, 2)).toString('base64');
+      const params = {
+        owner, repo, path: DECISION_LOG_PATH,
+        message: `chore: log ${entry.mode} decision (${entry.outcome})`,
+        content
+      };
+      if (sha) params.sha = sha;
+      await octokit.repos.createOrUpdateFileContents(params);
+      return;
+    } catch (e) {
+      // Most likely a 409 from another invocation writing between our read
+      // and write - loop and retry with a fresh sha. On the last attempt,
+      // swallow it: telemetry loss, not a request failure.
+    }
+  }
+}
+
+function makeLogEntry({ mode, commitSha, outcome, issueUrl = null, summary = null }) {
+  return { timestamp: new Date().toISOString(), mode, commitSha, outcome, issueUrl, summary };
+}
+
 // The actual decision logic, factored out of the Vercel handler so it can
 // be driven by a local test harness (scripts/dev-test-handler.mjs) with a
 // fake octokit/fetch instead of hitting GitHub and the AI API for real.
@@ -67,6 +132,11 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
 
   if (!owner || !repo || !mode) {
     return { httpStatus: 400, body: { error: 'owner, repo, and mode are required' } };
+  }
+
+  const taskInstruction = MODE_INSTRUCTIONS[mode];
+  if (!taskInstruction) {
+    return { httpStatus: 400, body: { error: `Unknown mode: ${mode}` } };
   }
 
   // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
@@ -107,6 +177,44 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
     localContext = "No local context found.";
   }
 
+  // Find the spoke's latest commit sha up front - both the decision-log
+  // dedup check below and the diff fetch further down need it, so fetch it
+  // once and reuse it instead of calling listCommits twice.
+  let latestCommitSha = null;
+  try {
+    const { data: commits } = await octokit.repos.listCommits({ owner, repo, per_page: 1 });
+    if (commits.length > 0) latestCommitSha = commits[0].sha;
+  } catch (e) {
+    latestCommitSha = null;
+  }
+
+  // DECISION LOGGING: don't re-run the AI (or spend the diff-fetch call) on
+  // a commit+mode combination already decided. An 'ai_error' outcome means
+  // the AI call itself failed last time (not that a real decision was
+  // made), so those don't block a retry - everything else does.
+  const { entries: decisionLog } = await readDecisionLog(octokit, owner, repo);
+  if (latestCommitSha) {
+    const priorEntry = decisionLog.find(
+      e => e.commitSha === latestCommitSha && e.mode === mode && e.outcome !== 'ai_error'
+    );
+    if (priorEntry) {
+      return {
+        httpStatus: 200,
+        body: {
+          status: 'Skipped',
+          reason: `Already decided for this commit in ${mode} mode (${priorEntry.outcome})`,
+          dryRun,
+          priorDecision: priorEntry
+        }
+      };
+    }
+  }
+
+  const logOutcome = (outcome, extra = {}) => {
+    if (!latestCommitSha) return; // nothing meaningful to key the entry on
+    return appendDecisionLogEntry(octokit, owner, repo, makeLogEntry({ mode, commitSha: latestCommitSha, outcome, ...extra }));
+  };
+
   // Fetch REAL CODE context: the diff of the spoke's latest commit.
   //
   // Every "audit" used to run with zero actual code in the prompt - only
@@ -117,10 +225,9 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
   // commit GitHub won't return patches for), we skip the AI call and the
   // issue entirely instead of asking it to invent something out of nothing.
   let codeDiff = null;
-  try {
-    const { data: commits } = await octokit.repos.listCommits({ owner, repo, per_page: 1 });
-    if (commits.length > 0) {
-      const { data: commitDetail } = await octokit.repos.getCommit({ owner, repo, ref: commits[0].sha });
+  if (latestCommitSha) {
+    try {
+      const { data: commitDetail } = await octokit.repos.getCommit({ owner, repo, ref: latestCommitSha });
       const patches = (commitDetail.files || [])
         .filter(f => typeof f.patch === 'string' && f.patch.length > 0)
         .map(f => `--- ${f.filename} (${f.status}) ---\\n${f.patch}`)
@@ -130,25 +237,22 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
           ? patches.slice(0, MAX_DIFF_CHARS) + `\\n\\n[... diff truncated at ${MAX_DIFF_CHARS} chars ...]`
           : patches;
       }
+    } catch (e) {
+      codeDiff = null;
     }
-  } catch (e) {
-    codeDiff = null;
   }
 
   if (!codeDiff) {
+    await logOutcome('no_diff_skip');
     return { httpStatus: 200, body: { status: 'Skipped', reason: 'No usable code diff found for the latest commit', dryRun } };
   }
 
-  let taskInstruction;
-  if (mode === 'debug') {
-    taskInstruction = 'Review the RECENT CODE CHANGES below for bugs, unsafe patterns, and code quality issues actually present in this diff. Only report something you can point to directly in the diff text.';
-  } else if (mode === 'hunt') {
-    taskInstruction = "Review the RECENT CODE CHANGES below for silent logic errors - places where the code runs without crashing but produces a wrong result. You cannot execute code or run tests; base findings only on what's visible in the diff text.";
-  } else if (mode === 'refactor') {
-    taskInstruction = 'Review the RECENT CODE CHANGES below for opportunities to simplify complex logic, remove redundancy, or improve maintainability. Only report something you can point to directly in the diff text.';
-  } else {
-    return { httpStatus: 400, body: { error: `Unknown mode: ${mode}`, dryRun } };
-  }
+  const priorDecisionsContext = decisionLog.length > 0
+    ? decisionLog
+        .slice(-PRIOR_DECISIONS_CONTEXT_COUNT)
+        .map(e => `- [${e.timestamp}] mode=${e.mode} outcome=${e.outcome}${e.summary ? `: ${e.summary}` : ''}`)
+        .join('\\n')
+    : 'None yet.';
 
   const prompt = `
     ROLE: Senior AI CTO. MODE: ${mode.toUpperCase()}.
@@ -156,6 +260,11 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
     GLOBAL NORTH STAR: ${globalNorthStar}
     HUB LESSONS: ${hubLessons}
     LOCAL CONTEXT: ${localContext}
+
+    PRIOR DECISIONS (most recent ${PRIOR_DECISIONS_CONTEXT_COUNT} for this repo - do not re-report
+    something already logged here as decided unless the diff below clearly
+    shows something new):
+    ${priorDecisionsContext}
 
     RECENT CODE CHANGES (diff of the latest commit):
     ${codeDiff}
@@ -187,6 +296,9 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
   const rawContent = aiData?.choices?.[0]?.message?.content;
 
   if (typeof rawContent !== 'string' || rawContent.trim().length === 0) {
+    // Treated as an infra/API failure, not a real decision - doesn't block
+    // a retry of this same commit+mode on the next run.
+    await logOutcome('ai_error', { summary: 'AI returned no content' });
     return { httpStatus: 200, body: { status: 'Skipped', reason: 'AI returned no content', dryRun } };
   }
 
@@ -200,6 +312,7 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
   try {
     result = JSON.parse(rawContent);
   } catch (parseError) {
+    await logOutcome('invalid_ai_response', { summary: 'AI did not return valid JSON' });
     return {
       httpStatus: 200,
       body: { status: 'Skipped', reason: 'AI did not return valid JSON', raw: rawContent.slice(0, 500), dryRun }
@@ -207,6 +320,7 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
   }
 
   if (result.has_findings !== true) {
+    await logOutcome('no_findings');
     return { httpStatus: 200, body: { status: 'Skipped', reason: 'AI reported no findings', dryRun } };
   }
 
@@ -219,6 +333,7 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
     isNonEmptyString(result.value_impact.reasoning);
 
   if (!isValidShape) {
+    await logOutcome('invalid_ai_response', { summary: 'AI response did not match the required shape' });
     return {
       httpStatus: 200,
       body: { status: 'Skipped', reason: 'AI response did not match the required shape', raw: rawContent.slice(0, 500), dryRun }
@@ -227,10 +342,12 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
 
   const issueTitle = `CTO HUB: ${mode.toUpperCase()} Action`;
   const issueBody = `### Value Impact\\n${result.value_impact.reasoning}\\n\\n### Patch\\n\\`\\`\\`\\n${result.code_patch}\\n\\`\\`\\``;
+  const summary = result.action_summary.slice(0, 200);
 
   // SAFETY RAIL 1 (continued): a real, validated finding - but dry-run mode
   // means we report what we *would* have filed instead of actually filing it.
   if (dryRun) {
+    await logOutcome('dry_run_would_create', { summary });
     return {
       httpStatus: 200,
       body: { status: 'DryRunFinding', dryRun: true, wouldCreate: { title: issueTitle, body: issueBody } }
@@ -246,6 +363,7 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
   const cap = Number(process.env.RATE_CAP_PER_REPO_PER_DAY || 3);
   const countToday = await countHubIssuesCreatedTodayUTC(octokit, owner, repo);
   if (countToday >= cap) {
+    await logOutcome('rate_capped', { summary });
     return {
       httpStatus: 200,
       body: { status: 'Skipped', reason: `Rate cap reached (${countToday}/${cap} issues filed today)`, dryRun }
@@ -258,6 +376,8 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
     body: issueBody,
     labels: [HUB_ISSUE_LABEL]
   });
+
+  await logOutcome('created', { issueUrl: created.data.html_url, summary });
 
   return { httpStatus: 200, body: { status: "Success", dryRun, issueUrl: created.data.html_url } };
 }
