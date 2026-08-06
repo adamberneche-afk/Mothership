@@ -1,32 +1,39 @@
 import { Octokit } from '@octokit/rest';
-import { execSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+
+// Caps how much diff text gets forwarded to the LLM per run - keeps prompt
+// size and API cost bounded.
+const MAX_DIFF_CHARS = 12000;
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
   const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
-  const { owner, repo, mode } = req.body;
+  const { owner, repo, mode } = req.body || {};
+
+  if (!owner || !repo || !mode) {
+    return res.status(400).json({ error: 'owner, repo, and mode are required' });
+  }
 
   try {
-      // Fetch Global Context from Hub
-      const universalLessonsPath = join(process.cwd(), 'universal_lessons.md');
-      const globalNorthStarPath = join(process.cwd(), 'north_star_framework.md');
-      const hubLessonsPath = join(process.cwd(), 'hub_lessons.md');
-      
-      const universalLessons = existsSync(universalLessonsPath) 
-          ? readFileSync(universalLessonsPath, 'utf8') 
-          : "";
-      const globalNorthStar = existsSync(globalNorthStarPath) 
-          ? readFileSync(globalNorthStarPath, 'utf8') 
-          : "";
-      const hubLessons = existsSync(hubLessonsPath) 
-          ? readFileSync(hubLessonsPath, 'utf8') 
-          : "";
+    // Fetch Global Context from Hub
+    const universalLessonsPath = join(process.cwd(), 'universal_lessons.md');
+    const globalNorthStarPath = join(process.cwd(), 'north_star_framework.md');
+    const hubLessonsPath = join(process.cwd(), 'hub_lessons.md');
+
+    const universalLessons = existsSync(universalLessonsPath)
+      ? readFileSync(universalLessonsPath, 'utf8')
+      : "";
+    const globalNorthStar = existsSync(globalNorthStarPath)
+      ? readFileSync(globalNorthStarPath, 'utf8')
+      : "";
+    const hubLessons = existsSync(hubLessonsPath)
+      ? readFileSync(hubLessonsPath, 'utf8')
+      : "";
 
     // Fetch Local Context from the Spoke repo
-    let localContext = "";
+    let localContext = "No local context found.";
     try {
       const { data: lsData } = await octokit.repos.getContent({ owner, repo, path: 'lessons.md' });
       const { data: nsData } = await octokit.repos.getContent({ owner, repo, path: 'NORTH_STAR.md' });
@@ -34,54 +41,76 @@ export default async function handler(req, res) {
         LOCAL LESSONS: ${Buffer.from(lsData.content, 'base64').toString()}
         LOCAL NORTH STAR: ${Buffer.from(nsData.content, 'base64').toString()}
       `;
-    } catch (e) { localContext = "No local context found."; }
+    } catch (e) {
+      localContext = "No local context found.";
+    }
 
-    let prompt = "";
-    
+    // Fetch REAL CODE context: the diff of the spoke's latest commit.
+    //
+    // This is the piece that was missing entirely before. Every prior "audit"
+    // ran with zero actual code in the prompt - only lessons.md/NORTH_STAR.md,
+    // which are notes files, not source. That guaranteed the LLM would
+    // hallucinate a plausible-looking bug + patch every single run, since it
+    // had nothing real to look at. If there's no usable diff (empty commit,
+    // binary-only changes, repo unreachable, huge commit GitHub won't return
+    // patches for), we skip the AI call and the issue entirely instead of
+    // asking it to invent something out of nothing.
+    let codeDiff = null;
+    try {
+      const { data: commits } = await octokit.repos.listCommits({ owner, repo, per_page: 1 });
+      if (commits.length > 0) {
+        const { data: commitDetail } = await octokit.repos.getCommit({ owner, repo, ref: commits[0].sha });
+        const patches = (commitDetail.files || [])
+          .filter(f => typeof f.patch === 'string' && f.patch.length > 0)
+          .map(f => `--- ${f.filename} (${f.status}) ---\n${f.patch}`)
+          .join('\n\n');
+        if (patches.length > 0) {
+          codeDiff = patches.length > MAX_DIFF_CHARS
+            ? patches.slice(0, MAX_DIFF_CHARS) + `\n\n[... diff truncated at ${MAX_DIFF_CHARS} chars ...]`
+            : patches;
+        }
+      }
+    } catch (e) {
+      codeDiff = null;
+    }
+
+    if (!codeDiff) {
+      return res.status(200).json({ status: 'Skipped', reason: 'No usable code diff found for the latest commit' });
+    }
+
+    let taskInstruction;
     if (mode === 'debug') {
-       prompt = `
-         ROLE: Senior AI CTO. MODE: DEBUG.
-         GLOBAL STANDARDS: ${universalLessons}
-         GLOBAL NORTH STAR: ${globalNorthStar}
-         HUB LESSONS: ${hubLessons}
-         LOCAL CONTEXT: ${localContext}
-
-         TASK: Perform a debug audit of the latest code. 
-         Identify code quality issues, unsafe patterns, and potential bugs.
-         Be specific about what you found and where.
-         Output your response as JSON with "action_summary", "code_patch", and "value_impact".
-       `;
-    } 
-    
-    else if (mode === 'hunt') {
-       prompt = `
-         ROLE: Senior AI CTO. MODE: SILENT ERROR HUNTER.
-         GLOBAL STANDARDS: ${universalLessons}
-         GLOBAL NORTH STAR: ${globalNorthStar}
-         HUB LESSONS: ${hubLessons}
-         LOCAL CONTEXT: ${localContext}
-
-         TASK: Run property-based tests to find silent logic errors.
-         Report any test failures as potential silent errors in the codebase.
-         Be specific about what tests failed and what they indicate.
-         Output your response as JSON with "action_summary", "code_patch", and "value_impact".
-       `;
+      taskInstruction = 'Review the RECENT CODE CHANGES below for bugs, unsafe patterns, and code quality issues actually present in this diff. Only report something you can point to directly in the diff text.';
+    } else if (mode === 'hunt') {
+      taskInstruction = "Review the RECENT CODE CHANGES below for silent logic errors - places where the code runs without crashing but produces a wrong result. You cannot execute code or run tests; base findings only on what's visible in the diff text.";
+    } else if (mode === 'refactor') {
+      taskInstruction = 'Review the RECENT CODE CHANGES below for opportunities to simplify complex logic, remove redundancy, or improve maintainability. Only report something you can point to directly in the diff text.';
+    } else {
+      return res.status(400).json({ error: `Unknown mode: ${mode}` });
     }
-    
-    else if (mode === 'refactor') {
-       prompt = `
-         ROLE: Senior AI CTO. MODE: REFACTOR.
-         GLOBAL STANDARDS: ${universalLessons}
-         GLOBAL NORTH STAR: ${globalNorthStar}
-         HUB LESSONS: ${hubLessons}
-         LOCAL CONTEXT: ${localContext}
 
-         TASK: Perform a refactor audit of the latest code. 
-         Identify opportunities to simplify complex logic, eliminate redundant code, and improve maintainability.
-         Be specific about what you found and where.
-         Output your response as JSON with "action_summary", "code_patch", and "value_impact".
-       `;
-    }
+    const prompt = `
+      ROLE: Senior AI CTO. MODE: ${mode.toUpperCase()}.
+      GLOBAL STANDARDS: ${universalLessons}
+      GLOBAL NORTH STAR: ${globalNorthStar}
+      HUB LESSONS: ${hubLessons}
+      LOCAL CONTEXT: ${localContext}
+
+      RECENT CODE CHANGES (diff of the latest commit):
+      ${codeDiff}
+
+      TASK: ${taskInstruction}
+      If you find nothing worth reporting, set "has_findings" to false and
+      leave "code_patch" and "value_impact.reasoning" as empty strings - do
+      not invent an issue just to have something to say.
+      Respond with ONLY valid JSON, exactly this shape:
+      {
+        "has_findings": boolean,
+        "action_summary": string,
+        "code_patch": string,
+        "value_impact": { "reasoning": string }
+      }
+    `;
 
     const aiResponse = await fetch(`${process.env.AI_BASE_URL}/chat/completions`, {
       method: 'POST',
@@ -94,50 +123,50 @@ export default async function handler(req, res) {
     });
 
     const aiData = await aiResponse.json();
-    
-    // Try to parse the AI's response as JSON
+    const rawContent = aiData?.choices?.[0]?.message?.content;
+
+    if (typeof rawContent !== 'string' || rawContent.trim().length === 0) {
+      return res.status(200).json({ status: 'Skipped', reason: 'AI returned no content' });
+    }
+
+    // Parse and STRICTLY VALIDATE the AI's response before acting on it.
+    //
+    // Previously: a JSON.parse failure fabricated a synthetic result from
+    // substring heuristics and posted an issue anyway, and even a successful
+    // parse was trusted blindly - a missing or wrong-typed field (code_patch
+    // as an object, value_impact.reasoning undefined) got string-interpolated
+    // straight into the issue body as literal "undefined" / "[object Object]".
+    // Neither path creates an issue now unless the response is well-formed
+    // JSON with real, non-empty findings.
     let result;
     try {
-      result = JSON.parse(aiData.choices[0].message.content);
+      result = JSON.parse(rawContent);
     } catch (parseError) {
-      // If parsing fails, try to extract meaningful information and create a structured response
-      const content = aiData.choices[0].message.content;
-      
-      // Extract action summary (first sentence or first 100 chars)
-      const actionSummary = content.split('.')[0] + '.' || content.substring(0, 100) + '...';
-      
-      // Look for code-like content in the response
-      let codePatch = "// AI suggestions:\n// ";
-      codePatch += content.substring(0, 200).replace(/\n/g, '\n// ');
-      
-      // Determine what the AI was trying to tell us
-      let benefitStrengthened = "Processing";
-      let frictionCreated = "See analysis";
-      let reasoning = "The AI provided analysis but not in the expected JSON format.";
-      
-      // Try to extract value impact information from the response
-      if (content.toLowerCase().includes('efficiency') || content.toLowerCase().includes('performance')) {
-        benefitStrengthened = "Efficiency without Anxiety";
-      }
-      if (content.toLowerCase().includes('complex') || content.toLowerCase().includes('simplify')) {
-        frictionCreated = "Potential complexity reduction";
-      }
-      if (content.toLowerCase().includes('safe') || content.toLowerCase().includes('secure') || 
-          content.toLowerCase().includes('error') || content.toLowerCase().includes('exception')) {
-        benefitStrengthened = "Forgiving Design";
-      }
-      
-      reasoning = `AI Analysis: ${content.substring(0, 300)}...`;
-      
-      result = {
-        action_summary: actionSummary.trim(),
-        code_patch: codePatch,
-        value_impact: {
-          benefit_strengthened: benefitStrengthened,
-          friction_created: frictionCreated,
-          reasoning: reasoning
-        }
-      };
+      return res.status(200).json({
+        status: 'Skipped',
+        reason: 'AI did not return valid JSON',
+        raw: rawContent.slice(0, 500)
+      });
+    }
+
+    if (result.has_findings !== true) {
+      return res.status(200).json({ status: 'Skipped', reason: 'AI reported no findings' });
+    }
+
+    const isNonEmptyString = (v) => typeof v === 'string' && v.trim().length > 0;
+    const isValidShape =
+      isNonEmptyString(result.action_summary) &&
+      isNonEmptyString(result.code_patch) &&
+      result.value_impact &&
+      typeof result.value_impact === 'object' &&
+      isNonEmptyString(result.value_impact.reasoning);
+
+    if (!isValidShape) {
+      return res.status(200).json({
+        status: 'Skipped',
+        reason: 'AI response did not match the required shape',
+        raw: rawContent.slice(0, 500)
+      });
     }
 
     await octokit.issues.create({

@@ -10,8 +10,10 @@ jobs:
     steps:
       - name: Ping Hub for self-analysis
         env:
+          # Note: GLOBAL_GITHUB_TOKEN is not needed here - the hub authenticates
+          # to GitHub server-side using its own Vercel env var, not anything
+          # the caller sends. Only HUB_VERCEL_URL is actually required.
           HUB_VERCEL_URL: ${{ secrets.HUB_VERCEL_URL }}
-          GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
         run: |
           curl -X POST "${HUB_VERCEL_URL}/api/autonomous_agent" \
             -H "Content-Type: application/json" \
