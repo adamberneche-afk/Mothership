@@ -6,7 +6,7 @@ This repository serves as the central intelligence (the "Mothership") for a hub-
 
 The AI CTO Hub implements a centralized intelligence system that manages multiple project repositories ("spokes") through a hub-and-spoke model. The system enables:
 
-- **Shared Standards**: A manual edit to this repo's global lessons/North Star files takes effect for every spoke on its next heartbeat - there's no automatic cross-spoke learning loop today, just a single shared source of truth
+- **Shared Standards**: A manual edit to this repo's global lessons/North Star files takes effect for every spoke on its next heartbeat. On top of that, a monthly job now looks for patterns across spokes and *proposes* updates to those files as a PR - a human still reviews and merges it, but the aggregation itself is automatic. See [Recursive Learning Loop](#recursive-learning-loop-apirecursive_learningjs).
 - **Centralized Maintenance**: Single point of updates for AI models, prompts, and standards  
 - **Lean Spokes**: Individual projects remain lightweight, only needing a heartbeat mechanism
 - **Global Cost Management**: All AI API traffic flows through a single Vercel deployment
@@ -59,6 +59,19 @@ Every decision the handler makes for a spoke - skip (no diff, no findings, inval
 
 Writes are best-effort (read-modify-write with retry on a stale `sha`, per repo, via the GitHub API) - a logging failure never fails the actual request, since the real decision has already been made by the time the log write happens. There is no separate database here; the log file itself is the durable state, same as everything else this handler persists.
 
+### Recursive Learning Loop (`api/recursive_learning.js`)
+
+A separate Vercel endpoint, distinct from `autonomous_agent.js`, that runs monthly (`.github/workflows/recursive-learning.yml`) and looks for patterns that recur across *multiple* spokes rather than reviewing one commit in one repo:
+
+1. Reads `spokes.json` (this repo's registry of connected spokes - `[{ "owner", "repo", "addedAt", "status" }, ...]`). If it's empty, the run is skipped.
+2. Fetches each registered spoke's `lessons.md` and recent `ai_decision_log.json` entries, alongside this hub's own current `universal_lessons.md`/`north_star_framework.md`.
+3. Asks the configured AI model to find a genuine cross-spoke pattern - not something specific to just one project - that the current global standards don't already cover, and to propose it as the full updated text of `universal_lessons.md` and/or `north_star_framework.md`.
+4. Same validation discipline as `autonomous_agent.js`: a `has_proposal` flag, and no action taken unless the response is well-formed with real reasoning and at least one patch.
+5. Same `DRY_RUN_MODE` rail: dry-run reports the proposal in the response without acting on it.
+6. In live mode, it **never pushes directly to `main`** - it opens a new branch, commits the proposed file(s), and opens a PR against this repo with the AI's reasoning as the PR body. A human still has to review and merge it, same as any other PR.
+
+Because this is a proposal mechanism (a PR someone reviews), not an unattended action, it's lower-stakes than issue creation - but it still shouldn't run live before Sprint 0's safety rails have been verified working, since it shares the same `DRY_RUN_MODE` switch and the same underlying AI call.
+
 ## Setup Instructions
 
 ### 1. Deploy to Vercel
@@ -89,6 +102,8 @@ For each project you want to manage:
 
 2. In GitHub Repository Settings → Secrets and variables → Actions:
    - Add `VERCEL_URL`: Your deployed Vercel application URL (e.g., `https://your-hub-name.vercel.app`)
+
+3. Add the spoke to this hub's own `spokes.json` (`{ "owner", "repo", "addedAt", "status" }`) so the [Recursive Learning Loop](#recursive-learning-loop-apirecursive_learningjs) includes it in its monthly cross-spoke pattern search. This step is only needed for that monthly job - the regular per-commit heartbeat (steps 1-2 above) works without it.
 
 ### 4. Test the Connection
 - Commit and push changes to a spoke repository
@@ -129,7 +144,9 @@ When the hub receives a request:
 10. Only a valid response with real findings, with dry-run off and under the day's cap, gets posted as a GitHub issue (tagged `cto-hub-auto`) with value impact analysis and a code patch, logged as `created` with the issue's URL
 
 ### Sharing Lessons Across Spokes
-There's currently no automated process that aggregates insights across spokes or updates `universal_lessons.md`/`north_star_framework.md` based on cross-project patterns - that's a manual step (edit the files in this repo directly) rather than something the hub does on its own. What *is* automatic: every spoke's heartbeat picks up whatever the hub's global files currently say, so an edit here takes effect for every spoke on its next run.
+Every spoke's heartbeat picks up whatever `universal_lessons.md`/`north_star_framework.md` currently say, so a manual edit to those files here takes effect for every spoke on its next run - that part has always been true.
+
+On top of that, `api/recursive_learning.js` runs monthly and looks across every spoke registered in `spokes.json` for a genuine cross-project pattern the current global standards don't cover, proposing an update as a PR against this repo (see [Recursive Learning Loop](#recursive-learning-loop-apirecursive_learningjs)). It never merges anything itself - a human still decides whether the proposal is right and merges the PR (or doesn't). "Automatic" here means the aggregation and drafting, not the decision to actually change the global standards.
 
 ## Values Alignment
 
