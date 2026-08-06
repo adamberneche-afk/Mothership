@@ -14,9 +14,16 @@ jobs:
           # to GitHub server-side using its own Vercel env var, not anything
           # the caller sends. Only HUB_VERCEL_URL is actually required.
           HUB_VERCEL_URL: ${{ secrets.HUB_VERCEL_URL }}
+          # The hub's deployment currently sits behind Vercel Deployment
+          # Protection - without this header every call gets a 403 before it
+          # ever reaches the handler. Get a "Protection Bypass for
+          # Automation" secret from the Vercel dashboard (Settings ->
+          # Deployment Protection) and store it as VERCEL_BYPASS_TOKEN.
+          VERCEL_BYPASS_TOKEN: ${{ secrets.VERCEL_BYPASS_TOKEN }}
         run: |
           curl -X POST "${HUB_VERCEL_URL}/api/autonomous_agent" \
             -H "Content-Type: application/json" \
+            -H "x-vercel-protection-bypass: ${VERCEL_BYPASS_TOKEN}" \
             -d '{
               "owner": "${{ github.repository_owner }}",
               "repo": "${{ github.event.repository.name }}",
