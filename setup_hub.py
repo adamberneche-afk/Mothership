@@ -996,14 +996,157 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 }"""
         },
 
-        # 4. INFRASTRUCTURE
+        # 4. AUTOMATION (GitHub Actions workflows - self-reflect, maintenance,
+        # health reporting, recursive learning). Without these, api/*.js and
+        # scripts/*.js above are never actually invoked on any schedule - a
+        # freshly-scaffolded hub would otherwise deploy successfully to Vercel
+        # and sit there completely inert.
+        {
+            "path": ".github/workflows/self-reflect.yml",
+            "content": """name: Hub Self-Reflection
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  self-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Hub for self-analysis
+        env:
+          # Note: GLOBAL_GITHUB_TOKEN is not needed here - the hub authenticates
+          # to GitHub server-side using its own Vercel env var, not anything
+          # the caller sends. Only HUB_VERCEL_URL is actually required.
+          HUB_VERCEL_URL: ${{ secrets.HUB_VERCEL_URL }}
+          # The hub's deployment currently sits behind Vercel Deployment
+          # Protection - without this header every call gets a 403 before it
+          # ever reaches the handler. Get a "Protection Bypass for
+          # Automation" secret from the Vercel dashboard (Settings ->
+          # Deployment Protection) and store it as VERCEL_BYPASS_TOKEN.
+          VERCEL_BYPASS_TOKEN: ${{ secrets.VERCEL_BYPASS_TOKEN }}
+        run: |
+          curl -X POST "${HUB_VERCEL_URL}/api/autonomous_agent" \\
+            -H "Content-Type: application/json" \\
+            -H "x-vercel-protection-bypass: ${VERCEL_BYPASS_TOKEN}" \\
+            -d '{
+              "owner": "${{ github.repository_owner }}",
+              "repo": "${{ github.event.repository.name }}",
+              "mode": "refactor"
+            }'"""
+        },
+        {
+            "path": ".github/workflows/prune-logs.yml",
+            "content": """name: Prune Decision Logs
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly, Sunday at midnight UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report what would move without writing anything'
+        type: boolean
+        default: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prune old decision-log entries across all registered spokes
+        env:
+          # Mirrors the Vercel env var of the same name - an Actions runner
+          # can't read Vercel's env, so this needs its own copy of the token
+          # as a repo secret, with cross-repo write access to every spoke.
+          GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: node scripts/prune-logs.js"""
+        },
+        {
+            "path": ".github/workflows/health-report.yml",
+            "content": """name: Health Report
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly, Monday at 6 AM UTC
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    # Only governs the auto-generated GITHUB_TOKEN (used below by checkout) -
+    # the script's actual GitHub calls authenticate with the GLOBAL_GITHUB_TOKEN
+    # secret instead, so this block doesn't grant those anything. Listed
+    # explicitly (rather than left off) so a future repo-visibility change
+    # doesn't silently drop checkout's read access - declaring any permissions
+    # here sets every unlisted scope to 'none'.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and publish the Mothership health report
+        env:
+          # Mirrors the Vercel env var of the same name - an Actions runner
+          # can't read Vercel's env, so this needs its own copy as a repo
+          # secret, with read access to every registered spoke plus write
+          # access to this repo (to update the pinned report issue).
+          GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
+        run: node scripts/health-report.js"""
+        },
+        {
+            "path": ".github/workflows/recursive-learning.yml",
+            "content": """name: Recursive Learning
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'  # Monthly, 1st of the month at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Hub for cross-spoke aggregation
+        env:
+          HUB_VERCEL_URL: ${{ secrets.HUB_VERCEL_URL }}
+          # See self-reflect.yml - required while the deployment has Vercel
+          # Deployment Protection enabled.
+          VERCEL_BYPASS_TOKEN: ${{ secrets.VERCEL_BYPASS_TOKEN }}
+        run: |
+          curl -X POST "${HUB_VERCEL_URL}/api/recursive_learning" \\
+            -H "Content-Type: application/json" \\
+            -H "x-vercel-protection-bypass: ${VERCEL_BYPASS_TOKEN}" \\
+            -d '{}'"""
+        },
+
+        # 5. INFRASTRUCTURE
         {
             "path": "package.json",
             "content": "{\n  \"name\": \"ai-cto-hub\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"dependencies\": {\n    \"@octokit/rest\": \"^19.0.0\"\n  }\n}"
         },
         {
             "path": ".gitignore",
-            "content": "node_modules/\n.env\n"
+            "content": "node_modules/\n.env\n.vercel\n__pycache__/\n*.pyc\n"
         }
     ]
 
