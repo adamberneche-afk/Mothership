@@ -22,11 +22,15 @@ function check(name, condition) {
 
 // --- Fakes -----------------------------------------------------------------
 
-function makeFakeOctokit({ spokesRegistry = [], perSpokeFiles = {} } = {}) {
-  const calls = { getContent: [], getRef: [], createRef: [], createOrUpdateFileContents: [], pullsCreate: [] };
+function makeFakeOctokit({ spokesRegistry = [], perSpokeFiles = {}, defaultBranch = 'main' } = {}) {
+  const calls = { getContent: [], getRef: [], createRef: [], createOrUpdateFileContents: [], pullsCreate: [], reposGet: [] };
   return {
     calls,
     repos: {
+      get: async (params) => {
+        calls.reposGet.push(params);
+        return { data: { default_branch: defaultBranch } };
+      },
       getContent: async ({ owner, repo, path }) => {
         calls.getContent.push({ owner, repo, path });
         if (path === 'spokes.json') {
@@ -142,11 +146,22 @@ async function testLiveOpensExactlyOnePR() {
   check('only universal_lessons.md was written (north_star_patch was empty)', octokit.calls.createOrUpdateFileContents.length === 1 && octokit.calls.createOrUpdateFileContents[0].path === 'universal_lessons.md');
 }
 
+async function testUsesTheRepoActualDefaultBranchNotHardcodedMain() {
+  console.log("Sprint 2 fix: uses the hub repo's real default branch instead of assuming 'main'");
+  const octokit = makeFakeOctokit({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES, defaultBranch: 'trunk' });
+  const fetchImpl = makeFakeFetch(PROPOSAL_JSON);
+  await runRecursiveLearning({}, { octokit, fetchImpl, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
+  check('looked up the default branch via repos.get', octokit.calls.reposGet.length === 1);
+  check('branched off the real default branch, not "main"', octokit.calls.getRef[0]?.ref === 'heads/trunk');
+  check('the PR base is the real default branch, not "main"', octokit.calls.pullsCreate[0]?.base === 'trunk');
+}
+
 async function main() {
   await testNoSpokesRegisteredSkips();
   await testNoProposalSkips();
   await testDryRunNeverOpensAPR();
   await testLiveOpensExactlyOnePR();
+  await testUsesTheRepoActualDefaultBranchNotHardcodedMain();
 
   console.log('');
   if (failures > 0) {

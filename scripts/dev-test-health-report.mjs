@@ -49,11 +49,14 @@ function makeFakeOctokit({ issuesByRepo = {}, decisionLogByRepo = {}, existingRe
       },
       create: async (params) => {
         calls.issuesCreate.push(params);
-        reportIssue = { number: 1, title: params.title, html_url: 'https://github.com/fake/fake/issues/1' };
+        reportIssue = { number: 1, title: params.title, html_url: 'https://github.com/fake/fake/issues/1', state: 'open' };
         return { data: reportIssue };
       },
       update: async (params) => {
         calls.issuesUpdate.push(params);
+        if (reportIssue && params.issue_number === reportIssue.number && params.state) {
+          reportIssue.state = params.state;
+        }
         return { data: {} };
       }
     }
@@ -127,6 +130,27 @@ async function testPublishReportCreatesThenUpdatesInPlace() {
   check('exactly one update call happened', octokit.calls.issuesUpdate.length === 1);
 }
 
+async function testPublishReportReopensAClosedIssue() {
+  console.log('Sprint 5 fix: publishReport reopens the pinned issue if a human closed it');
+  const octokit = makeFakeOctokit({
+    existingReportIssue: { number: 7, title: 'Mothership Health Report', html_url: 'https://github.com/fake/fake/issues/7', state: 'closed' }
+  });
+  const result = await publishReport(octokit, '# new report');
+  check("action is 'reopened', not 'updated'", result.action === 'reopened');
+  check('the update call explicitly reopens it', octokit.calls.issuesUpdate[0]?.state === 'open');
+  check('the fake issue is now open', octokit.getReportIssue().state === 'open');
+}
+
+async function testPublishReportDoesNotTouchStateWhenAlreadyOpen() {
+  console.log('Sprint 5: publishReport leaves an already-open issue’s state alone');
+  const octokit = makeFakeOctokit({
+    existingReportIssue: { number: 7, title: 'Mothership Health Report', html_url: 'https://github.com/fake/fake/issues/7', state: 'open' }
+  });
+  const result = await publishReport(octokit, '# new report');
+  check("action is 'updated'", result.action === 'updated');
+  check('no state field was sent', octokit.calls.issuesUpdate[0]?.state === undefined);
+}
+
 async function testBuildFullReportUsesRealRegistryWithoutCrashing() {
   console.log('Sprint 5: buildFullReport reads the real (possibly absent) spokes.json without crashing');
   // This branch doesn't have spokes.json yet (Sprint 2 hasn't merged here) -
@@ -143,6 +167,8 @@ async function main() {
   await testNoActivitySpokeReportsNoDecisionsLogged();
   await testMarkdownRendersEmptySpokeListGracefully();
   await testPublishReportCreatesThenUpdatesInPlace();
+  await testPublishReportReopensAClosedIssue();
+  await testPublishReportDoesNotTouchStateWhenAlreadyOpen();
   await testBuildFullReportUsesRealRegistryWithoutCrashing();
 
   console.log('');

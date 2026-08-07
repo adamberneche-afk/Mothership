@@ -20,10 +20,14 @@ function check(name, condition) {
 
 // --- Fakes -------------------------------------------------------------------
 
-function makeFakeOctokit({ files = {} } = {}) {
+// `failLiveWritesCount`: simulates a stale-sha conflict on the live decision
+// log write (e.g. a concurrent heartbeat append) - throws that many times
+// before letting the write through, to verify pruneSpoke's retry behavior.
+function makeFakeOctokit({ files = {}, failLiveWritesCount = 0 } = {}) {
   // files: { "owner/repo:path": [...entries] }
   const calls = { getContent: [], createOrUpdateFileContents: [] };
   const store = { ...files };
+  let remainingFailures = failLiveWritesCount;
   return {
     calls,
     store,
@@ -36,6 +40,10 @@ function makeFakeOctokit({ files = {} } = {}) {
       },
       createOrUpdateFileContents: async (params) => {
         calls.createOrUpdateFileContents.push(params);
+        if (params.path === 'ai_decision_log.json' && remainingFailures > 0) {
+          remainingFailures--;
+          throw new Error('409 Conflict: sha mismatch');
+        }
         const key = `${params.owner}/${params.repo}:${params.path}`;
         store[key] = JSON.parse(Buffer.from(params.content, 'base64').toString('utf8'));
         return { data: {} };
@@ -100,6 +108,42 @@ async function testEmptyLogIsANoOp() {
   check('skipped is true', result.skipped === true);
 }
 
+async function testRetriesOnWriteConflictAndSucceeds() {
+  console.log('Sprint 3 fix: retries on a stale-sha write conflict and succeeds on a later attempt');
+  const octokit = makeFakeOctokit({
+    files: {
+      'o/r:ai_decision_log.json': [entryAt(1), entryAt(100), entryAt(120)],
+      'o/r:ai_decision_log_archive.json': []
+    },
+    failLiveWritesCount: 1 // first attempt's live-log write fails, second succeeds
+  });
+  const result = await pruneSpoke(octokit, { owner: 'o', repo: 'r' }, { retentionDays: 90, now: NOW });
+  const liveWrites = octokit.calls.createOrUpdateFileContents.filter(p => p.path === 'ai_decision_log.json');
+  check('eventually succeeds', result.moved === 2 && result.dryRun === false);
+  check('live log write was attempted twice (one failure, one success)', liveWrites.length === 2);
+  check('live log ends up truncated correctly', octokit.store['o/r:ai_decision_log.json'].length === 1);
+}
+
+async function testGivesUpAfterMaxAttempts() {
+  console.log('Sprint 3 fix: gives up and throws after exhausting retries on a persistent conflict');
+  const octokit = makeFakeOctokit({
+    files: {
+      'o/r:ai_decision_log.json': [entryAt(1), entryAt(100)],
+      'o/r:ai_decision_log_archive.json': []
+    },
+    failLiveWritesCount: 99 // always fails
+  });
+  let threw = false;
+  try {
+    await pruneSpoke(octokit, { owner: 'o', repo: 'r' }, { retentionDays: 90, now: NOW, maxAttempts: 3 });
+  } catch (e) {
+    threw = true;
+  }
+  const liveWrites = octokit.calls.createOrUpdateFileContents.filter(p => p.path === 'ai_decision_log.json');
+  check('throws after exhausting retries', threw === true);
+  check('attempted exactly maxAttempts times', liveWrites.length === 3);
+}
+
 async function testPruneAllSpokesUsesTheRealRegistryAndSkipsOnError() {
   console.log('Sprint 3: pruneAllSpokes reads the real spokes.json and continues past a per-spoke error');
   // This repo's actual spokes.json has one entry (tso) - no fs mocking
@@ -115,6 +159,8 @@ async function main() {
   await testDryRunReportsWithoutWriting();
   await testArchivesOldEntriesBeforeTruncatingLiveLog();
   await testEmptyLogIsANoOp();
+  await testRetriesOnWriteConflictAndSucceeds();
+  await testGivesUpAfterMaxAttempts();
   await testPruneAllSpokesUsesTheRealRegistryAndSkipsOnError();
 
   console.log('');

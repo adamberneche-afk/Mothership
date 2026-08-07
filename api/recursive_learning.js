@@ -35,6 +35,18 @@ function safeParseJsonArray(text) {
   }
 }
 
+// Looks up the hub repo's actual default branch instead of assuming 'main' -
+// correct today, but a hardcoded assumption is exactly the kind of thing
+// that silently breaks later if the default branch is ever renamed.
+async function getDefaultBranch(octokit, owner, repo) {
+  try {
+    const { data } = await octokit.repos.get({ owner, repo });
+    return data.default_branch || 'main';
+  } catch (e) {
+    return 'main';
+  }
+}
+
 // The actual logic, factored out of the Vercel handler the same way
 // autonomous_agent.js's processRequest is, so it can be driven by a local
 // mock harness instead of hitting GitHub/the AI API for real.
@@ -153,9 +165,10 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
   }
 
   // Live: propose via a PR against the hub itself - never push directly to
-  // main. Whatever comes out of this is a suggestion a human reviews and
-  // merges (or doesn't), same as any other PR.
-  const { data: baseRef } = await octokit.git.getRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: 'heads/main' });
+  // the default branch. Whatever comes out of this is a suggestion a human
+  // reviews and merges (or doesn't), same as any other PR.
+  const defaultBranch = await getDefaultBranch(octokit, HUB_OWNER, HUB_REPO);
+  const { data: baseRef } = await octokit.git.getRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `heads/${defaultBranch}` });
   const branchName = `recursive-learning-${Date.now()}`;
   await octokit.git.createRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `refs/heads/${branchName}`, sha: baseRef.object.sha });
 
@@ -188,7 +201,7 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
     owner: HUB_OWNER, repo: HUB_REPO,
     title: 'Recursive Learning: proposed cross-spoke updates',
     head: branchName,
-    base: 'main',
+    base: defaultBranch,
     body: `### Reasoning\n${result.reasoning}\n\n---\nGenerated automatically by \`api/recursive_learning.js\` from patterns observed across ${spokes.length} spoke(s). This is a proposal, not a decision - review before merging.`
   });
 
