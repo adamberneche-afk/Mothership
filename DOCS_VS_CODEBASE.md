@@ -1,18 +1,20 @@
 # Documentation vs. Codebase: What We Say We're Building vs. What Exists
 
+> **Update (2026-08-07):** Every capability marked NOT BUILT or PARTIAL in the original analysis below — except #7, which is genuinely blocked on a manual deployment step, not code — has since been built for real, across a follow-up multi-sprint effort (PRs #3–#10 on this repo, plus companion PRs on `tso`, `thinkos-server`, and `tais`). The original analysis is kept below as the historical record of what prompted that effort; see **Rollup (Updated)** at the bottom for the current, verified status of each capability. Leaving the original table's verdicts uncorrected here would repeat the exact mistake this document exists to catch — docs asserting something false about the code — so don't take the table below at face value for current status; take the updated one.
+
 **Purpose:** This is a capability-level comparison, not a line-by-line doc-accuracy check. For each capability `README.md` describes, this cross-checks the actual source code to classify it as **BUILT** (real, wired-up implementation), **PARTIAL** (real code exists but key pieces are missing or disconnected), or **NOT BUILT** (aspirational — no corresponding code).
 
 **Methodology:** Every row was verified by reading the actual source referenced in the Evidence column.
 
-**Scope note:** This describes the state of `main` as of this PR. A separate branch/PR fixes the two most consequential items below (#1 and #2) — see that PR for details once it's up; this document intentionally describes what's currently live, not what's pending.
+**Scope note (original, now historical):** This describes the state of `main` as of this PR. A separate branch/PR fixes the two most consequential items below (#1 and #2) — see that PR for details once it's up; this document intentionally describes what's currently live, not what's pending.
 
-## Overall Positioning vs. Reality
+## Overall Positioning vs. Reality (original analysis, historical)
 
 `README.md` describes Mothership as a "hub-and-spoke autonomous coding swarm" that recursively learns across projects, provides centralized AI-assisted debugging/hunting/refactoring, and logs decisions for peer review between agents. If you only read the code, the actual system is: a single Vercel serverless handler that reads two philosophy files from the target repo (never any actual application code), asks an LLM to "audit the latest code" with no code in the prompt, and unconditionally files a GitHub issue with whatever comes back — including fabricated content when the LLM's response doesn't parse or doesn't match the expected shape. This is not a minor implementation gap; it's the direct cause of ~1,974 hallucinated issues filed against one spoke repo (`tso`) over roughly 4 months.
 
-## Capability Inventory
+## Capability Inventory (original analysis, historical — see Rollup (Updated) below for current status)
 
-| # | Capability | Claiming Doc(s) | Status | Evidence |
+| # | Capability | Claiming Doc(s) | Status (at time of original audit) | Evidence (at time of original audit) |
 |---|---|---|---|---|
 | 1 | Code-aware debug/hunt/refactor auditing | README ("Autonomous Agent" section) | **NOT BUILT (root cause of the issue-spam incident)** | `api/autonomous_agent.js` fetches only `lessons.md`/`NORTH_STAR.md` from the target repo — no diff, no file contents, no commit reference. The LLM is asked to audit "the latest code" with zero code in the prompt, so it fabricates plausible-looking bugs every call. Confirmed root cause of ~1,974 issues filed against `tso`. |
 | 2 | Reliable, validated issue creation | README (implied — "Posts proposals as GitHub issues with clear reasoning") | **NOT BUILT** | A `JSON.parse` failure on the LLM's response doesn't stop execution — it fabricates a synthetic result from substring heuristics and files an issue anyway. Even a successful parse is used without validating field types, so a missing/wrong-shaped field gets string-interpolated directly into the issue body, producing literal `undefined` and `[object Object]` (confirmed present in ~220 of the `tso` issues). |
@@ -24,8 +26,26 @@
 | 8 | "Hunt" mode (silent error detection) | README ("Heartbeat Mechanism": "Mode (`debug`, `hunt`, or `refactor`)") | **PARTIAL — implemented but unreachable** | `autonomous_agent.js` has real `hunt` mode logic, but `setup_spoke.py`'s generated workflow only ever computes `debug` or `refactor` from the cron schedule — `hunt` is never actually sent by anything the setup script produces. |
 | 9 | Core "ping hub → get an issue" mechanism | README | **BUILT (mechanically)** | The Vercel handler, GitHub issue-creation call, and spoke heartbeat workflow all genuinely execute end-to-end — the request/response plumbing works. What it produces (see #1, #2) is the problem, not whether the pipe itself functions. |
 
-## Rollup
+**Rollup (original, historical): 1 BUILT (mechanically) · 2 PARTIAL · 6 NOT BUILT** (out of 9 capabilities catalogued)
 
-**1 BUILT (mechanically) · 2 PARTIAL · 6 NOT BUILT** (out of 9 capabilities catalogued)
+The pattern at the time was different from TSO and ThinkOS-Server, where most of the core product was real and the gaps were in secondary/aspirational features. Here, the core mechanism ran successfully end-to-end, but produced no reliable value, because the two things that would make it trustworthy — giving the model real code to look at, and validating what it hands back before acting on it — were never implemented. Everything downstream of that (learning loop, decision logging, maintenance) was documented as if it worked but had no code behind it at all.
 
-The pattern here is different from TSO and ThinkOS-Server, where most of the core product is real and the gaps are in secondary/aspirational features. Here, the core mechanism runs successfully end-to-end, but produces no reliable value, because the two things that would make it trustworthy — giving the model real code to look at, and validating what it hands back before acting on it — were never implemented. Everything downstream of that (learning loop, decision logging, maintenance) was documented as if it worked but has no code behind it at all.
+---
+
+## Rollup (Updated 2026-08-07)
+
+**8 BUILT · 1 PARTIAL (blocked on a manual deployment step, not a code gap) · 0 NOT BUILT** (out of 9 capabilities catalogued)
+
+| # | Capability | Status (original) | Status (now) | Evidence (now) |
+|---|---|---|---|---|
+| 1 | Code-aware debug/hunt/refactor auditing | NOT BUILT | **BUILT** | `api/autonomous_agent.js` fetches the spoke's latest commit diff via the GitHub API and includes it in the prompt; skips the AI call entirely if there's no usable diff. |
+| 2 | Reliable, validated issue creation | NOT BUILT | **BUILT** | Strict field-by-field validation before ever calling `issues.create`, plus a `DRY_RUN_MODE` (default on) safety rail and a per-repo daily rate cap. |
+| 3 | Decision logging to `ai_decision_log.json` | NOT BUILT | **BUILT** | Every decision is appended with `{ timestamp, mode, commitSha, outcome, issueUrl, summary }`; a repeat run on the same commit+mode replays the logged outcome instead of re-calling the AI. |
+| 4 | Recursive Learning Loop | NOT BUILT | **BUILT** | `api/recursive_learning.js` runs monthly, looks for patterns across every spoke registered in `spokes.json`, and opens a PR (never a direct commit) proposing updates to the global standards files. Aggregation and drafting are automatic; merging the proposal is still a human decision. |
+| 5 | Maintenance script: log pruning | NOT BUILT (dead stub) | **BUILT** | `scripts/prune-logs.js` archives decision-log entries past a retention window into `ai_decision_log_archive.json` on a weekly schedule, with retry-on-conflict against concurrent heartbeat writes. |
+| 6 | Daily/automated health reporting | NOT BUILT (misattributed) | **BUILT** | `scripts/health-report.js` is a real, Mothership-native replacement reporting on the hub/swarm's own health (issues filed, skip rate, inferred live/dry-run status per spoke), published to a single pinned issue updated in place. |
+| 7 | Hub self-analysis (`self-reflect.yml`) | PARTIAL | **PARTIAL (unchanged — genuinely blocked, not a code gap)** | Still requires a human to set the `HUB_VERCEL_URL`/`VERCEL_BYPASS_TOKEN` secrets and obtain a Vercel Deployment Protection bypass token from the Vercel dashboard. Documented in `README.md`; nothing left to fix in code. |
+| 8 | "Hunt" mode | PARTIAL (unreachable) | **BUILT** | `setup_spoke.py`'s generated workflow — and all three live spokes (`tso`, `thinkos-server`, `tais`) — now schedule a weekly `hunt` run via a step-output `case` statement instead of the old two-branch inline expression. |
+| 9 | Core "ping hub → get an issue" mechanism | BUILT (mechanically) | **BUILT (and now trustworthy)** | Same request/response plumbing as before, but gated by real validation, a dry-run default, and a rate cap — it no longer produces fabricated output by default. |
+
+This reversal is the point of the whole exercise: build the capability for real first, document it only once it's verified working — the opposite of what produced the original ~1,974-issue incident this document was written to diagnose.
