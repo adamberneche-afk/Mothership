@@ -177,15 +177,18 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
       e => e.commitSha === latestCommitSha && e.mode === mode && e.outcome !== 'ai_error'
     );
     if (priorEntry) {
-      return {
-        httpStatus: 200,
-        body: {
-          status: 'Skipped',
-          reason: `Already decided for this commit in ${mode} mode (${priorEntry.outcome})`,
-          dryRun,
-          priorDecision: priorEntry
-        }
+      const body = {
+        status: 'Skipped',
+        reason: `Already decided for this commit in ${mode} mode (${priorEntry.outcome})`,
+        dryRun,
+        priorDecision: priorEntry
       };
+      // A caller checking body.issueUrl (the shape a live 'created' response
+      // uses) would otherwise only find it nested under priorDecision on a
+      // replay - surface it at the top level too when the prior decision
+      // actually filed one.
+      if (priorEntry.issueUrl) body.issueUrl = priorEntry.issueUrl;
+      return { httpStatus: 200, body };
     }
   }
 

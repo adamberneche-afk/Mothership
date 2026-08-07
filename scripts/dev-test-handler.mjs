@@ -213,6 +213,36 @@ async function testDecisionLogWritesEntryOnNormalRun() {
   check('no sha sent when the file did not exist yet', writes[0].sha === undefined);
 }
 
+async function testReplayOfACreatedDecisionSurfacesIssueUrlAtTopLevel() {
+  console.log('Sprint 1 fix: replaying a prior "created" decision surfaces issueUrl at the top level too');
+  const decisionLog = [
+    { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'abc123', outcome: 'created', issueUrl: 'https://github.com/o/r/issues/42', summary: 'Found a thing' }
+  ];
+  const octokit = makeFakeOctokit({ decisionLog, commitSha: 'abc123' });
+  const fetchImpl = makeFakeFetch(FINDING_JSON);
+  const { body } = await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokit, fetchImpl, dryRunOverride: true }
+  );
+  check('AI was never called', fetchImpl.callCount() === 0);
+  check('top-level issueUrl matches the logged one', body.issueUrl === 'https://github.com/o/r/issues/42');
+  check('still nested under priorDecision too', body.priorDecision?.issueUrl === 'https://github.com/o/r/issues/42');
+}
+
+async function testReplayWithoutAnIssueUrlOmitsTheField() {
+  console.log('Sprint 1 fix: replaying a decision with no issueUrl does not add a spurious top-level field');
+  const decisionLog = [
+    { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'abc123', outcome: 'no_findings', issueUrl: null, summary: null }
+  ];
+  const octokit = makeFakeOctokit({ decisionLog, commitSha: 'abc123' });
+  const fetchImpl = makeFakeFetch(FINDING_JSON);
+  const { body } = await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokit, fetchImpl, dryRunOverride: true }
+  );
+  check('no top-level issueUrl field', body.issueUrl === undefined);
+}
+
 async function main() {
   await testDryRunNeverCreatesIssue();
   await testRateCapBlocksAtLimit();
@@ -221,6 +251,8 @@ async function main() {
   await testDecisionLogSkipsAlreadyDecidedCommit();
   await testAiErrorDoesNotBlockRetry();
   await testDecisionLogWritesEntryOnNormalRun();
+  await testReplayOfACreatedDecisionSurfacesIssueUrlAtTopLevel();
+  await testReplayWithoutAnIssueUrlOmitsTheField();
 
   console.log('');
   if (failures > 0) {

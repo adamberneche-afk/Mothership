@@ -173,8 +173,15 @@ async function findExistingReportIssue(octokit) {
 export async function publishReport(octokit, body) {
   const existing = await findExistingReportIssue(octokit);
   if (existing) {
-    await octokit.issues.update({ owner: HUB_OWNER, repo: HUB_REPO, issue_number: existing.number, body });
-    return { action: 'updated', issueUrl: existing.html_url };
+    const updateParams = { owner: HUB_OWNER, repo: HUB_REPO, issue_number: existing.number, body };
+    // If a human closed the report issue (e.g. tidying notifications), the
+    // update itself doesn't reopen it by default - reopen explicitly, or
+    // every future run would keep silently rewriting a closed issue's body
+    // instead of surfacing anywhere a maintainer would actually look.
+    const wasClosed = existing.state === 'closed';
+    if (wasClosed) updateParams.state = 'open';
+    await octokit.issues.update(updateParams);
+    return { action: wasClosed ? 'reopened' : 'updated', issueUrl: existing.html_url };
   }
   const created = await octokit.issues.create({
     owner: HUB_OWNER, repo: HUB_REPO, title: REPORT_ISSUE_TITLE, body, labels: [REPORT_ISSUE_LABEL]

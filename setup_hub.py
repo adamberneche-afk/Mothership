@@ -202,15 +202,18 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
       e => e.commitSha === latestCommitSha && e.mode === mode && e.outcome !== 'ai_error'
     );
     if (priorEntry) {
-      return {
-        httpStatus: 200,
-        body: {
-          status: 'Skipped',
-          reason: `Already decided for this commit in ${mode} mode (${priorEntry.outcome})`,
-          dryRun,
-          priorDecision: priorEntry
-        }
+      const body = {
+        status: 'Skipped',
+        reason: `Already decided for this commit in ${mode} mode (${priorEntry.outcome})`,
+        dryRun,
+        priorDecision: priorEntry
       };
+      // A caller checking body.issueUrl (the shape a live 'created' response
+      // uses) would otherwise only find it nested under priorDecision on a
+      // replay - surface it at the top level too when the prior decision
+      // actually filed one.
+      if (priorEntry.issueUrl) body.issueUrl = priorEntry.issueUrl;
+      return { httpStatus: 200, body };
     }
   }
 
@@ -438,6 +441,18 @@ function safeParseJsonArray(text) {
   }
 }
 
+// Looks up the hub repo's actual default branch instead of assuming 'main' -
+// correct today, but a hardcoded assumption is exactly the kind of thing
+// that silently breaks later if the default branch is ever renamed.
+async function getDefaultBranch(octokit, owner, repo) {
+  try {
+    const { data } = await octokit.repos.get({ owner, repo });
+    return data.default_branch || 'main';
+  } catch (e) {
+    return 'main';
+  }
+}
+
 // The actual logic, factored out of the Vercel handler the same way
 // autonomous_agent.js's processRequest is, so it can be driven by a local
 // mock harness instead of hitting GitHub/the AI API for real.
@@ -556,9 +571,10 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
   }
 
   // Live: propose via a PR against the hub itself - never push directly to
-  // main. Whatever comes out of this is a suggestion a human reviews and
-  // merges (or doesn't), same as any other PR.
-  const { data: baseRef } = await octokit.git.getRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: 'heads/main' });
+  // the default branch. Whatever comes out of this is a suggestion a human
+  // reviews and merges (or doesn't), same as any other PR.
+  const defaultBranch = await getDefaultBranch(octokit, HUB_OWNER, HUB_REPO);
+  const { data: baseRef } = await octokit.git.getRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `heads/${defaultBranch}` });
   const branchName = `recursive-learning-${Date.now()}`;
   await octokit.git.createRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `refs/heads/${branchName}`, sha: baseRef.object.sha });
 
@@ -591,7 +607,7 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
     owner: HUB_OWNER, repo: HUB_REPO,
     title: 'Recursive Learning: proposed cross-spoke updates',
     head: branchName,
-    base: 'main',
+    base: defaultBranch,
     body: `### Reasoning\\n${result.reasoning}\\n\\n---\\nGenerated automatically by \\`api/recursive_learning.js\\` from patterns observed across ${spokes.length} spoke(s). This is a proposal, not a decision - review before merging.`
   });
 
@@ -682,24 +698,38 @@ function partitionByAge(entries, retentionDays, now) {
 // happens first, so a failure between the two writes leaves an entry
 // duplicated in both files (safe, idempotent on the next run) rather than
 // lost.
-export async function pruneSpoke(octokit, spoke, { retentionDays = DEFAULT_RETENTION_DAYS, dryRun = false, now = Date.now() } = {}) {
-  const { entries: liveEntries, sha: liveSha } = await readJsonArrayFile(octokit, spoke.owner, spoke.repo, DECISION_LOG_PATH);
-  const { recent, old } = partitionByAge(liveEntries, retentionDays, now);
+//
+// Retries the whole read-partition-write cycle a few times on failure - most
+// likely a stale-sha conflict from a heartbeat run (autonomous_agent.js)
+// appending a new decision entry in the same window this pruner is reading
+// and writing. Re-reading from scratch each attempt picks up that new entry
+// instead of clobbering it.
+export async function pruneSpoke(octokit, spoke, { retentionDays = DEFAULT_RETENTION_DAYS, dryRun = false, now = Date.now(), maxAttempts = 3 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const { entries: liveEntries, sha: liveSha } = await readJsonArrayFile(octokit, spoke.owner, spoke.repo, DECISION_LOG_PATH);
+    const { recent, old } = partitionByAge(liveEntries, retentionDays, now);
 
-  if (old.length === 0) {
-    return { owner: spoke.owner, repo: spoke.repo, moved: 0, skipped: true };
+    if (old.length === 0) {
+      return { owner: spoke.owner, repo: spoke.repo, moved: 0, skipped: true };
+    }
+
+    if (dryRun) {
+      return { owner: spoke.owner, repo: spoke.repo, moved: old.length, dryRun: true };
+    }
+
+    try {
+      const { entries: archiveEntries, sha: archiveSha } = await readJsonArrayFile(octokit, spoke.owner, spoke.repo, ARCHIVE_LOG_PATH);
+      const updatedArchive = [...archiveEntries, ...old];
+      await writeJsonArrayFile(octokit, spoke.owner, spoke.repo, ARCHIVE_LOG_PATH, updatedArchive, archiveSha, 'chore: archive old decision-log entries');
+      await writeJsonArrayFile(octokit, spoke.owner, spoke.repo, DECISION_LOG_PATH, recent, liveSha, 'chore: prune archived entries from decision log');
+      return { owner: spoke.owner, repo: spoke.repo, moved: old.length, dryRun: false };
+    } catch (e) {
+      lastError = e;
+      // Loop and retry with a fresh read on the next iteration.
+    }
   }
-
-  if (dryRun) {
-    return { owner: spoke.owner, repo: spoke.repo, moved: old.length, dryRun: true };
-  }
-
-  const { entries: archiveEntries, sha: archiveSha } = await readJsonArrayFile(octokit, spoke.owner, spoke.repo, ARCHIVE_LOG_PATH);
-  const updatedArchive = [...archiveEntries, ...old];
-  await writeJsonArrayFile(octokit, spoke.owner, spoke.repo, ARCHIVE_LOG_PATH, updatedArchive, archiveSha, 'chore: archive old decision-log entries');
-  await writeJsonArrayFile(octokit, spoke.owner, spoke.repo, DECISION_LOG_PATH, recent, liveSha, 'chore: prune archived entries from decision log');
-
-  return { owner: spoke.owner, repo: spoke.repo, moved: old.length, dryRun: false };
+  throw lastError;
 }
 
 export async function pruneAllSpokes(octokit, options = {}) {
@@ -910,8 +940,15 @@ async function findExistingReportIssue(octokit) {
 export async function publishReport(octokit, body) {
   const existing = await findExistingReportIssue(octokit);
   if (existing) {
-    await octokit.issues.update({ owner: HUB_OWNER, repo: HUB_REPO, issue_number: existing.number, body });
-    return { action: 'updated', issueUrl: existing.html_url };
+    const updateParams = { owner: HUB_OWNER, repo: HUB_REPO, issue_number: existing.number, body };
+    // If a human closed the report issue (e.g. tidying notifications), the
+    // update itself doesn't reopen it by default - reopen explicitly, or
+    // every future run would keep silently rewriting a closed issue's body
+    // instead of surfacing anywhere a maintainer would actually look.
+    const wasClosed = existing.state === 'closed';
+    if (wasClosed) updateParams.state = 'open';
+    await octokit.issues.update(updateParams);
+    return { action: wasClosed ? 'reopened' : 'updated', issueUrl: existing.html_url };
   }
   const created = await octokit.issues.create({
     owner: HUB_OWNER, repo: HUB_REPO, title: REPORT_ISSUE_TITLE, body, labels: [REPORT_ISSUE_LABEL]

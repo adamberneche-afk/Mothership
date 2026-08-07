@@ -65,24 +65,38 @@ function partitionByAge(entries, retentionDays, now) {
 // happens first, so a failure between the two writes leaves an entry
 // duplicated in both files (safe, idempotent on the next run) rather than
 // lost.
-export async function pruneSpoke(octokit, spoke, { retentionDays = DEFAULT_RETENTION_DAYS, dryRun = false, now = Date.now() } = {}) {
-  const { entries: liveEntries, sha: liveSha } = await readJsonArrayFile(octokit, spoke.owner, spoke.repo, DECISION_LOG_PATH);
-  const { recent, old } = partitionByAge(liveEntries, retentionDays, now);
+//
+// Retries the whole read-partition-write cycle a few times on failure - most
+// likely a stale-sha conflict from a heartbeat run (autonomous_agent.js)
+// appending a new decision entry in the same window this pruner is reading
+// and writing. Re-reading from scratch each attempt picks up that new entry
+// instead of clobbering it.
+export async function pruneSpoke(octokit, spoke, { retentionDays = DEFAULT_RETENTION_DAYS, dryRun = false, now = Date.now(), maxAttempts = 3 } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const { entries: liveEntries, sha: liveSha } = await readJsonArrayFile(octokit, spoke.owner, spoke.repo, DECISION_LOG_PATH);
+    const { recent, old } = partitionByAge(liveEntries, retentionDays, now);
 
-  if (old.length === 0) {
-    return { owner: spoke.owner, repo: spoke.repo, moved: 0, skipped: true };
+    if (old.length === 0) {
+      return { owner: spoke.owner, repo: spoke.repo, moved: 0, skipped: true };
+    }
+
+    if (dryRun) {
+      return { owner: spoke.owner, repo: spoke.repo, moved: old.length, dryRun: true };
+    }
+
+    try {
+      const { entries: archiveEntries, sha: archiveSha } = await readJsonArrayFile(octokit, spoke.owner, spoke.repo, ARCHIVE_LOG_PATH);
+      const updatedArchive = [...archiveEntries, ...old];
+      await writeJsonArrayFile(octokit, spoke.owner, spoke.repo, ARCHIVE_LOG_PATH, updatedArchive, archiveSha, 'chore: archive old decision-log entries');
+      await writeJsonArrayFile(octokit, spoke.owner, spoke.repo, DECISION_LOG_PATH, recent, liveSha, 'chore: prune archived entries from decision log');
+      return { owner: spoke.owner, repo: spoke.repo, moved: old.length, dryRun: false };
+    } catch (e) {
+      lastError = e;
+      // Loop and retry with a fresh read on the next iteration.
+    }
   }
-
-  if (dryRun) {
-    return { owner: spoke.owner, repo: spoke.repo, moved: old.length, dryRun: true };
-  }
-
-  const { entries: archiveEntries, sha: archiveSha } = await readJsonArrayFile(octokit, spoke.owner, spoke.repo, ARCHIVE_LOG_PATH);
-  const updatedArchive = [...archiveEntries, ...old];
-  await writeJsonArrayFile(octokit, spoke.owner, spoke.repo, ARCHIVE_LOG_PATH, updatedArchive, archiveSha, 'chore: archive old decision-log entries');
-  await writeJsonArrayFile(octokit, spoke.owner, spoke.repo, DECISION_LOG_PATH, recent, liveSha, 'chore: prune archived entries from decision log');
-
-  return { owner: spoke.owner, repo: spoke.repo, moved: old.length, dryRun: false };
+  throw lastError;
 }
 
 export async function pruneAllSpokes(octokit, options = {}) {
