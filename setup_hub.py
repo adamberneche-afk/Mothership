@@ -694,6 +694,14 @@ function partitionByAge(entries, retentionDays, now) {
   return { recent, old };
 }
 
+// A stable identity for a decision-log entry, used to dedupe against what's
+// already archived. timestamp+commitSha+mode is unique per real decision;
+// this is not a general-purpose object hash, just enough to recognize "this
+// exact entry already made it into the archive."
+function archiveKeyFor(entry) {
+  return `${entry && entry.timestamp}|${entry && entry.commitSha}|${entry && entry.mode}`;
+}
+
 // Prunes one spoke's decision log. Archive-then-truncate: the archive write
 // happens first, so a failure between the two writes leaves an entry
 // duplicated in both files (safe, idempotent on the next run) rather than
@@ -704,6 +712,17 @@ function partitionByAge(entries, retentionDays, now) {
 // appending a new decision entry in the same window this pruner is reading
 // and writing. Re-reading from scratch each attempt picks up that new entry
 // instead of clobbering it.
+//
+// The archive write itself is deduped against what's already there before
+// writing (and skipped entirely if there's nothing new). Without this, a
+// retry triggered by the *live-log* write failing - after the *archive*
+// write on that same attempt already succeeded - would re-append the same
+// "old" entries to the archive a second time on the next attempt, since
+// re-reading from scratch recomputes the same `old` set from an
+// as-yet-untruncated live log. That's a real duplicate within one
+// invocation's retry loop, not just the safe, eventually-consistent
+// duplication the archive-then-truncate ordering is meant to allow for
+// across separate runs.
 export async function pruneSpoke(octokit, spoke, { retentionDays = DEFAULT_RETENTION_DAYS, dryRun = false, now = Date.now(), maxAttempts = 3 } = {}) {
   let lastError;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -720,8 +739,12 @@ export async function pruneSpoke(octokit, spoke, { retentionDays = DEFAULT_RETEN
 
     try {
       const { entries: archiveEntries, sha: archiveSha } = await readJsonArrayFile(octokit, spoke.owner, spoke.repo, ARCHIVE_LOG_PATH);
-      const updatedArchive = [...archiveEntries, ...old];
-      await writeJsonArrayFile(octokit, spoke.owner, spoke.repo, ARCHIVE_LOG_PATH, updatedArchive, archiveSha, 'chore: archive old decision-log entries');
+      const archivedKeys = new Set(archiveEntries.map(archiveKeyFor));
+      const newToArchive = old.filter((entry) => !archivedKeys.has(archiveKeyFor(entry)));
+      if (newToArchive.length > 0) {
+        const updatedArchive = [...archiveEntries, ...newToArchive];
+        await writeJsonArrayFile(octokit, spoke.owner, spoke.repo, ARCHIVE_LOG_PATH, updatedArchive, archiveSha, 'chore: archive old decision-log entries');
+      }
       await writeJsonArrayFile(octokit, spoke.owner, spoke.repo, DECISION_LOG_PATH, recent, liveSha, 'chore: prune archived entries from decision log');
       return { owner: spoke.owner, repo: spoke.repo, moved: old.length, dryRun: false };
     } catch (e) {

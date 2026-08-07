@@ -124,6 +124,21 @@ async function testRetriesOnWriteConflictAndSucceeds() {
   check('live log ends up truncated correctly', octokit.store['o/r:ai_decision_log.json'].length === 1);
 }
 
+async function testRetryDoesNotDuplicateAlreadyArchivedEntries() {
+  console.log('Bugfix: a retry triggered by the live-log write failing (after the archive write on that attempt already succeeded) does not re-duplicate entries in the archive');
+  const octokit = makeFakeOctokit({
+    files: {
+      'o/r:ai_decision_log.json': [entryAt(1), entryAt(100), entryAt(120)],
+      'o/r:ai_decision_log_archive.json': []
+    },
+    failLiveWritesCount: 1 // first attempt's live-log write fails (after its archive write already landed), second succeeds
+  });
+  const result = await pruneSpoke(octokit, { owner: 'o', repo: 'r' }, { retentionDays: 90, now: NOW });
+  check('moved is reported as 2 (not doubled)', result.moved === 2);
+  check('archive has exactly the 2 moved entries, not 4', octokit.store['o/r:ai_decision_log_archive.json'].length === 2);
+  check('live log ends up truncated correctly', octokit.store['o/r:ai_decision_log.json'].length === 1);
+}
+
 async function testGivesUpAfterMaxAttempts() {
   console.log('Sprint 3 fix: gives up and throws after exhausting retries on a persistent conflict');
   const octokit = makeFakeOctokit({
@@ -160,6 +175,7 @@ async function main() {
   await testArchivesOldEntriesBeforeTruncatingLiveLog();
   await testEmptyLogIsANoOp();
   await testRetriesOnWriteConflictAndSucceeds();
+  await testRetryDoesNotDuplicateAlreadyArchivedEntries();
   await testGivesUpAfterMaxAttempts();
   await testPruneAllSpokesUsesTheRealRegistryAndSkipsOnError();
 
