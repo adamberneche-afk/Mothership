@@ -8,7 +8,14 @@ on:
 jobs:
   report:
     runs-on: ubuntu-latest
+    # Only governs the auto-generated GITHUB_TOKEN (used below by checkout) -
+    # the script's actual GitHub calls authenticate with the GLOBAL_GITHUB_TOKEN
+    # secret instead, so this block doesn't grant those anything. Listed
+    # explicitly (rather than left off) so a future repo-visibility change
+    # doesn't silently drop checkout's read access - declaring any permissions
+    # here sets every unlisted scope to 'none'.
     permissions:
+      contents: read
       issues: write
     steps:
       - uses: actions/checkout@v4
