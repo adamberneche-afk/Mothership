@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Read-only checkout is all this needs. Every scripts/dev-test-*.mjs
+    # harness runs against a fully mocked octokit/fetch (see their own
+    # headers) - this job needs zero GitHub or AI credentials, so it's safe
+    # to run even on a pull_request opened from a fork.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run local mock-harness test suite
+        run: |
+          set -e
+          for f in scripts/dev-test-*.mjs; do
+            echo "::group::$f"
+            node "$f"
+            echo "::endgroup::"
+          done
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Verify the installer scripts still compile
+        run: python3 -m py_compile setup_hub.py setup_spoke.py
