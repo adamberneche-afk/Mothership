@@ -27,13 +27,7 @@ jobs:
         run: npm ci
 
       - name: Run local mock-harness test suite
-        run: |
-          set -e
-          for f in scripts/dev-test-*.mjs; do
-            echo "::group::$f"
-            node "$f"
-            echo "::endgroup::"
-          done
+        run: npm test
 
       - name: Install Python
         uses: actions/setup-python@v5
@@ -42,3 +36,38 @@ jobs:
 
       - name: Verify the installer scripts still compile
         run: python3 -m py_compile setup_hub.py setup_spoke.py
+
+      - name: Verify setup_hub.py's generated files match the real repo files
+        run: |
+          set -e
+          rm -rf /tmp/hub-scratch
+          mkdir -p /tmp/hub-scratch
+          (cd /tmp/hub-scratch && python3 "$GITHUB_WORKSPACE/setup_hub.py")
+
+          # Normalizes trailing-newline differences only - setup_hub.py's
+          # embedded string literals never end in a trailing newline, while
+          # the real files do; that's an accepted, cosmetic difference, not
+          # drift. Anything else is a real mismatch between what the
+          # installer would generate today and what's actually checked in.
+          norm() { printf '%s\n' "$(cat "$1")"; }
+
+          drift=0
+          for f in \
+            api/autonomous_agent.js api/recursive_learning.js \
+            scripts/prune-logs.js scripts/health-report.js \
+            .github/workflows/self-reflect.yml .github/workflows/prune-logs.yml \
+            .github/workflows/health-report.yml .github/workflows/recursive-learning.yml \
+            package.json .gitignore; do
+            if ! diff -u <(norm "$f") <(norm "/tmp/hub-scratch/$f") > /tmp/hub-scratch-diff.txt; then
+              echo "::error::setup_hub.py's embedded copy of $f has drifted from the real file"
+              cat /tmp/hub-scratch-diff.txt
+              drift=1
+            fi
+          done
+
+          # spokes.json, universal_lessons.md, and north_star_framework.md are
+          # deliberately NOT checked above: setup_hub.py seeds those with
+          # fresh-install defaults, not a mirror of this repo's own live,
+          # accumulated state, so they're expected to diverge from this repo's
+          # real copies - that's not drift, it's the installer doing its job.
+          exit $drift
