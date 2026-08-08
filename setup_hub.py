@@ -1142,7 +1142,7 @@ jobs:
         # 5. INFRASTRUCTURE
         {
             "path": "package.json",
-            "content": "{\n  \"name\": \"ai-cto-hub\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"dependencies\": {\n    \"@octokit/rest\": \"^19.0.0\"\n  }\n}"
+            "content": "{\n  \"name\": \"ai-cto-hub\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"test\": \"for f in scripts/dev-test-*.mjs; do node \\\"$f\\\" || exit 1; done\"\n  },\n  \"dependencies\": {\n    \"@octokit/rest\": \"^19.0.0\"\n  }\n}"
         },
         {
             "path": ".gitignore",
@@ -1157,7 +1157,14 @@ jobs:
         print(f"Created: {f['path']}")
 
     print("\nInstalling Hub dependencies...")
-    subprocess.run(["npm", "install"], shell=True)
+    # No shell=True here: combined with a list, it runs the list's first
+    # item as the shell command and every item after it as arguments to the
+    # *shell* invocation itself, not to that command - so ["npm", "install"]
+    # silently ran bare `npm` (no subcommand) and never installed anything.
+    # A plain list without shell=True execs npm directly with both args.
+    install = subprocess.run(["npm", "install"])
+    if install.returncode != 0:
+        print("Warning: 'npm install' failed - install dependencies manually before deploying.")
 
     print("\n" + "="*50)
     print("MOTHERSHIP INITIALIZED")
