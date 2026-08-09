@@ -9,7 +9,7 @@ The AI CTO Hub implements a centralized intelligence system that manages multipl
 - **Shared Standards**: A manual edit to this repo's global lessons/North Star files takes effect for every spoke on its next heartbeat. On top of that, a monthly job now looks for patterns across spokes and *proposes* updates to those files as a PR - a human still reviews and merges it, but the aggregation itself is automatic. See [Recursive Learning Loop](#recursive-learning-loop-apirecursive_learningjs).
 - **Centralized Maintenance**: Single point of updates for AI models, prompts, and standards  
 - **Lean Spokes**: Individual projects remain lightweight, only needing a heartbeat mechanism
-- **Global Cost Management**: All AI API traffic flows through a single Vercel deployment
+- **Global Cost Management**: All AI API traffic flows through a single deployment - Vercel by default, or Google Apps Script (see [Alternative: Deploy Without Vercel](#alternative-deploy-without-vercel-google-apps-script)) if you'd rather not use Vercel at all
 - **Structural Consistency**: Ensures coding standards and architectural decisions align across the portfolio
 
 ## Core Components
@@ -88,6 +88,14 @@ Runs weekly (`.github/workflows/health-report.yml`) as a plain GitHub Actions sc
 - Publishes the report as a single **pinned issue on this repo**, tagged `mothership-health-report`, updated in place on every run rather than creating a new one each time - a deliberate callback to the disaster this whole system exists to avoid repeating.
 
 Like `prune-logs.js`, this needs its own `GLOBAL_GITHUB_TOKEN` Actions secret (see setup below, step 7) - the Vercel env var of the same name isn't visible to an Actions runner.
+
+### Health Dashboard (`dashboard/`)
+
+A standalone, installable PWA - additive, not part of the request-handling path (a PWA can't receive GitHub Actions' POST mid-cron-job the way the two endpoints above do). Since Mothership and every spoke are public repos, `dashboard/app.js` reads `spokes.json` and each spoke's `ai_decision_log.json`/issue list straight from `api.github.com` client-side and renders the same metrics `health-report.js`'s `buildReportForSpoke` already computes - skip rate, per-outcome breakdown, inferred live/dry-run status - live in a browser instead of waiting for the weekly pinned issue.
+
+No backend of its own: `manifest.json`/`sw.js` make it installable (add-to-home-screen), and it's meant to be hosted for free on **GitHub Pages** straight from this repo - enable it under Settings → Pages, source set to the `dashboard/` folder (or a `gh-pages` branch, if you'd rather not serve straight from `main`).
+
+**Known, disclosed limitation:** unauthenticated GitHub API calls are capped at 60 requests/hour per IP. Fine for a single-operator dashboard opened a few times a day; would need a caching proxy (the `gas/` deployment above could serve this read-only, authenticated, with a much higher cap) if usage ever grows past that.
 
 ## Setup Instructions
 
