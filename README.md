@@ -218,6 +218,7 @@ Every piece of decision logic in `api/` and `scripts/` is dependency-injected (a
 
 - `scripts/dev-test-handler.mjs`, `dev-test-recursive-learning.mjs`, `dev-test-prune-logs.mjs`, `dev-test-health-report.mjs` - one per capability, run with `node scripts/dev-test-*.mjs` or all at once via `npm test`.
 - `.github/workflows/ci.yml` runs that full suite, a `python3 -m py_compile` check on both installer scripts, and a scratch-directory diff proving `setup_hub.py`'s generated output still matches this repo's real files - on every pull request, every push to `main`, and on demand. No secrets required: every harness runs against a fully mocked GitHub/AI client, so it's safe even on a PR opened from a fork.
+- A separate `docs-check` job in the same workflow fails a pull request that adds a new file under `api/`, `gas/`, `dashboard/`, or `.github/workflows/` without also touching `README.md` in the same diff - the automated version of the "is this documented?" check that found the gaps this section itself is an answer to. A `[skip-docs-check]` marker in the PR title or body is the escape hatch for genuine non-capability additions.
 
 Before this existed, verification was a manual sweep run by hand after every change - several real defects were found sitting in code that already had a passing test, which is exactly the gap automatic enforcement closes: a test only guards the future if something re-runs it on every subsequent change, not just the one where it was written.
 
