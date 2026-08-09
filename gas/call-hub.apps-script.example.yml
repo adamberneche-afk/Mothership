@@ -1,0 +1,50 @@
+# Example spoke heartbeat workflow targeting the Apps Script deployment
+# instead of Vercel. NOT active CI - lives here (not .github/workflows/) on
+# purpose, so GitHub never tries to run it. Copy this to a spoke's
+# .github/workflows/call-hub.yml, replacing its Vercel-targeting content,
+# once you have a real deployed Apps Script Web App URL (see README.md's
+# "Alternative: Deploy Without Vercel" section for how to get one) - this
+# is a deliberate, manual switch you make per spoke, not something applied
+# for you before that URL exists.
+#
+# What changed from the Vercel version:
+#   - VERCEL_URL -> APPS_SCRIPT_URL (a new secret, set to the Web App URL
+#     `clasp deploy` printed).
+#   - The URL gets ?endpoint=autonomous_agent appended - Apps Script Web
+#     Apps expose one URL for both endpoints, not one route per file the
+#     way Vercel's api/*.js did.
+#   - No x-vercel-protection-bypass header, no VERCEL_BYPASS_TOKEN secret -
+#     Apps Script Web Apps have no equivalent forced auth wall, so there's
+#     nothing to bypass.
+#   - The POST body (owner/repo/mode) is completely unchanged.
+name: Ping CTO Hub
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # -> debug
+    - cron: '0 0 * * 0'      # Sunday midnight -> refactor
+    - cron: '0 12 * * 3'     # Wednesday noon -> hunt
+  workflow_dispatch:
+
+jobs:
+  call-central-brain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine Mode
+        id: mode
+        run: |
+          case "${{ github.event.schedule }}" in
+            '0 0 * * 0') echo "mode=refactor" >> $GITHUB_OUTPUT ;;
+            '0 12 * * 3') echo "mode=hunt" >> $GITHUB_OUTPUT ;;
+            *) echo "mode=debug" >> $GITHUB_OUTPUT ;;
+          esac
+      - name: Send Payload to Hub
+        env:
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+        run: |
+          curl -X POST "${APPS_SCRIPT_URL}?endpoint=autonomous_agent" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "owner": "${{ github.repository_owner }}",
+              "repo": "${{ github.event.repository.name }}",
+              "mode": "${{ steps.mode.outputs.mode }}"
+            }'

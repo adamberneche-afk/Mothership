@@ -1,0 +1,27 @@
+# Example hub self-reflection workflow targeting the Apps Script deployment
+# instead of Vercel. NOT active CI - see call-hub.apps-script.example.yml's
+# header comment for why this lives here and what to do with it.
+name: Hub Self-Reflection
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  self-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Hub for self-analysis
+        env:
+          # GLOBAL_GITHUB_TOKEN is still not needed here - the hub
+          # authenticates to GitHub server-side using its own Script
+          # Property, not anything the caller sends.
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+        run: |
+          curl -X POST "${APPS_SCRIPT_URL}?endpoint=autonomous_agent" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "owner": "${{ github.repository_owner }}",
+              "repo": "${{ github.event.repository.name }}",
+              "mode": "refactor"
+            }'

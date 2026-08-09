@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mothership Health Dashboard</title>
+<meta name="description" content="Live health and decision-log status for Mothership's connected spokes.">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#14161a">
+<style>
+  :root {
+    --paper: #f4f3ee;
+    --panel: #ffffff;
+    --ink: #1e2124;
+    --ink-soft: #5c5f57;
+    --line: #d9d5c7;
+    --accent: #a5551e;
+    --teal: #2f6459;
+    --good: #2f6459;
+    --warn: #9c7222;
+    --critical: #a23b36;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #14161a;
+      --panel: #1a1d22;
+      --ink: #e8e4d9;
+      --ink-soft: #a9a79c;
+      --line: rgba(255,255,255,0.14);
+      --accent: #de9455;
+      --teal: #74b4a2;
+      --good: #74b4a2;
+      --warn: #d9a63f;
+      --critical: #de7a6e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    line-height: 1.5;
+  }
+  .page { max-width: 900px; margin: 0 auto; padding: 24px 20px 64px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 4px; }
+  h1 { font-size: 1.4rem; margin: 0; }
+  #status { font-size: 0.85rem; color: var(--ink-soft); margin: 4px 0 20px; }
+  button {
+    font: inherit; font-size: 0.85rem; padding: 6px 14px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer;
+  }
+  button:hover { border-color: var(--teal); color: var(--teal); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; min-width: 620px; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  thead th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-soft); }
+  tbody tr:last-child td { border-bottom: none; }
+  a { color: var(--teal); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .muted { color: var(--ink-soft); font-size: 0.85rem; }
+  .chip {
+    display: inline-block; font-size: 0.75rem; padding: 2px 10px; border-radius: 20px; font-weight: 600;
+  }
+  .chip-good { background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--good); }
+  .chip-warn { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+  .chip-critical { background: color-mix(in srgb, var(--critical) 20%, transparent); color: var(--critical); }
+  .chip-neutral { background: color-mix(in srgb, var(--ink-soft) 16%, transparent); color: var(--ink-soft); }
+  #empty-state { padding: 32px; text-align: center; color: var(--ink-soft); }
+  footer { margin-top: 20px; font-size: 0.75rem; color: var(--ink-soft); }
+</style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>Mothership Health Dashboard</h1>
+      <button id="refresh" type="button">Refresh</button>
+    </header>
+    <p id="status">Loading…</p>
+
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Spoke</th>
+            <th>Issues filed</th>
+            <th>Decisions logged</th>
+            <th>Skip rate</th>
+            <th>Status</th>
+            <th>Outcome breakdown</th>
+          </tr>
+        </thead>
+        <tbody id="report-body"></tbody>
+      </table>
+      <div id="empty-state" hidden>No spokes registered, or <code>spokes.json</code> couldn't be reached.</div>
+    </div>
+
+    <footer>
+      Reads directly from <code>api.github.com</code>, unauthenticated - no backend of its own.
+      Same metrics as <code>scripts/health-report.js</code>'s weekly pinned issue, live in your browser instead of a 7-day-old snapshot.
+    </footer>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

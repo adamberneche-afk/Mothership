@@ -1,0 +1,13 @@
+{
+  "name": "Mothership Health Dashboard",
+  "short_name": "Mothership",
+  "description": "Live health and decision-log status for Mothership's connected spokes",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#14161a",
+  "theme_color": "#14161a",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

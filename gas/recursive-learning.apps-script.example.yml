@@ -1,0 +1,21 @@
+# Example recursive-learning workflow targeting the Apps Script deployment
+# instead of Vercel. NOT active CI - see call-hub.apps-script.example.yml's
+# header comment for why this lives here and what to do with it.
+name: Recursive Learning
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'  # Monthly, 1st of the month at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Hub for cross-spoke aggregation
+        env:
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+        run: |
+          curl -X POST "${APPS_SCRIPT_URL}?endpoint=recursive_learning" \
+            -H "Content-Type: application/json" \
+            -d '{}'
