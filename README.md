@@ -212,6 +212,16 @@ On top of that, `api/recursive_learning.js` runs monthly and looks across every 
 
 This repo's root `spokes.json` lists the spokes this hub knows about (`{ owner, repo, addedAt, status }`), used by cross-spoke tooling that needs to iterate every connected project rather than operate on just one. As of this writing: `tso`, `thinkos-server`, and `tais` - all three now have the standard spoke contract (`NORTH_STAR.md`, `lessons.md`, `ai_decision_log.json`, `.github/workflows/call-hub.yml`) and are registered here. Being registered doesn't change how the per-commit heartbeat works (that only needs the spoke's own `VERCEL_URL` secret) - it's specifically for tooling that operates across the whole portfolio at once.
 
+## Testing & CI
+
+Every piece of decision logic in `api/` and `scripts/` is dependency-injected (an optional `{ octokit, fetchImpl, dryRunOverride }` for the two AI-calling endpoints; similarly for the plain scripts) specifically so it can be driven by a local mock harness instead of hitting GitHub or the AI API for real:
+
+- `scripts/dev-test-handler.mjs`, `dev-test-recursive-learning.mjs`, `dev-test-prune-logs.mjs`, `dev-test-health-report.mjs` - one per capability, run with `node scripts/dev-test-*.mjs` or all at once via `npm test`.
+- `.github/workflows/ci.yml` runs that full suite, a `python3 -m py_compile` check on both installer scripts, and a scratch-directory diff proving `setup_hub.py`'s generated output still matches this repo's real files - on every pull request, every push to `main`, and on demand. No secrets required: every harness runs against a fully mocked GitHub/AI client, so it's safe even on a PR opened from a fork.
+- A separate `docs-check` job in the same workflow fails a pull request that adds a new file under `api/`, `gas/`, `dashboard/`, or `.github/workflows/` without also touching `README.md` in the same diff - the automated version of the "is this documented?" check that found the gaps this section itself is an answer to. A `[skip-docs-check]` marker in the PR title or body is the escape hatch for genuine non-capability additions.
+
+Before this existed, verification was a manual sweep run by hand after every change - several real defects were found sitting in code that already had a passing test, which is exactly the gap automatic enforcement closes: a test only guards the future if something re-runs it on every subsequent change, not just the one where it was written.
+
 ## Values Alignment
 
 This system is designed to continuously improve toward producing:
