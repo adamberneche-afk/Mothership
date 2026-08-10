@@ -13,12 +13,24 @@
 // user (footer copy + the rate-limited status below) rather than left as
 // just a code comment - hitting it should look distinctly different from
 // an actual problem, not paint every spoke red.
+//
+// A short-lived sessionStorage cache (CACHE_TTL_MS below) sits in front of
+// the per-spoke calls specifically because of that cap: reopening the tab
+// or double-clicking Refresh within the TTL window repaints instantly from
+// cache instead of burning more of the budget, while a background refetch
+// still runs and patches the row in place once it lands (stale-while-
+// revalidate) - never masks staleness indefinitely, just avoids paying for
+// the same answer twice within a few seconds of it.
 
 const HUB_OWNER = 'adamberneche-afk';
 const HUB_REPO = 'Mothership';
 const HUB_ISSUE_LABEL = 'cto-hub-auto';
 const REPORT_WINDOW_DAYS = 7;
 const GITHUB_API = 'https://api.github.com';
+const FETCH_TIMEOUT_MS = 15000;
+const CACHE_TTL_MS = 45000;
+const CACHE_PREFIX = 'mothership-dashboard:';
+const BASE_TITLE = document.title;
 
 // Human labels for the raw decision-log outcome enum (ai_decision_log.json's
 // `outcome` field) - shown in the "Outcome breakdown" column instead of the
@@ -38,6 +50,46 @@ function outcomeLabel(key) {
   return OUTCOME_LABELS[key] || key;
 }
 
+// --- sessionStorage cache, guarded against every way it can fail ---------
+// Private-browsing mode, a full quota, or storage disabled outright can all
+// make sessionStorage throw on read or write - caching is a nice-to-have,
+// never something that should crash the dashboard, so every access is
+// wrapped and a failure just means "behave as if there's no cache."
+
+function readCache(key, { ignoreTtl = false } = {}) {
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+    const entry = JSON.parse(raw);
+    if (!ignoreTtl && Date.now() - entry.ts > CACHE_TTL_MS) return null;
+    return entry;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeCache(key, value) {
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ ts: Date.now(), value }));
+  } catch (e) {
+    // ignore - private browsing / quota exceeded / storage disabled
+  }
+}
+
+function spokeCacheKey(owner, repo) {
+  return `${CACHE_PREFIX}spoke:${owner}/${repo}`;
+}
+
+const SPOKES_CACHE_KEY = `${CACHE_PREFIX}spokes.json`;
+
+// Only real, successful reports are worth caching - caching a transient
+// failure (rate-limited/timed out/couldn't load) would just serve that same
+// failure back on the next load within the TTL window instead of trying
+// again, which is the opposite of what the cache is for.
+const FAILURE_STATUSES = new Set(["couldn't load", 'rate-limited', 'timed out']);
+
+// --- fetch helpers ---------------------------------------------------------
+
 // Rate-limit detail for a failed request. Every endpoint this dashboard
 // calls (repo contents, issue listing on a public repo) 404s on a missing
 // resource - it doesn't 403 - so a 403 here is treated as the 60-req/hr cap
@@ -55,32 +107,50 @@ function rateLimitInfo(res) {
   return { resetAt: resetHeader ? new Date(Number(resetHeader) * 1000) : null };
 }
 
+// A hung request (flaky network, captive portal) used to leave the Refresh
+// button disabled and the status stuck on "Loading…" forever, with no way
+// to recover short of a hard reload. A timeout turns that into a distinct,
+// recoverable status instead of an indefinite wait.
 async function fetchJson(url) {
-  const res = await fetch(url, { headers: { Accept: 'application/vnd.github.v3+json' } });
-  if (!res.ok) {
-    const err = new Error(`${url} -> ${res.status}`);
-    err.status = res.status;
-    err.rateLimited = rateLimitInfo(res);
-    throw err;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { headers: { Accept: 'application/vnd.github.v3+json' }, signal: controller.signal });
+    if (!res.ok) {
+      const err = new Error(`${url} -> ${res.status}`);
+      err.status = res.status;
+      err.rateLimited = rateLimitInfo(res);
+      throw err;
+    }
+    return await res.json();
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      const timeoutErr = new Error(`${url} timed out after ${FETCH_TIMEOUT_MS}ms`);
+      timeoutErr.timedOut = true;
+      throw timeoutErr;
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
 // GitHub's Contents API returns base64 wrapped at 60 chars/line - atob()
 // chokes on embedded newlines, so they're stripped first.
 //
-// Returns { ok: true, text } on success, or { ok: false, rateLimited } on
-// failure - deliberately not collapsing every failure to a bare `null`, so
-// callers can tell "reached the API, file doesn't exist yet" (a spoke that's
-// simply quiet) apart from "couldn't reach the API at all" (rate-limited or
-// down - a real problem, or at least not evidence of anything).
+// Returns { ok: true, text } on success, or { ok: false, rateLimited,
+// timedOut } on failure - deliberately not collapsing every failure to a
+// bare `null`, so callers can tell "reached the API, file doesn't exist
+// yet" (a spoke that's simply quiet) apart from "couldn't reach the API at
+// all" (rate-limited, timed out, or down - a real problem, or at least not
+// evidence of anything).
 async function fetchDecodedFile(owner, repo, path) {
   try {
     const data = await fetchJson(`${GITHUB_API}/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`);
     return { ok: true, text: atob(data.content.replace(/\n/g, '')) };
   } catch (e) {
     if (e.status === 404) return { ok: true, text: null }; // file genuinely doesn't exist - not an error
-    return { ok: false, rateLimited: e.rateLimited || null };
+    return { ok: false, rateLimited: e.rateLimited || null, timedOut: !!e.timedOut };
   }
 }
 
@@ -94,6 +164,15 @@ function safeParseJsonArray(text) {
   }
 }
 
+// A stray null/non-object entry (a bad manual edit, a trailing-comma
+// artifact) used to throw inside buildReportForSpoke and take the whole
+// batch down with it - see the per-spoke isolation in loadDashboard for the
+// other half of that fix. This half just means a malformed entry never gets
+// that far: it's silently dropped rather than crashing anything.
+function validSpokes(arr) {
+  return arr.filter((s) => s && typeof s === 'object' && typeof s.owner === 'string' && s.owner && typeof s.repo === 'string' && s.repo);
+}
+
 function groupBy(arr, keyFn) {
   const out = {};
   for (const item of arr) {
@@ -103,8 +182,8 @@ function groupBy(arr, keyFn) {
   return out;
 }
 
-// Same ok/rateLimited shape as fetchDecodedFile, wrapping a count instead of
-// file text.
+// Same ok/rateLimited/timedOut shape as fetchDecodedFile, wrapping a count
+// instead of file text.
 async function countIssuesCreatedSince(owner, repo, windowStart) {
   let data;
   try {
@@ -112,7 +191,7 @@ async function countIssuesCreatedSince(owner, repo, windowStart) {
       `${GITHUB_API}/repos/${owner}/${repo}/issues?state=all&labels=${HUB_ISSUE_LABEL}&sort=created&direction=desc&per_page=100`
     );
   } catch (e) {
-    return { ok: false, rateLimited: e.rateLimited || null };
+    return { ok: false, rateLimited: e.rateLimited || null, timedOut: !!e.timedOut };
   }
   let count = 0;
   for (const issue of data) {
@@ -123,9 +202,10 @@ async function countIssuesCreatedSince(owner, repo, windowStart) {
 }
 
 // Mirrors scripts/health-report.js's buildReportForSpoke - same fields, same
-// status-inference rules, plus a distinct 'error' status this client-side
-// port needs that the Actions-run original doesn't (a failed GitHub API
-// call there is a workflow failure, not a UI state to render).
+// status-inference rules, plus distinct 'error'/'rate-limited'/'timed out'
+// statuses this client-side port needs that the Actions-run original
+// doesn't (a failed GitHub API call there is a workflow failure, not a UI
+// state to render).
 async function buildReportForSpoke(spoke, windowStart) {
   const [issuesResult, logResult] = await Promise.all([
     countIssuesCreatedSince(spoke.owner, spoke.repo, windowStart),
@@ -133,6 +213,7 @@ async function buildReportForSpoke(spoke, windowStart) {
   ]);
 
   if (!issuesResult.ok || !logResult.ok) {
+    const timedOut = issuesResult.timedOut || logResult.timedOut;
     const rateLimited = issuesResult.rateLimited || logResult.rateLimited;
     return {
       owner: spoke.owner,
@@ -141,7 +222,7 @@ async function buildReportForSpoke(spoke, windowStart) {
       entriesInWindow: null,
       byOutcome: {},
       skipRate: null,
-      capabilityStatus: rateLimited ? 'rate-limited' : "couldn't load",
+      capabilityStatus: timedOut ? 'timed out' : rateLimited ? 'rate-limited' : "couldn't load",
       rateLimitResetAt: rateLimited ? rateLimited.resetAt : null,
     };
   }
@@ -170,11 +251,34 @@ async function buildReportForSpoke(spoke, windowStart) {
   return { owner: spoke.owner, repo: spoke.repo, issuesFiled: issuesResult.count, entriesInWindow: total, byOutcome, skipRate, capabilityStatus };
 }
 
+// Defense in depth: even after validSpokes filters the obviously-malformed
+// entries, buildReportForSpoke is still one unexpected error away from
+// taking the whole Promise.all-shaped batch down with it. Wrapping every
+// per-spoke call means one spoke's surprise is that spoke's problem, never
+// everyone else's.
+async function safeBuildReport(spoke, windowStart) {
+  try {
+    return await buildReportForSpoke(spoke, windowStart);
+  } catch (e) {
+    return {
+      owner: spoke.owner,
+      repo: spoke.repo,
+      issuesFiled: null,
+      entriesInWindow: null,
+      byOutcome: {},
+      skipRate: null,
+      capabilityStatus: "couldn't load",
+      rateLimitResetAt: null,
+    };
+  }
+}
+
 // Ranks worst-first so a real problem is never buried below quiet spokes.
 // 'no decisions logged this window' is deliberately NOT treated as bad here
 // - it means nothing happened, not that something is wrong.
 const STATUS_SEVERITY = {
   "couldn't load": 0,
+  'timed out': 0,
   'rate-limited': 1,
   'dry-run': 2,
   'active, no findings': 3,
@@ -190,54 +294,88 @@ function statusClass(status) {
   if (status === 'live') return 'good';
   if (status === 'dry-run') return 'warn';
   if (status === 'rate-limited') return 'warn';
-  if (status === "couldn't load") return 'critical';
+  if (status === "couldn't load" || status === 'timed out') return 'critical';
   return 'neutral';
 }
 
 function statusLabel(report) {
-  if (report.capabilityStatus === 'rate-limited') {
-    if (report.rateLimitResetAt) {
-      return `rate-limited - retry after ${report.rateLimitResetAt.toLocaleTimeString()}`;
-    }
-    return 'rate-limited - retry later';
+  let label;
+  if (report.capabilityStatus === 'timed out') {
+    label = 'timed out - try again';
+  } else if (report.capabilityStatus === 'rate-limited') {
+    label = report.rateLimitResetAt
+      ? `rate-limited - retry after ${report.rateLimitResetAt.toLocaleTimeString()}`
+      : 'rate-limited - retry later';
+  } else {
+    label = report.capabilityStatus;
   }
-  return report.capabilityStatus;
+  return report.fromCache ? `${label} (cached)` : label;
 }
 
-function renderRow(report) {
+// --- rendering: a keyed reconciliation instead of clear-and-rebuild -------
+// Wiping tbody and re-appending fresh rows on every load (including a
+// manual Refresh with perfectly good data already on screen) makes the
+// table visibly disappear and reappear on every click. Reusing existing
+// <tr> elements keyed by owner/repo - updating their cell text in place,
+// only adding/removing rows when the actual spoke set changes - means old
+// data stays visible until its replacement is ready, and this is also what
+// lets a background cache-revalidation patch a single row without touching
+// any other spoke's row at all.
+
+function buildRow(report) {
   const row = document.createElement('tr');
-  const skipPct = report.skipRate === null ? 'n/a' : `${Math.round(report.skipRate * 100)}%`;
-  const issuesFiled = report.issuesFiled === null ? 'n/a' : report.issuesFiled;
-  const outcomes = Object.entries(report.byOutcome)
-    .map(([k, v]) => `${outcomeLabel(k)}: ${v}`)
-    .join(', ') || 'none';
+  row.dataset.key = `${report.owner}/${report.repo}`;
 
   const repoCell = document.createElement('td');
   const link = document.createElement('a');
-  link.href = `https://github.com/${report.owner}/${report.repo}`;
   link.target = '_blank';
   link.rel = 'noopener';
-  link.append(`${report.owner}/${report.repo}`);
   const newTabHint = document.createElement('span');
   newTabHint.className = 'sr-only';
   newTabHint.textContent = ' (opens in a new tab)';
   link.appendChild(newTabHint);
   repoCell.appendChild(link);
-
   row.appendChild(repoCell);
-  row.appendChild(tdText(issuesFiled));
-  row.appendChild(tdText(report.entriesInWindow === null ? 'n/a' : report.entriesInWindow));
-  row.appendChild(tdText(skipPct));
+
+  row.appendChild(tdText(''));
+  row.appendChild(tdText(''));
+  row.appendChild(tdText(''));
 
   const statusCell = document.createElement('td');
   const chip = document.createElement('span');
-  chip.className = `chip chip-${statusClass(report.capabilityStatus)}`;
-  chip.textContent = statusLabel(report);
+  chip.className = 'chip';
   statusCell.appendChild(chip);
   row.appendChild(statusCell);
 
-  row.appendChild(tdText(outcomes, true));
+  row.appendChild(tdText('', true));
+
+  updateRow(row, report);
   return row;
+}
+
+function updateRow(row, report) {
+  const cells = row.children;
+
+  const link = cells[0].querySelector('a');
+  link.href = `https://github.com/${report.owner}/${report.repo}`;
+  const label = `${report.owner}/${report.repo}`;
+  if (link.firstChild && link.firstChild.nodeType === Node.TEXT_NODE) {
+    link.firstChild.textContent = label;
+  } else {
+    link.insertBefore(document.createTextNode(label), link.firstChild);
+  }
+
+  cells[1].textContent = report.issuesFiled === null ? 'n/a' : report.issuesFiled;
+  cells[2].textContent = report.entriesInWindow === null ? 'n/a' : report.entriesInWindow;
+  cells[3].textContent = report.skipRate === null ? 'n/a' : `${Math.round(report.skipRate * 100)}%`;
+
+  const chip = cells[4].querySelector('.chip');
+  chip.className = `chip chip-${statusClass(report.capabilityStatus)}`;
+  chip.textContent = statusLabel(report);
+
+  const outcomes = Object.entries(report.byOutcome).map(([k, v]) => `${outcomeLabel(k)}: ${v}`).join(', ') || 'none';
+  cells[5].textContent = outcomes;
+  cells[5].className = 'muted';
 }
 
 function tdText(text, muted = false) {
@@ -247,54 +385,168 @@ function tdText(text, muted = false) {
   return td;
 }
 
+function findRowByKey(tbody, key) {
+  for (const row of tbody.children) {
+    if (row.dataset.key === key) return row;
+  }
+  return null;
+}
+
+function renderRows(tbody, reports) {
+  const sorted = [...reports].sort((a, b) => statusRank(a.capabilityStatus) - statusRank(b.capabilityStatus));
+  const seen = new Set();
+  let cursor = tbody.firstElementChild;
+
+  for (const report of sorted) {
+    const key = `${report.owner}/${report.repo}`;
+    seen.add(key);
+    let row = findRowByKey(tbody, key);
+    if (row) {
+      updateRow(row, report);
+      if (row !== cursor) tbody.insertBefore(row, cursor);
+      cursor = row.nextElementSibling;
+    } else {
+      row = buildRow(report);
+      tbody.insertBefore(row, cursor);
+    }
+  }
+
+  for (const row of Array.from(tbody.children)) {
+    if (!seen.has(row.dataset.key)) row.remove();
+  }
+}
+
+function upsertReport(reports, report) {
+  const idx = reports.findIndex((r) => r.owner === report.owner && r.repo === report.repo);
+  if (idx >= 0) reports[idx] = report;
+  else reports.push(report);
+}
+
+// --- document title: a backgrounded/pinned tab should still say something -
+
+function updateDocumentTitle(reports) {
+  const hasProblem = reports.some((r) => STATUS_SEVERITY[r.capabilityStatus] === 0);
+  document.title = hasProblem ? `⚠ ${BASE_TITLE}` : BASE_TITLE;
+}
+
+// --- "Updated Xs/Xm ago" - stays honest without a manual refresh ----------
+
+let lastUpdatedAt = null;
+let relativeTimeTimer = null;
+
+function formatRelativeTime(date) {
+  const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
+  if (seconds < 5) return 'just now';
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  return `${hours}h ago`;
+}
+
+function refreshStatusTimestamp(statusEl) {
+  if (!lastUpdatedAt) return;
+  statusEl.textContent = `Updated ${formatRelativeTime(lastUpdatedAt)} · window: last ${REPORT_WINDOW_DAYS} days · source: api.github.com (unauthenticated, capped at 60 requests/hour)`;
+  statusEl.title = lastUpdatedAt.toLocaleString();
+}
+
+// --- main load/refresh flow ------------------------------------------------
+
 let loadInFlight = false;
+let liveReports = [];
 
 async function loadDashboard() {
-  if (loadInFlight) return; // ignore a Refresh click while a load is already running
+  if (loadInFlight) return; // ignore a Refresh click (or 'r' keypress) while a load is already running
   loadInFlight = true;
 
   const statusEl = document.getElementById('status');
   const tbody = document.getElementById('report-body');
   const emptyEl = document.getElementById('empty-state');
   const refreshBtn = document.getElementById('refresh');
+  const panel = document.querySelector('.panel');
+
   refreshBtn.disabled = true;
   refreshBtn.setAttribute('aria-busy', 'true');
-  statusEl.textContent = 'Loading…';
-  emptyEl.hidden = true;
-  emptyEl.textContent = '';
-  tbody.innerHTML = '';
+  panel.classList.add('refreshing');
+  if (liveReports.length === 0) {
+    statusEl.textContent = 'Loading…'; // only shown on a genuine first-ever load - a refresh with existing rows keeps them visible instead
+  }
 
   try {
     const windowStart = new Date(Date.now() - REPORT_WINDOW_DAYS * 24 * 60 * 60 * 1000);
 
     const spokesResult = await fetchDecodedFile(HUB_OWNER, HUB_REPO, 'spokes.json');
-    if (!spokesResult.ok) {
-      statusEl.textContent = spokesResult.rateLimited
-        ? "GitHub's unauthenticated rate limit (60 requests/hour) was hit while loading spokes.json - try again later."
-        : "Couldn't reach GitHub to load spokes.json - check your connection and try again.";
-      emptyEl.textContent = statusEl.textContent;
-      emptyEl.hidden = false;
-      return;
+    let spokes;
+    if (spokesResult.ok) {
+      spokes = validSpokes(safeParseJsonArray(spokesResult.text));
+      writeCache(SPOKES_CACHE_KEY, spokes);
+    } else {
+      // Fall back to the last-known spoke list (ignoring its TTL - any age
+      // beats nothing here) rather than going fully blank over a transient
+      // failure to fetch the registry itself.
+      const fallback = readCache(SPOKES_CACHE_KEY, { ignoreTtl: true });
+      if (!fallback) {
+        statusEl.textContent = spokesResult.timedOut
+          ? 'Timed out loading spokes.json - check your connection and try again.'
+          : spokesResult.rateLimited
+            ? "GitHub's unauthenticated rate limit (60 requests/hour) was hit while loading spokes.json - try again later."
+            : "Couldn't reach GitHub to load spokes.json - check your connection and try again.";
+        emptyEl.textContent = statusEl.textContent;
+        emptyEl.hidden = liveReports.length > 0; // existing rows, if any, stay visible instead of being replaced by this banner
+        return;
+      }
+      spokes = fallback.value;
+      statusEl.textContent = `Showing the last-known spoke list (${spokesResult.timedOut ? 'timed out' : spokesResult.rateLimited ? 'rate-limited' : "couldn't reach GitHub"} just now) - will retry on next refresh.`;
     }
 
-    const spokes = safeParseJsonArray(spokesResult.text);
     if (spokes.length === 0) {
       statusEl.textContent = 'spokes.json loaded but no spokes are registered yet.';
       emptyEl.textContent = statusEl.textContent;
       emptyEl.hidden = false;
+      liveReports = [];
+      renderRows(tbody, liveReports);
       return;
     }
 
-    const reports = await Promise.all(spokes.map((spoke) => buildReportForSpoke(spoke, windowStart)));
-    reports.sort((a, b) => statusRank(a.capabilityStatus) - statusRank(b.capabilityStatus));
-    for (const report of reports) {
-      tbody.appendChild(renderRow(report));
-    }
+    emptyEl.hidden = true;
 
-    statusEl.textContent = `Updated ${new Date().toLocaleString()} · window: last ${REPORT_WINDOW_DAYS} days · source: api.github.com (unauthenticated, capped at 60 requests/hour)`;
+    await Promise.allSettled(
+      spokes.map(async (spoke) => {
+        const key = spokeCacheKey(spoke.owner, spoke.repo);
+        const cached = readCache(key);
+
+        if (cached) {
+          // Instant repaint from cache, then a background revalidation
+          // patches this one row in place once fresh data lands - the rest
+          // of the table is untouched either way.
+          upsertReport(liveReports, { ...cached.value, fromCache: true });
+          renderRows(tbody, liveReports);
+          updateDocumentTitle(liveReports);
+        }
+
+        const fresh = await safeBuildReport(spoke, windowStart);
+        if (!FAILURE_STATUSES.has(fresh.capabilityStatus)) writeCache(key, fresh);
+        upsertReport(liveReports, fresh);
+        renderRows(tbody, liveReports);
+        updateDocumentTitle(liveReports);
+      })
+    );
+
+    // Drop rows for spokes no longer registered (a real change, not a
+    // transient hiccup - unlike the fetch-failure paths above, this one
+    // should replace what's on screen).
+    liveReports = liveReports.filter((r) => spokes.some((s) => s.owner === r.owner && s.repo === r.repo));
+    renderRows(tbody, liveReports);
+
+    lastUpdatedAt = new Date();
+    refreshStatusTimestamp(statusEl);
+    if (!relativeTimeTimer) {
+      relativeTimeTimer = setInterval(() => refreshStatusTimestamp(statusEl), 15000);
+    }
   } finally {
     refreshBtn.disabled = false;
     refreshBtn.removeAttribute('aria-busy');
+    panel.classList.remove('refreshing');
     loadInFlight = false;
   }
 }
@@ -302,6 +554,18 @@ async function loadDashboard() {
 window.addEventListener('load', () => {
   loadDashboard();
   document.getElementById('refresh').addEventListener('click', loadDashboard);
+
+  // 'r' triggers the same Refresh action, ignored while focus is in a form
+  // field or a modifier is held (so it doesn't fight browser/OS shortcuts).
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'r' && e.key !== 'R') return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const tag = e.target && e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    e.preventDefault();
+    loadDashboard();
+  });
+
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
