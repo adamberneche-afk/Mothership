@@ -71,3 +71,52 @@ jobs:
           # accumulated state, so they're expected to diverge from this repo's
           # real copies - that's not drift, it's the installer doing its job.
           exit $drift
+
+  docs-check:
+    runs-on: ubuntu-latest
+    # Only meaningful against a PR's own diff - the "did docs come along
+    # with this new file" question doesn't apply to a push/workflow_dispatch
+    # run, which has no base to diff against.
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, not the default shallow clone - needed to diff
+          # reliably against the PR's base sha below.
+          fetch-depth: 0
+
+      - name: Require README updates alongside new capability files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -e
+          if echo "$PR_TITLE $PR_BODY" | grep -qi '\[skip-docs-check\]'; then
+            echo "Skip marker found - not requiring a README update for this PR."
+            exit 0
+          fi
+
+          added_files=$(git diff --diff-filter=A --name-only "$BASE_SHA" "$HEAD_SHA")
+          changed_files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          watched_new_files=$(echo "$added_files" | grep -E '^(api/|gas/|dashboard/|\.github/workflows/)' || true)
+
+          if [ -z "$watched_new_files" ]; then
+            echo "No new files under api/, gas/, dashboard/, or .github/workflows/ - nothing to check."
+            exit 0
+          fi
+
+          if echo "$changed_files" | grep -qx 'README.md'; then
+            echo "New capability file(s) added and README.md was updated in the same PR:"
+            echo "$watched_new_files"
+            exit 0
+          fi
+
+          echo "::error::This PR adds new file(s) under api/, gas/, dashboard/, or .github/workflows/ but never touches README.md:"
+          echo "$watched_new_files"
+          echo ""
+          echo "Update README.md to describe what this adds, or add '[skip-docs-check]' to the PR title/description if this genuinely needs no documentation."
+          exit 1
