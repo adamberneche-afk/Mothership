@@ -9,7 +9,7 @@ The AI CTO Hub implements a centralized intelligence system that manages multipl
 - **Shared Standards**: A manual edit to this repo's global lessons/North Star files takes effect for every spoke on its next heartbeat. On top of that, a monthly job now looks for patterns across spokes and *proposes* updates to those files as a PR - a human still reviews and merges it, but the aggregation itself is automatic. See [Recursive Learning Loop](#recursive-learning-loop-apirecursive_learningjs).
 - **Centralized Maintenance**: Single point of updates for AI models, prompts, and standards  
 - **Lean Spokes**: Individual projects remain lightweight, only needing a heartbeat mechanism
-- **Global Cost Management**: All AI API traffic flows through a single Vercel deployment
+- **Global Cost Management**: All AI API traffic flows through a single deployment - Vercel by default, or Google Apps Script (see [Alternative: Deploy Without Vercel](#alternative-deploy-without-vercel-google-apps-script)) if you'd rather not use Vercel at all
 - **Structural Consistency**: Ensures coding standards and architectural decisions align across the portfolio
 
 ## Core Components
@@ -89,6 +89,14 @@ Runs weekly (`.github/workflows/health-report.yml`) as a plain GitHub Actions sc
 
 Like `prune-logs.js`, this needs its own `GLOBAL_GITHUB_TOKEN` Actions secret (see setup below, step 7) - the Vercel env var of the same name isn't visible to an Actions runner.
 
+### Health Dashboard (`dashboard/`)
+
+A standalone, installable PWA - additive, not part of the request-handling path (a PWA can't receive GitHub Actions' POST mid-cron-job the way the two endpoints above do). Since Mothership and every spoke are public repos, `dashboard/app.js` reads `spokes.json` and each spoke's `ai_decision_log.json`/issue list straight from `api.github.com` client-side and renders the same metrics `health-report.js`'s `buildReportForSpoke` already computes - skip rate, per-outcome breakdown, inferred live/dry-run status - live in a browser instead of waiting for the weekly pinned issue.
+
+No backend of its own: `manifest.json`/`sw.js` make it installable (add-to-home-screen), and it's meant to be hosted for free on **GitHub Pages** straight from this repo - enable it under Settings → Pages, source set to the `dashboard/` folder (or a `gh-pages` branch, if you'd rather not serve straight from `main`).
+
+**Known, disclosed limitation:** unauthenticated GitHub API calls are capped at 60 requests/hour per IP. Fine for a single-operator dashboard opened a few times a day; would need a caching proxy (the `gas/` deployment above could serve this read-only, authenticated, with a much higher cap) if usage ever grows past that.
+
 ## Setup Instructions
 
 ### 1. Deploy to Vercel
@@ -151,6 +159,25 @@ Set this under this repository's own Settings → Secrets and variables → Acti
 ### 7. Enable Health Reporting
 
 Unlike self-analysis, `.github/workflows/health-report.yml` doesn't call the Vercel deployment at all either - it's a plain Actions script that talks to GitHub directly, and needs the exact same `GLOBAL_GITHUB_TOKEN` secret as step 6 above. If you've already set that up for log pruning, health reporting works with no further setup.
+
+### Alternative: Deploy Without Vercel (Google Apps Script)
+
+Everything in steps 1-2 above (the two AI-calling endpoints and their config) can run on Google Apps Script instead of Vercel, using the `gas/` directory instead of `api/`. The two most common reasons to prefer this: you don't have (or don't want) a Vercel account, or your Vercel deployment sits behind Deployment Protection and you can't get a bypass token - Apps Script Web Apps have no equivalent forced auth wall, so there's nothing to bypass.
+
+`gas/` is a faithful, independently-tested port of `api/autonomous_agent.js` and `api/recursive_learning.js` - same validation, same dry-run/rate-cap rails, same decision-log dedup - adapted for three real platform differences (documented in `gas/autonomous_agent.js`'s header comment): no `@octokit/rest` (a hand-rolled `github.js` REST client replaces it), no Node `fetch`/Promises (Apps Script's `UrlFetchApp` is synchronous, so this code is too), and no local filesystem (the hub's own `universal_lessons.md`/`north_star_framework.md`/`hub_lessons.md` are fetched from this repo via the GitHub API instead of read off disk). Apps Script also has no `import`/`export` - every file in a project shares one global scope - so these files are plain global functions, not ES modules; `gas/constants.js` exists specifically so shared identifiers are declared exactly once instead of colliding.
+
+**Setup:**
+
+1. Install [`clasp`](https://github.com/google/clasp), Google's official CLI for Apps Script, and run `clasp login` (opens a browser to authorize your Google account).
+2. From this repo: `cd gas && clasp create --title "Mothership Hub" --type webapp --rootDir .` - this creates a new Apps Script project under your account and writes a real `gas/.clasp.json` (gitignored - it's a scriptId tied to your account, not shared code; `gas/.clasp.json.example` is the checked-in template).
+3. `clasp push` to upload `gas/*.js` and `gas/appsscript.json`.
+4. In the Apps Script IDE (`clasp open`) → Project Settings → Script Properties, set the same six config values as step 2's Vercel env vars: `AI_API_KEY`, `AI_MODEL`, `AI_BASE_URL`, `GLOBAL_GITHUB_TOKEN`, `DRY_RUN_MODE`, `RATE_CAP_PER_REPO_PER_DAY`. Same names, same defaults-fail-safe behavior.
+5. Deploy → New deployment → type **Web app** → Execute as **Me** → Who has access **Anyone** → Deploy. Copy the resulting Web App URL.
+6. On each spoke (instead of step 3's `VERCEL_URL`/`VERCEL_BYPASS_TOKEN`): set an `APPS_SCRIPT_URL` secret to that URL, and drop `VERCEL_BYPASS_TOKEN` entirely - nothing replaces it, because nothing needs to. Apps Script Web Apps expose one URL for both endpoints, not one route per file the way Vercel's `api/*.js` did - append `?endpoint=autonomous_agent` or `?endpoint=recursive_learning` to the deployed URL to pick one (omitting it defaults to `autonomous_agent`, matching Vercel's original default route). Ready-to-copy versions of `call-hub.yml`/`self-reflect.yml`/`recursive-learning.yml` targeting `APPS_SCRIPT_URL` this way live in `gas/*.apps-script.example.yml` - deliberately kept outside `.github/workflows/` so GitHub never tries to run them; copy the one you need over its Vercel-targeting counterpart once you have a real URL from step 5.
+
+**Verified locally, not yet live:** `scripts/dev-test-gas-*.mjs` cover the ported decision logic, the GitHub REST mapping, and `Code.js`'s request routing against hand-rolled fakes - the same testing discipline as everything else in this repo, and they already caught one real defect (`autonomous_agent.js`/`recursive_learning.js` both declaring the same constant, a silent `SyntaxError` the moment both files shared one real Apps Script project's scope) before any real deployment existed. What hasn't happened yet is an actual `clasp push` + live dispatch against a real Apps Script project - do that and confirm `dryRun: true` responses before pointing any spoke's schedule at it.
+
+**Not removed:** `api/*.js` and the Vercel path stay in this repo untouched. Dropping Vercel entirely - deleting `api/`, `setup_hub.py`'s Vercel-flavored generation, the Vercel-specific docs above - is a deliberate follow-up once the Apps Script path has actually been verified live, not bundled into adding it.
 
 ## How It Works
 

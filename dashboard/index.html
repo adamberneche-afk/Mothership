@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mothership Health Dashboard</title>
+<meta name="description" content="Live health and decision-log status for Mothership's connected spokes.">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="theme-color" content="#14161a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Mothership Health">
+<style>
+  :root {
+    --paper: #f4f3ee;
+    --panel: #ffffff;
+    --ink: #1e2124;
+    --ink-soft: #5c5f57;
+    --line: #d9d5c7;
+    --accent: #a5551e;
+    --teal: #2f6459;
+    --good: #2f6459;
+    --warn: #9c7222;
+    --critical: #a23b36;
+    --good-bg: #2f645930;
+    --warn-bg: #9c722233;
+    --critical-bg: #a23b3633;
+    --neutral-bg: #5c5f5729;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #14161a;
+      --panel: #1a1d22;
+      --ink: #e8e4d9;
+      --ink-soft: #a9a79c;
+      --line: rgba(255,255,255,0.14);
+      --accent: #de9455;
+      --teal: #74b4a2;
+      --good: #74b4a2;
+      --warn: #d9a63f;
+      --critical: #de7a6e;
+      --good-bg: #74b4a230;
+      --warn-bg: #d9a63f33;
+      --critical-bg: #de7a6e33;
+      --neutral-bg: #a9a79c29;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    line-height: 1.5;
+  }
+  .page { max-width: 900px; margin: 0 auto; padding: 24px 20px 64px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 4px; }
+  h1 { font-size: 1.4rem; margin: 0; }
+  #status { font-size: 0.85rem; color: var(--ink-soft); margin: 4px 0 20px; }
+  button {
+    font: inherit; font-size: 0.85rem; padding: 6px 14px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer;
+  }
+  button:hover { border-color: var(--teal); color: var(--teal); }
+  button:focus-visible, a:focus-visible {
+    outline: 2px solid var(--teal); outline-offset: 2px; border-radius: 4px;
+  }
+  button[disabled] { cursor: wait; opacity: 0.7; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; min-width: 620px; font-size: 0.9rem; }
+  caption {
+    text-align: left; caption-side: top; padding: 10px 14px 0; font-size: 0.75rem;
+    color: var(--ink-soft);
+  }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  thead th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-soft); }
+  th abbr { text-decoration-style: dotted; cursor: help; }
+  tbody tr:last-child td { border-bottom: none; }
+  a { color: var(--teal); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .muted { color: var(--ink-soft); font-size: 0.85rem; }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
+  .chip {
+    display: inline-block; font-size: 0.75rem; padding: 2px 10px; border-radius: 20px; font-weight: 600;
+  }
+  /* Solid fallback background-color declared first for browsers without
+     color-mix() support, then overridden by the color-mix() version where
+     it's available - without this, unsupported browsers drop the whole
+     background declaration and the chip loses its pill affordance entirely. */
+  .chip-good { background: var(--good-bg); background: color-mix(in srgb, var(--good) 18%, transparent); color: var(--good); }
+  .chip-warn { background: var(--warn-bg); background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+  .chip-critical { background: var(--critical-bg); background: color-mix(in srgb, var(--critical) 20%, transparent); color: var(--critical); }
+  .chip-neutral { background: var(--neutral-bg); background: color-mix(in srgb, var(--ink-soft) 16%, transparent); color: var(--ink-soft); }
+  #empty-state { padding: 32px; text-align: center; color: var(--ink-soft); }
+  .scroll-hint {
+    display: none; text-align: center; font-size: 0.75rem; color: var(--ink-soft);
+    margin: 6px 0 0;
+  }
+  @media (max-width: 640px) {
+    .scroll-hint { display: block; }
+  }
+  footer { margin-top: 20px; font-size: 0.75rem; color: var(--ink-soft); }
+</style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>Mothership Health Dashboard</h1>
+      <button id="refresh" type="button">Refresh</button>
+    </header>
+    <p id="status" role="status" aria-live="polite">Loading…</p>
+
+    <div class="panel">
+      <table>
+        <caption>Per-spoke hub activity for the last 7 days, worst status first.</caption>
+        <thead>
+          <tr>
+            <th>Spoke</th>
+            <th>Issues filed</th>
+            <th>Decisions logged</th>
+            <th><abbr title="Share of this window's logged decisions that did NOT result in an issue being created.">Skip rate</abbr></th>
+            <th>Status</th>
+            <th>Outcome breakdown</th>
+          </tr>
+        </thead>
+        <tbody id="report-body"></tbody>
+      </table>
+      <div id="empty-state" hidden>No spokes registered, or <code>spokes.json</code> couldn't be reached.</div>
+    </div>
+    <p class="scroll-hint" aria-hidden="true">⇠ scroll to see more columns ⇢</p>
+
+    <footer>
+      Reads directly from <code>api.github.com</code>, unauthenticated - no backend of its own.
+      Same metrics as <code>scripts/health-report.js</code>'s weekly pinned issue, live in your browser instead of a 7-day-old snapshot.
+      Unauthenticated GitHub API calls are capped at 60 requests/hour per IP - a "rate-limited" status below means the cap was hit, not that anything is actually wrong.
+    </footer>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
