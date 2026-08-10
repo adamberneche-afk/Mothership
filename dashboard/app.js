@@ -15,12 +15,17 @@
 // an actual problem, not paint every spoke red.
 //
 // A short-lived sessionStorage cache (CACHE_TTL_MS below) sits in front of
-// the per-spoke calls specifically because of that cap: reopening the tab
-// or double-clicking Refresh within the TTL window repaints instantly from
-// cache instead of burning more of the budget, while a background refetch
-// still runs and patches the row in place once it lands (stale-while-
-// revalidate) - never masks staleness indefinitely, just avoids paying for
-// the same answer twice within a few seconds of it.
+// the per-spoke calls specifically because of that cap. A passive trigger
+// (the initial load, returning to a backgrounded tab, the browser reporting
+// connectivity restored) skips the network entirely for any spoke whose
+// cache is still fresh - real budget savings, not just an instant repaint.
+// An explicit user action (clicking Refresh, pressing 'r') always forces a
+// real fetch regardless of freshness, on the theory that a user who just
+// asked for current data shouldn't silently get served something up to
+// CACHE_TTL_MS old - see loadDashboard's `force` parameter. Either way, a
+// stale (expired) cache entry is still shown instantly as a placeholder
+// while the real fetch runs in the background (stale-while-revalidate),
+// rather than going blank while waiting.
 
 const HUB_OWNER = 'adamberneche-afk';
 const HUB_REPO = 'Mothership';
@@ -304,7 +309,7 @@ function statusLabel(report) {
     label = 'timed out - try again';
   } else if (report.capabilityStatus === 'rate-limited') {
     label = report.rateLimitResetAt
-      ? `rate-limited - retry after ${report.rateLimitResetAt.toLocaleTimeString()}`
+      ? `rate-limited - retry in ${formatCountdown(report.rateLimitResetAt)}`
       : 'rate-limited - retry later';
   } else {
     label = report.capabilityStatus;
@@ -444,6 +449,17 @@ function formatRelativeTime(date) {
   return `${hours}h ago`;
 }
 
+// Counts down to a future time instead of up from a past one - the
+// rate-limited chip's inverse of formatRelativeTime above, reusing the same
+// tick (relativeTimeTimer) rather than a second interval.
+function formatCountdown(target) {
+  const seconds = Math.round((target.getTime() - Date.now()) / 1000);
+  if (seconds <= 0) return 'now';
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  return `${minutes}m`;
+}
+
 function refreshStatusTimestamp(statusEl) {
   if (!lastUpdatedAt) return;
   statusEl.textContent = `Updated ${formatRelativeTime(lastUpdatedAt)} · window: last ${REPORT_WINDOW_DAYS} days · source: api.github.com (unauthenticated, capped at 60 requests/hour)`;
@@ -455,7 +471,13 @@ function refreshStatusTimestamp(statusEl) {
 let loadInFlight = false;
 let liveReports = [];
 
-async function loadDashboard() {
+// force=true (an explicit Refresh click or 'r' keypress) always fetches
+// real data regardless of cache freshness. force=false (the initial load,
+// a visibility-triggered or online-triggered refetch) respects the cache -
+// skipping the network entirely for any spoke whose cache is still within
+// CACHE_TTL_MS, which is what actually protects the disclosed request
+// budget rather than just repainting instantly and fetching anyway.
+async function loadDashboard(force = false) {
   if (loadInFlight) return; // ignore a Refresh click (or 'r' keypress) while a load is already running
   loadInFlight = true;
 
@@ -513,16 +535,25 @@ async function loadDashboard() {
     await Promise.allSettled(
       spokes.map(async (spoke) => {
         const key = spokeCacheKey(spoke.owner, spoke.repo);
-        const cached = readCache(key);
+        // ignoreTtl: true so an *expired* entry is still readable as a
+        // stale-while-revalidate placeholder below - freshness is checked
+        // separately via isFresh, since "a cache entry exists" and "it's
+        // still within TTL" are different questions here.
+        const cached = readCache(key, { ignoreTtl: true });
+        const isFresh = !!cached && Date.now() - cached.ts <= CACHE_TTL_MS;
 
         if (cached) {
-          // Instant repaint from cache, then a background revalidation
-          // patches this one row in place once fresh data lands - the rest
-          // of the table is untouched either way.
+          // Instant repaint from cache (fresh or stale) so there's never a
+          // blank gap while a fetch is pending.
           upsertReport(liveReports, { ...cached.value, fromCache: true });
           renderRows(tbody, liveReports);
           updateDocumentTitle(liveReports);
         }
+
+        // A fresh, unforced load stops here - this is the actual budget
+        // savings, not just an instant repaint. Forced (explicit Refresh/
+        // 'r') or stale/missing always fetches.
+        if (isFresh && !force) return;
 
         const fresh = await safeBuildReport(spoke, windowStart);
         if (!FAILURE_STATUSES.has(fresh.capabilityStatus)) writeCache(key, fresh);
@@ -541,7 +572,13 @@ async function loadDashboard() {
     lastUpdatedAt = new Date();
     refreshStatusTimestamp(statusEl);
     if (!relativeTimeTimer) {
-      relativeTimeTimer = setInterval(() => refreshStatusTimestamp(statusEl), 15000);
+      // Same tick re-renders rows too, cheap at this table size, so a
+      // rate-limited chip's "retry in Xm" countdown ticks down live
+      // instead of sitting frozen between loads (formatCountdown above).
+      relativeTimeTimer = setInterval(() => {
+        refreshStatusTimestamp(statusEl);
+        renderRows(tbody, liveReports);
+      }, 15000);
     }
   } finally {
     refreshBtn.disabled = false;
@@ -553,7 +590,10 @@ async function loadDashboard() {
 
 window.addEventListener('load', () => {
   loadDashboard();
-  document.getElementById('refresh').addEventListener('click', loadDashboard);
+
+  // Explicit user actions always force a real fetch, bypassing the cache
+  // regardless of freshness - see loadDashboard's `force` parameter.
+  document.getElementById('refresh').addEventListener('click', () => loadDashboard(true));
 
   // 'r' triggers the same Refresh action, ignored while focus is in a form
   // field or a modifier is held (so it doesn't fight browser/OS shortcuts).
@@ -563,8 +603,27 @@ window.addEventListener('load', () => {
     const tag = e.target && e.target.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     e.preventDefault();
-    loadDashboard();
+    loadDashboard(true);
   });
+
+  // A tab left open for a while just sat there with increasingly stale data
+  // until someone remembered to click Refresh. Refetching on return-to-tab
+  // is the fix, but deliberately unforced: the now-corrected cache means
+  // this only actually spends a request on whatever's genuinely past
+  // CACHE_TTL_MS per spoke, not a blind poll that would need its own
+  // cadence re-tuned every time spokes.json grows (a fixed-interval poll's
+  // safe interval shrinks as request-cost-per-cycle grows with spoke
+  // count; a visibility-gated, cache-respecting refetch doesn't have that
+  // problem - it only ever spends anything when a human is actually
+  // looking, and only on what's actually stale).
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') loadDashboard();
+  });
+
+  // Self-heals the moment connectivity is restored (e.g. a laptop waking
+  // from sleep) instead of sitting in a stale/failed state until a manual
+  // click - unforced for the same budget reasons as visibilitychange above.
+  window.addEventListener('online', () => loadDashboard());
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});

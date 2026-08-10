@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mothership Health Dashboard</title>
 <meta name="description" content="Live health and decision-log status for Mothership's connected spokes.">
+<!-- The page unconditionally fetches from api.github.com within milliseconds
+     of load - let the browser start DNS+TLS setup immediately instead of
+     only once the first fetch() call actually fires. -->
+<link rel="preconnect" href="https://api.github.com" crossorigin>
 <link rel="manifest" href="manifest.json">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="icon-180.png">
