@@ -162,6 +162,7 @@
       Reads directly from <code>api.github.com</code>, unauthenticated - no backend of its own.
       Same metrics as <code>scripts/health-report.js</code>'s weekly pinned issue, live in your browser instead of a 7-day-old snapshot.
       Unauthenticated GitHub API calls are capped at 60 requests/hour per IP - a "rate-limited" status below means the cap was hit, not that anything is actually wrong.
+      A status labeled "offline - last seen ..." means this page couldn't reach GitHub at all and is showing the last real data it saw, however old that is.
     </footer>
   </div>
   <script src="app.js"></script>

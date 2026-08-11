@@ -87,6 +87,42 @@ function spokeCacheKey(owner, repo) {
 
 const SPOKES_CACHE_KEY = `${CACHE_PREFIX}spokes.json`;
 
+// --- localStorage durable fallback, for genuinely offline use ------------
+// The sessionStorage cache above exists purely to cut request volume and
+// deliberately forgets everything the moment the tab/browser session ends
+// - it was never meant as an offline store. This second, separate layer
+// is: no TTL, no expiry, survives across sessions (days, if that's how
+// long it's been since the tab was last online), and is read ONLY as a
+// last resort when there's nothing fresher to show - a genuinely offline
+// load (a brand-new tab, zero network) still shows real "last known status
+// as of 3 days ago" data instead of a bare failure message. Same guarded
+// try/catch pattern as the sessionStorage helpers: a failure here just
+// means "no offline fallback available," never a crash.
+const LAST_KNOWN_PREFIX = 'mothership-dashboard-last-known:';
+
+function readLastKnown(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeLastKnown(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify({ ts: Date.now(), value }));
+  } catch (e) {
+    // ignore - private browsing / quota exceeded / storage disabled
+  }
+}
+
+function lastKnownSpokeKey(owner, repo) {
+  return `${LAST_KNOWN_PREFIX}spoke:${owner}/${repo}`;
+}
+
+const SPOKES_LAST_KNOWN_KEY = `${LAST_KNOWN_PREFIX}spokes.json`;
+
 // Only real, successful reports are worth caching - caching a transient
 // failure (rate-limited/timed out/couldn't load) would just serve that same
 // failure back on the next load within the TTL window instead of trying
@@ -314,7 +350,9 @@ function statusLabel(report) {
   } else {
     label = report.capabilityStatus;
   }
-  return report.fromCache ? `${label} (cached)` : label;
+  if (report.fromCache) return `${label} (cached)`;
+  if (report.offlineAsOf) return `${label} (offline - last seen ${formatRelativeTime(new Date(report.offlineAsOf))})`;
+  return label;
 }
 
 // --- rendering: a keyed reconciliation instead of clear-and-rebuild -------
@@ -375,7 +413,11 @@ function updateRow(row, report) {
   cells[3].textContent = report.skipRate === null ? 'n/a' : `${Math.round(report.skipRate * 100)}%`;
 
   const chip = cells[4].querySelector('.chip');
-  chip.className = `chip chip-${statusClass(report.capabilityStatus)}`;
+  // A stale offline fallback always renders neutral regardless of its
+  // historical status - a days-old "live" shouldn't paint green at a
+  // glance and read as "currently fine," when what's actually known is
+  // only "was fine as of however long ago the label says."
+  chip.className = `chip chip-${report.offlineAsOf ? 'neutral' : statusClass(report.capabilityStatus)}`;
   chip.textContent = statusLabel(report);
 
   const outcomes = Object.entries(report.byOutcome).map(([k, v]) => `${outcomeLabel(k)}: ${v}`).join(', ') || 'none';
@@ -446,7 +488,12 @@ function formatRelativeTime(date) {
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.round(minutes / 60);
-  return `${hours}h ago`;
+  if (hours < 24) return `${hours}h ago`;
+  // Only the offline last-known fallback (localStorage, no expiry) can
+  // realistically age into days - the "Updated ..." line and the
+  // sessionStorage cache never live long enough to reach this branch.
+  const days = Math.round(hours / 24);
+  return `${days}d ago`;
 }
 
 // Counts down to a future time instead of up from a past one - the
@@ -502,11 +549,15 @@ async function loadDashboard(force = false) {
     if (spokesResult.ok) {
       spokes = validSpokes(safeParseJsonArray(spokesResult.text));
       writeCache(SPOKES_CACHE_KEY, spokes);
+      writeLastKnown(SPOKES_LAST_KNOWN_KEY, spokes);
     } else {
-      // Fall back to the last-known spoke list (ignoring its TTL - any age
-      // beats nothing here) rather than going fully blank over a transient
-      // failure to fetch the registry itself.
-      const fallback = readCache(SPOKES_CACHE_KEY, { ignoreTtl: true });
+      // Fall back to the last-known spoke list - sessionStorage first (any
+      // age within this browser session beats nothing), then the durable
+      // localStorage copy if the session itself is fresh too (a brand-new
+      // tab with zero network has no sessionStorage entry at all, but may
+      // still have a days-old localStorage one from a previous session) -
+      // rather than going fully blank over a failure to fetch the registry.
+      const fallback = readCache(SPOKES_CACHE_KEY, { ignoreTtl: true }) || readLastKnown(SPOKES_LAST_KNOWN_KEY);
       if (!fallback) {
         statusEl.textContent = spokesResult.timedOut
           ? 'Timed out loading spokes.json - check your connection and try again.'
@@ -556,8 +607,21 @@ async function loadDashboard(force = false) {
         if (isFresh && !force) return;
 
         const fresh = await safeBuildReport(spoke, windowStart);
-        if (!FAILURE_STATUSES.has(fresh.capabilityStatus)) writeCache(key, fresh);
-        upsertReport(liveReports, fresh);
+        if (!FAILURE_STATUSES.has(fresh.capabilityStatus)) {
+          writeCache(key, fresh);
+          writeLastKnown(lastKnownSpokeKey(spoke.owner, spoke.repo), fresh);
+          upsertReport(liveReports, fresh);
+        } else if (!cached) {
+          // Nothing fresher (not even a stale sessionStorage entry) was
+          // already on screen for this spoke - before giving up and
+          // showing a bare failure, check the durable offline fallback.
+          // Rendered with its own historical status/numbers, clearly aged-
+          // labeled (see statusLabel/updateRow) rather than as if current.
+          const lastKnown = readLastKnown(lastKnownSpokeKey(spoke.owner, spoke.repo));
+          upsertReport(liveReports, lastKnown ? { ...lastKnown.value, offlineAsOf: lastKnown.ts } : fresh);
+        } else {
+          upsertReport(liveReports, fresh);
+        }
         renderRows(tbody, liveReports);
         updateDocumentTitle(liveReports);
       })
