@@ -1,0 +1,41 @@
+name: Doctor
+
+# Deliberately workflow_dispatch-only, no schedule. This session's whole
+# investigation into the hub's health started because scheduled workflows
+# were failing silently with nobody watching - adding another scheduled job
+# here would risk the exact same failure mode this tool exists to catch.
+# Run this manually when setting up a new spoke, rotating a credential, or
+# troubleshooting - not on a clock.
+on:
+  workflow_dispatch:
+
+jobs:
+  doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run pre-flight checks against the hub and every registered spoke
+        env:
+          # GLOBAL_GITHUB_TOKEN also needs read access to each spoke's
+          # Actions secrets metadata (names only, never values) to check
+          # VERCEL_URL/APPS_SCRIPT_URL is set - the same classic PAT with
+          # full repo scope already documented in README already covers this.
+          GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
+          # AI_API_KEY/AI_BASE_URL normally live only as Vercel env vars, not
+          # Actions secrets (an Actions runner can't read Vercel's env either
+          # way) - the AI_API_KEY check below reports "not configured" and
+          # is skipped gracefully unless you also mirror these two as Actions
+          # secrets on this repo, the same way GLOBAL_GITHUB_TOKEN already
+          # has to be mirrored to reach an Actions runner at all.
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+        run: node scripts/doctor.js
