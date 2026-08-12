@@ -116,6 +116,8 @@ No backend of its own: `manifest.json`/`sw.js` make it installable (add-to-home-
 
 **Staying current without asking:** the page refetches automatically when you switch back to its tab, or when the browser reports connectivity restored after being offline - both deliberately budget-respecting (only fetches what's actually gone stale per spoke, reusing the same cache above) rather than a blind polling interval that would need re-tuning every time a spoke is added. `document.title` picks up a `⚠` marker when any spoke has a genuine problem (never for the disclosed rate-limited state) so a backgrounded or pinned tab is still useful at a glance, and both the "Updated ..." timestamp and a rate-limited spoke's "retry in ..." countdown tick down live instead of freezing between loads. Press `r`, or click Refresh, to force an immediate check regardless of cache freshness.
 
+**Hub Health:** a second panel, above the per-spoke one, answering a different question - not "are the spokes okay," but "is the swarm's own machinery actually running." Reads this repo's own Actions run history for its four scheduled workflows (`self-reflect`, `health-report`, `recursive-learning`, `prune-logs` - `ci.yml` is left out on purpose, it's a PR/push code-quality gate, not a scheduled operational signal) via the same unauthenticated `api.github.com` access as everything else here, with the same caching/offline-fallback treatment. Statuses: `healthy` (last run succeeded), `failing` (completed with any other outcome), `never run`, `in progress`, plus the same `rate-limited`/`couldn't load`/`timed out` states the spoke panel already has - worst-first, same as the spoke table.
+
 ## Setup Instructions
 
 ### 1. Deploy to Vercel

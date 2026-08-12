@@ -82,7 +82,12 @@
     .panel { transition: opacity 150ms ease; }
   }
   .panel.refreshing { opacity: 0.85; }
-  table { border-collapse: collapse; width: 100%; min-width: 620px; font-size: 0.9rem; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+  /* Only the spoke table's 6 columns need the wider minimum that forces
+     horizontal scroll on narrow viewports (see .scroll-hint below) - the
+     hub-health table's 3 columns fit comfortably without it. */
+  #spoke-table { min-width: 620px; }
+  h2 { font-size: 1rem; margin: 24px 0 8px; }
   caption {
     text-align: left; caption-side: top; padding: 10px 14px 0; font-size: 0.75rem;
     color: var(--ink-soft);
@@ -139,8 +144,25 @@
     </header>
     <p id="status" role="status" aria-live="polite">Loading…</p>
 
+    <h2>Hub Health</h2>
+    <p class="muted" style="margin:0 0 8px">Whether Mothership's own scheduled automation is actually running - not just spoke activity.</p>
     <div class="panel">
       <table>
+        <caption>Mothership's own scheduled workflows, worst status first.</caption>
+        <thead>
+          <tr>
+            <th>Workflow</th>
+            <th>Last run</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="hub-health-body"></tbody>
+      </table>
+    </div>
+
+    <h2>Spoke Health</h2>
+    <div class="panel">
+      <table id="spoke-table">
         <caption>Per-spoke hub activity for the last 7 days, worst status first.</caption>
         <thead>
           <tr>
@@ -161,6 +183,7 @@
     <footer>
       Reads directly from <code>api.github.com</code>, unauthenticated - no backend of its own.
       Same metrics as <code>scripts/health-report.js</code>'s weekly pinned issue, live in your browser instead of a 7-day-old snapshot.
+      Hub Health reads this repo's own Actions run history for its four scheduled workflows (<code>self-reflect</code>, <code>health-report</code>, <code>recursive-learning</code>, <code>prune-logs</code>) - <code>ci.yml</code> is left out on purpose, since it's a PR/push code-quality gate, not a scheduled operational signal.
       Unauthenticated GitHub API calls are capped at 60 requests/hour per IP - a "rate-limited" status below means the cap was hit, not that anything is actually wrong.
       A status labeled "offline - last seen ..." means this page couldn't reach GitHub at all and is showing the last real data it saw, however old that is.
     </footer>
