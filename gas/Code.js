@@ -18,6 +18,22 @@
 // `httpStatus` (400 for bad input, 200 for everything else) is preserved
 // inside the JSON body as `_httpStatus` instead, since nothing that calls
 // this endpoint today branches on the transport-level status code anyway.
+// GET requests: only ?endpoint=settings does anything real (see
+// gas/settings.js) - a small, token-gated page for viewing/updating this
+// deployment's config without reopening the Apps Script IDE every time.
+// Anything else just says what this URL is, since there was no doGet at all
+// before this - GET requests used to fall through to Apps Script's own
+// default error page, which said nothing useful either.
+function doGet(e) {
+  const endpoint = (e && e.parameter && e.parameter.endpoint) || '';
+  if (endpoint === 'settings') {
+    return renderSettingsPage((e && e.parameter && e.parameter.token) || '');
+  }
+  return HtmlService.createHtmlOutput(
+    '<!doctype html><html><body><p>Mothership hub webhook endpoint. POST requests only.</p></body></html>'
+  );
+}
+
 function doPost(e) {
   const endpoint = (e && e.parameter && e.parameter.endpoint) || 'autonomous_agent';
 
