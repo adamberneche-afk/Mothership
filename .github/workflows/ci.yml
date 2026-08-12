@@ -54,9 +54,10 @@ jobs:
           drift=0
           for f in \
             api/autonomous_agent.js api/recursive_learning.js \
-            scripts/prune-logs.js scripts/health-report.js \
+            scripts/prune-logs.js scripts/health-report.js scripts/collect-issue-feedback.js \
             .github/workflows/self-reflect.yml .github/workflows/prune-logs.yml \
             .github/workflows/health-report.yml .github/workflows/recursive-learning.yml \
+            .github/workflows/collect-issue-feedback.yml \
             package.json .gitignore; do
             if ! diff -u <(norm "$f") <(norm "/tmp/hub-scratch/$f") > /tmp/hub-scratch-diff.txt; then
               echo "::error::setup_hub.py's embedded copy of $f has drifted from the real file"
