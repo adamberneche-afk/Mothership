@@ -78,11 +78,22 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
     const lessons = await safeGetTextContent(octokit, spoke.owner, spoke.repo, 'lessons.md');
     const decisionLogText = await safeGetTextContent(octokit, spoke.owner, spoke.repo, 'ai_decision_log.json');
     const recentDecisions = safeParseJsonArray(decisionLogText).slice(-RECENT_DECISIONS_PER_SPOKE);
+    // scripts/collect-issue-feedback.js attaches a `feedback` field (from
+    // issue reactions - a real "this was wrong" signal from the spoke's own
+    // maintainer) to matching entries. Summarized here rather than dumped
+    // raw, same reasoning as RECENT_DECISIONS_PER_SPOKE's own cap - enough
+    // signal to see a pattern, not so much detail it drowns out everything
+    // else in the prompt.
+    const negativeFeedbackCount = recentDecisions.filter((d) => d && d.feedback && d.feedback.thumbsDown > 0).length;
+    const feedbackSummary = negativeFeedbackCount > 0
+      ? `${negativeFeedbackCount} of the last ${recentDecisions.length} decisions received negative maintainer feedback (a real thumbs-down reaction on the filed issue).`
+      : 'none of the last decisions received negative maintainer feedback.';
     perSpokeContext.push({
       owner: spoke.owner,
       repo: spoke.repo,
       lessons: lessons || 'No lessons.md found.',
-      recentDecisions
+      recentDecisions,
+      feedbackSummary
     });
   }
 
@@ -90,6 +101,7 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
     --- ${s.owner}/${s.repo} ---
     LESSONS: ${s.lessons}
     RECENT HUB DECISIONS: ${JSON.stringify(s.recentDecisions)}
+    MAINTAINER FEEDBACK: ${s.feedbackSummary}
   `).join('\n');
 
   const prompt = `
@@ -103,12 +115,16 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
 
     TASK: Look for a genuine pattern that recurs across TWO OR MORE spokes
     above - not something specific to only one project - that the CURRENT
-    GLOBAL STANDARDS or GLOBAL NORTH STAR don't already cover. If you find
-    one, propose it as the FULL, updated text of universal_lessons.md and/or
-    north_star_framework.md (not a diff - the complete file content with
-    your addition folded in). If nothing genuinely cross-cutting stands out,
-    set "has_proposal" to false and leave both patch fields as empty strings -
-    do not invent a pattern just to have something to propose.
+    GLOBAL STANDARDS or GLOBAL NORTH STAR don't already cover. Weigh a
+    MAINTAINER FEEDBACK signal that recurs across multiple spokes as real
+    evidence too - if several spokes show negative feedback on a similar
+    kind of finding, that's a sign a check should be adjusted or suppressed,
+    not just repeated. If you find one, propose it as the FULL, updated text
+    of universal_lessons.md and/or north_star_framework.md (not a diff - the
+    complete file content with your addition folded in). If nothing
+    genuinely cross-cutting stands out, set "has_proposal" to false and
+    leave both patch fields as empty strings - do not invent a pattern just
+    to have something to propose.
     Respond with ONLY valid JSON, exactly this shape:
     {
       "has_proposal": boolean,

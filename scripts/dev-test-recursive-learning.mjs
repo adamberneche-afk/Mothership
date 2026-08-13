@@ -68,11 +68,21 @@ function makeFakeOctokit({ spokesRegistry = [], perSpokeFiles = {}, defaultBranc
 
 function makeFakeFetch(aiJsonContent) {
   let callCount = 0;
-  const fetchImpl = async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
     callCount++;
+    calls.push({ url, options });
     return { json: async () => ({ choices: [{ message: { content: aiJsonContent } }] }) };
   };
   fetchImpl.callCount = () => callCount;
+  fetchImpl.calls = calls;
+  // The prompt actually sent to the AI - used to assert on what's in it
+  // (e.g. the MAINTAINER FEEDBACK line) without re-deriving the whole
+  // template here.
+  fetchImpl.lastPrompt = () => {
+    const last = calls[calls.length - 1];
+    return last ? JSON.parse(last.options.body).messages[0].content : null;
+  };
   return fetchImpl;
 }
 
@@ -156,12 +166,40 @@ async function testUsesTheRepoActualDefaultBranchNotHardcodedMain() {
   check('the PR base is the real default branch, not "main"', octokit.calls.pullsCreate[0]?.base === 'trunk');
 }
 
+async function testPromptIncludesNegativeMaintainerFeedbackSummary() {
+  console.log('the prompt includes a MAINTAINER FEEDBACK line naming a real negative-feedback count when scripts/collect-issue-feedback.js has recorded one');
+  const filesWithFeedback = {
+    ...SPOKE_FILES,
+    'fake-owner/fake-spoke:ai_decision_log.json': JSON.stringify([
+      { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'abc', outcome: 'created', issueUrl: 'https://github.com/fake-owner/fake-spoke/issues/1', summary: null, feedback: { thumbsDown: 2, thumbsUp: 0, checkedAt: '2026-08-02T00:00:00Z' } },
+      { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'def', outcome: 'no_findings', issueUrl: null, summary: null }
+    ])
+  };
+  const octokit = makeFakeOctokit({ spokesRegistry: ONE_SPOKE, perSpokeFiles: filesWithFeedback });
+  const fetchImpl = makeFakeFetch(NO_PROPOSAL_JSON);
+  await runRecursiveLearning({}, { octokit, fetchImpl, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
+  const prompt = fetchImpl.lastPrompt();
+  check('prompt mentions MAINTAINER FEEDBACK', /MAINTAINER FEEDBACK/.test(prompt));
+  check('prompt names the real negative-feedback count (1 of the 2 logged decisions)', /1 of the last 2 decisions received negative maintainer feedback/.test(prompt));
+}
+
+async function testPromptSaysNoneWhenNoNegativeFeedbackExists() {
+  console.log('the prompt says "none" when no decision has received negative maintainer feedback');
+  const octokit = makeFakeOctokit({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES });
+  const fetchImpl = makeFakeFetch(NO_PROPOSAL_JSON);
+  await runRecursiveLearning({}, { octokit, fetchImpl, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
+  const prompt = fetchImpl.lastPrompt();
+  check('prompt says none received negative maintainer feedback', /none of the last decisions received negative maintainer feedback/.test(prompt));
+}
+
 async function main() {
   await testNoSpokesRegisteredSkips();
   await testNoProposalSkips();
   await testDryRunNeverOpensAPR();
   await testLiveOpensExactlyOnePR();
   await testUsesTheRepoActualDefaultBranchNotHardcodedMain();
+  await testPromptIncludesNegativeMaintainerFeedbackSummary();
+  await testPromptSaysNoneWhenNoNegativeFeedbackExists();
 
   console.log('');
   if (failures > 0) {

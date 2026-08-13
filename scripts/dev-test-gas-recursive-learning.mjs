@@ -75,14 +75,23 @@ function makeFakeGithub({ spokesRegistry = [], perSpokeFiles = {}, defaultBranch
 
 function makeFakeAiFetch(aiJsonContent) {
   let callCount = 0;
-  const aiFetch = () => {
+  const calls = [];
+  const aiFetch = (url, options) => {
     callCount++;
+    calls.push({ url, options });
     return {
       getResponseCode: () => 200,
       getContentText: () => JSON.stringify({ choices: [{ message: { content: aiJsonContent } }] })
     };
   };
   aiFetch.callCount = () => callCount;
+  aiFetch.calls = calls;
+  // The prompt actually sent to the AI - Apps Script's UrlFetchApp uses
+  // `payload`, not fetch()'s `body`.
+  aiFetch.lastPrompt = () => {
+    const last = calls[calls.length - 1];
+    return last ? JSON.parse(last.options.payload).messages[0].content : null;
+  };
   return aiFetch;
 }
 
@@ -177,6 +186,32 @@ function testBase64RoundTripsThroughInjectedFunctions() {
   check('the written content decodes back to the real proposal text', unb64(write.content).includes('Validate before you trust.'));
 }
 
+function testPromptIncludesNegativeMaintainerFeedbackSummary() {
+  console.log('the prompt includes a MAINTAINER FEEDBACK line naming a real negative-feedback count when scripts/collect-issue-feedback.js has recorded one');
+  const filesWithFeedback = {
+    ...SPOKE_FILES,
+    'fake-owner/fake-spoke:ai_decision_log.json': JSON.stringify([
+      { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'abc', outcome: 'created', issueUrl: 'https://github.com/fake-owner/fake-spoke/issues/1', summary: null, feedback: { thumbsDown: 2, thumbsUp: 0, checkedAt: '2026-08-02T00:00:00Z' } },
+      { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'def', outcome: 'no_findings', issueUrl: null, summary: null }
+    ])
+  };
+  const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: filesWithFeedback });
+  const aiFetch = makeFakeAiFetch(NO_PROPOSAL_JSON);
+  runRecursiveLearning({}, { ...BASE_DEPS, github, aiFetch, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
+  const prompt = aiFetch.lastPrompt();
+  check('prompt mentions MAINTAINER FEEDBACK', /MAINTAINER FEEDBACK/.test(prompt));
+  check('prompt names the real negative-feedback count (1 of the 2 logged decisions)', /1 of the last 2 decisions received negative maintainer feedback/.test(prompt));
+}
+
+function testPromptSaysNoneWhenNoNegativeFeedbackExists() {
+  console.log('the prompt says "none" when no decision has received negative maintainer feedback');
+  const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES });
+  const aiFetch = makeFakeAiFetch(NO_PROPOSAL_JSON);
+  runRecursiveLearning({}, { ...BASE_DEPS, github, aiFetch, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
+  const prompt = aiFetch.lastPrompt();
+  check('prompt says none received negative maintainer feedback', /none of the last decisions received negative maintainer feedback/.test(prompt));
+}
+
 function main() {
   testNoSpokesRegisteredSkips();
   testNoProposalSkips();
@@ -184,6 +219,8 @@ function main() {
   testLiveOpensExactlyOnePR();
   testUsesTheRepoActualDefaultBranchNotHardcodedMain();
   testBase64RoundTripsThroughInjectedFunctions();
+  testPromptIncludesNegativeMaintainerFeedbackSummary();
+  testPromptSaysNoneWhenNoNegativeFeedbackExists();
 
   console.log('');
   if (failures > 0) {

@@ -1,0 +1,28 @@
+name: Collect Issue Feedback
+
+on:
+  schedule:
+    - cron: '0 6 * * 6'  # Weekly, Saturday at 06:00 UTC - offset from prune-logs.yml/health-report.yml's Sunday/Monday cadence
+  workflow_dispatch:
+
+jobs:
+  collect-feedback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Record maintainer feedback (issue reactions) across all registered spokes
+        env:
+          # Mirrors the Vercel env var of the same name - an Actions runner
+          # can't read Vercel's env, so this needs its own copy of the token
+          # as a repo secret, with cross-repo write access to every spoke.
+          GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
+        run: node scripts/collect-issue-feedback.js

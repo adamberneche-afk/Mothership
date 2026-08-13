@@ -70,13 +70,23 @@ Every decision the handler makes for a spoke - skip (no diff, no findings, inval
 
 Writes are best-effort (read-modify-write with retry on a stale `sha`, per repo, via the GitHub API) - a logging failure never fails the actual request, since the real decision has already been made by the time the log write happens. There is no separate database here; the log file itself is the durable state, same as everything else this handler persists.
 
+### Maintainer Feedback (`scripts/collect-issue-feedback.js`)
+
+Before this, the only way a spoke maintainer could tell the system "this finding was wrong" was closing the issue - nothing ever read that. GitHub already attaches a `reactions` summary (`{"+1", "-1", laugh, ...}`) to every issue `issues.listForRepo` returns, so a 👎 on a hub-filed issue is a free, already-available signal that was simply never collected. A weekly Actions script (`.github/workflows/collect-issue-feedback.yml`, plain GitHub token only, no AI):
+
+1. Lists every `cto-hub-auto`-labeled issue per registered spoke, reading each one's reaction counts.
+2. Matches issues back to the decision-log entry that created them (`issueUrl === issue.html_url`).
+3. Attaches `feedback: { thumbsUp, thumbsDown, checkedAt }` to any matching entry with a real thumbs-down count - additive, optional, no existing reader breaks.
+
+This feeds directly into the Recursive Learning Loop below, which weighs a feedback pattern that recurs across spokes as evidence a check should be adjusted or suppressed, not just repeated.
+
 ### Recursive Learning Loop (`api/recursive_learning.js`)
 
 A separate Vercel endpoint, distinct from `autonomous_agent.js`, that runs monthly (`.github/workflows/recursive-learning.yml`) and looks for patterns that recur across *multiple* spokes rather than reviewing one commit in one repo:
 
 1. Reads `spokes.json` (this repo's registry of connected spokes - `[{ "owner", "repo", "addedAt", "status" }, ...]`). If it's empty, the run is skipped.
-2. Fetches each registered spoke's `lessons.md` and recent `ai_decision_log.json` entries, alongside this hub's own current `universal_lessons.md`/`north_star_framework.md`.
-3. Asks the configured AI model to find a genuine cross-spoke pattern - not something specific to just one project - that the current global standards don't already cover, and to propose it as the full updated text of `universal_lessons.md` and/or `north_star_framework.md`.
+2. Fetches each registered spoke's `lessons.md` and recent `ai_decision_log.json` entries (including any `feedback` the maintainer-feedback script above has attached), alongside this hub's own current `universal_lessons.md`/`north_star_framework.md`.
+3. Asks the configured AI model to find a genuine cross-spoke pattern - not something specific to just one project - that the current global standards don't already cover, and to propose it as the full updated text of `universal_lessons.md` and/or `north_star_framework.md`. A recurring negative-feedback signal across spokes counts as real evidence here too, not just repeated findings.
 4. Same validation discipline as `autonomous_agent.js`: a `has_proposal` flag, and no action taken unless the response is well-formed with real reasoning and at least one patch.
 5. Same `DRY_RUN_MODE` rail: dry-run reports the proposal in the response without acting on it.
 6. In live mode, it **never pushes directly to `main`** - it opens a new branch, commits the proposed file(s), and opens a PR against this repo with the AI's reasoning as the PR body. A human still has to review and merge it, same as any other PR.
