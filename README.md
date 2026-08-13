@@ -2,6 +2,17 @@
 
 This repository serves as the central intelligence (the "Mothership") for a hub-and-spoke autonomous coding swarm system.
 
+## Why This Exists
+
+The value proposition is leverage: write engineering judgment down once (`universal_lessons.md`, `north_star_framework.md`) and have it re-applied continuously across every connected spoke, instead of re-reviewing each project by hand. Each spoke stays lean - it only needs a heartbeat mechanism - while all the standards live centrally, in the hub. The Recursive Learning Loop pushes this further: a pattern the AI notices recurring across more than one spoke gets proposed back into the shared standards as a PR, so a lesson learned fixing one project can make every other project a little better too - a human still reviews and merges that proposal, the aggregation itself is what's automatic.
+
+That leverage is deliberately safety-railed, and the caveat is part of the value proposition, not an afterthought: an earlier, naive version of this same idea - no real code in the prompt, no validation of what came back - produced ~1,974 fabricated GitHub issues against `tso` over four months (see `DOCS_VS_CODEBASE.md`). Everything built since - dry-run-by-default, per-repo daily rate caps, decision logs, strict response validation - exists because trusting an AI reviewer to act autonomously has to be earned incrementally and provably, not assumed.
+
+There are two different intended experiences here, close to opposite on purpose:
+
+- **The operator running the swarm** should get glanceable confidence, not a reason to dig through logs: a scheduled heartbeat quietly reviews real commit diffs, a single pinned health-report issue updates in place instead of spamming, and the [Health Dashboard](#health-dashboard-dashboard) gives the same picture live in a browser - worst-status-first, so a real problem is never buried under quiet ones. That's the intended experience once a hub URL is actually live and every piece is wired to it - as of this writing it isn't yet (see `DOCS_VS_CODEBASE.md` #7), so today this describes designed, tested behavior rather than something an operator can currently check in on.
+- **The people actually using the spoke products** (`tso`, `thinkos-server`, `tais`) should never know any of this exists. That's the literal goal in `north_star_framework.md`: *"Efficiency without Anxiety," "Invisible Complexity - the AI handles the mess, the user sees the magic," "Forgiving Design."* Mothership's job is to catch the silent bug and nudge the refactor before either ever becomes something a real user has to notice. Success looks like nothing changing for them at all - see [Values Alignment](#values-alignment) below for how this is meant to compound across the whole portfolio.
+
 ## Overview
 
 The AI CTO Hub implements a centralized intelligence system that manages multiple project repositories ("spokes") through a hub-and-spoke model. The system enables:
