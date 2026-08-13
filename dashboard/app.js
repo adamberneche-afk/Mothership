@@ -37,6 +37,17 @@ const CACHE_TTL_MS = 45000;
 const CACHE_PREFIX = 'mothership-dashboard:';
 const BASE_TITLE = document.title;
 
+// The hub's own scheduled automation - "is the swarm's own machinery
+// actually running," not spoke activity. ci.yml is deliberately excluded:
+// it's a PR/push code-quality gate, not a scheduled operational signal an
+// operator needs a glance at here.
+const HUB_WORKFLOWS = [
+  { file: 'self-reflect.yml', label: 'Hub Self-Reflection' },
+  { file: 'health-report.yml', label: 'Health Report' },
+  { file: 'recursive-learning.yml', label: 'Recursive Learning' },
+  { file: 'prune-logs.yml', label: 'Prune Decision Logs' },
+];
+
 // Human labels for the raw decision-log outcome enum (ai_decision_log.json's
 // `outcome` field) - shown in the "Outcome breakdown" column instead of the
 // snake_case identifiers those files actually store.
@@ -122,6 +133,14 @@ function lastKnownSpokeKey(owner, repo) {
 }
 
 const SPOKES_LAST_KNOWN_KEY = `${LAST_KNOWN_PREFIX}spokes.json`;
+
+function hubWorkflowCacheKey(file) {
+  return `${CACHE_PREFIX}hub-workflow:${file}`;
+}
+
+function lastKnownHubWorkflowKey(file) {
+  return `${LAST_KNOWN_PREFIX}hub-workflow:${file}`;
+}
 
 // Only real, successful reports are worth caching - caching a transient
 // failure (rate-limited/timed out/couldn't load) would just serve that same
@@ -242,6 +261,20 @@ async function countIssuesCreatedSince(owner, repo, windowStart) {
   return { ok: true, count };
 }
 
+// Same ok/rateLimited/timedOut shape as fetchDecodedFile/
+// countIssuesCreatedSince, wrapping the most recent run of one workflow.
+// GitHub returns `workflow_runs: []` (total_count 0) for a workflow that has
+// never run - not a 404 - so `run: null` on success means "never run,"
+// genuinely distinct from "couldn't check."
+async function fetchLatestWorkflowRun(owner, repo, file) {
+  try {
+    const data = await fetchJson(`${GITHUB_API}/repos/${owner}/${repo}/actions/workflows/${file}/runs?per_page=1`);
+    return { ok: true, run: (data.workflow_runs && data.workflow_runs[0]) || null };
+  } catch (e) {
+    return { ok: false, rateLimited: e.rateLimited || null, timedOut: !!e.timedOut };
+  }
+}
+
 // Mirrors scripts/health-report.js's buildReportForSpoke - same fields, same
 // status-inference rules, plus distinct 'error'/'rate-limited'/'timed out'
 // statuses this client-side port needs that the Actions-run original
@@ -312,6 +345,91 @@ async function safeBuildReport(spoke, windowStart) {
       rateLimitResetAt: null,
     };
   }
+}
+
+// Defense in depth, same reasoning as safeBuildReport above: one workflow's
+// unexpected error should never take the others down with it.
+async function safeBuildHubWorkflowReport(entry) {
+  try {
+    return await buildHubWorkflowReport(entry);
+  } catch (e) {
+    return { file: entry.file, label: entry.label, lastRunAt: null, htmlUrl: null, hubStatus: "couldn't load" };
+  }
+}
+
+// Mirrors buildReportForSpoke's shape, but classifying a workflow's most
+// recent run instead of a spoke's decision log: 'never run' (zero runs
+// ever - a real, distinct answer, not a failure), 'in progress' (still
+// running), 'healthy' (last completed run succeeded), 'failing' (completed
+// with any other conclusion - failure/cancelled/timed_out/etc).
+async function buildHubWorkflowReport(entry) {
+  const result = await fetchLatestWorkflowRun(HUB_OWNER, HUB_REPO, entry.file);
+  if (!result.ok) {
+    return {
+      file: entry.file,
+      label: entry.label,
+      lastRunAt: null,
+      htmlUrl: null,
+      hubStatus: result.timedOut ? 'timed out' : result.rateLimited ? 'rate-limited' : "couldn't load",
+      rateLimitResetAt: result.rateLimited ? result.rateLimited.resetAt : null,
+    };
+  }
+  const run = result.run;
+  if (!run) {
+    return {
+      file: entry.file,
+      label: entry.label,
+      lastRunAt: null,
+      htmlUrl: `https://github.com/${HUB_OWNER}/${HUB_REPO}/actions/workflows/${entry.file}`,
+      hubStatus: 'never run',
+    };
+  }
+  const hubStatus = run.status !== 'completed' ? 'in progress' : run.conclusion === 'success' ? 'healthy' : 'failing';
+  return { file: entry.file, label: entry.label, lastRunAt: run.created_at, htmlUrl: run.html_url, hubStatus };
+}
+
+// Only real answers are worth caching - a transient fetch failure isn't,
+// same reasoning as FAILURE_STATUSES below (this is the hub-workflow
+// equivalent of that same set).
+const HUB_FAILURE_STATUSES = new Set(["couldn't load", 'rate-limited', 'timed out']);
+
+// Worst-first: an actively failing or unreachable workflow outranks one
+// that's simply never been exercised, which outranks one currently running.
+const HUB_STATUS_SEVERITY = {
+  "couldn't load": 0,
+  'timed out': 0,
+  failing: 0,
+  'rate-limited': 1,
+  'never run': 2,
+  'in progress': 3,
+  healthy: 4,
+};
+
+function hubStatusRank(status) {
+  return status in HUB_STATUS_SEVERITY ? HUB_STATUS_SEVERITY[status] : 99;
+}
+
+function hubStatusClass(status) {
+  if (status === 'healthy') return 'good';
+  if (status === 'in progress') return 'neutral';
+  if (status === 'never run' || status === 'rate-limited') return 'warn';
+  return 'critical'; // failing, couldn't load, timed out
+}
+
+function hubStatusLabel(report) {
+  let label;
+  if (report.hubStatus === 'timed out') {
+    label = 'timed out - try again';
+  } else if (report.hubStatus === 'rate-limited') {
+    label = report.rateLimitResetAt
+      ? `rate-limited - retry in ${formatCountdown(report.rateLimitResetAt)}`
+      : 'rate-limited - retry later';
+  } else {
+    label = report.hubStatus;
+  }
+  if (report.fromCache) return `${label} (cached)`;
+  if (report.offlineAsOf) return `${label} (offline - last seen ${formatRelativeTime(new Date(report.offlineAsOf))})`;
+  return label;
 }
 
 // Ranks worst-first so a real problem is never buried below quiet spokes.
@@ -469,11 +587,95 @@ function upsertReport(reports, report) {
   else reports.push(report);
 }
 
-// --- document title: a backgrounded/pinned tab should still say something -
+// --- hub-health rows: same keyed-reconciliation shape as the spoke rows
+// above, keyed by workflow file instead of owner/repo. findRowByKey/tdText
+// below are already generic enough to reuse as-is.
 
-function updateDocumentTitle(reports) {
-  const hasProblem = reports.some((r) => STATUS_SEVERITY[r.capabilityStatus] === 0);
-  document.title = hasProblem ? `⚠ ${BASE_TITLE}` : BASE_TITLE;
+function buildHubRow(report) {
+  const row = document.createElement('tr');
+  row.dataset.key = report.file;
+
+  const nameCell = document.createElement('td');
+  const link = document.createElement('a');
+  link.target = '_blank';
+  link.rel = 'noopener';
+  const newTabHint = document.createElement('span');
+  newTabHint.className = 'sr-only';
+  newTabHint.textContent = ' (opens in a new tab)';
+  link.appendChild(newTabHint);
+  nameCell.appendChild(link);
+  row.appendChild(nameCell);
+
+  row.appendChild(tdText('', true));
+
+  const statusCell = document.createElement('td');
+  const chip = document.createElement('span');
+  chip.className = 'chip';
+  statusCell.appendChild(chip);
+  row.appendChild(statusCell);
+
+  updateHubRow(row, report);
+  return row;
+}
+
+function updateHubRow(row, report) {
+  const cells = row.children;
+
+  const link = cells[0].querySelector('a');
+  link.href = report.htmlUrl || `https://github.com/${HUB_OWNER}/${HUB_REPO}/actions`;
+  if (link.firstChild && link.firstChild.nodeType === Node.TEXT_NODE) {
+    link.firstChild.textContent = report.label;
+  } else {
+    link.insertBefore(document.createTextNode(report.label), link.firstChild);
+  }
+
+  cells[1].textContent = report.lastRunAt ? formatRelativeTime(new Date(report.lastRunAt)) : 'never';
+  cells[1].title = report.lastRunAt ? new Date(report.lastRunAt).toLocaleString() : '';
+
+  const chip = cells[2].querySelector('.chip');
+  chip.className = `chip chip-${report.offlineAsOf ? 'neutral' : hubStatusClass(report.hubStatus)}`;
+  chip.textContent = hubStatusLabel(report);
+}
+
+function renderHubRows(tbody, reports) {
+  const sorted = [...reports].sort((a, b) => hubStatusRank(a.hubStatus) - hubStatusRank(b.hubStatus));
+  const seen = new Set();
+  let cursor = tbody.firstElementChild;
+
+  for (const report of sorted) {
+    const key = report.file;
+    seen.add(key);
+    let row = findRowByKey(tbody, key);
+    if (row) {
+      updateHubRow(row, report);
+      if (row !== cursor) tbody.insertBefore(row, cursor);
+      cursor = row.nextElementSibling;
+    } else {
+      row = buildHubRow(report);
+      tbody.insertBefore(row, cursor);
+    }
+  }
+
+  for (const row of Array.from(tbody.children)) {
+    if (!seen.has(row.dataset.key)) row.remove();
+  }
+}
+
+function upsertHubReport(reports, report) {
+  const idx = reports.findIndex((r) => r.file === report.file);
+  if (idx >= 0) reports[idx] = report;
+  else reports.push(report);
+}
+
+// --- document title: a backgrounded/pinned tab should still say something -
+// Reads liveReports/liveHubReports directly rather than taking them as
+// parameters - both sections call this after every render, and threading
+// two arrays through every call site added nothing but noise.
+
+function updateDocumentTitle() {
+  const hasSpokeProblem = liveReports.some((r) => STATUS_SEVERITY[r.capabilityStatus] === 0);
+  const hasHubProblem = liveHubReports.some((r) => HUB_STATUS_SEVERITY[r.hubStatus] === 0);
+  document.title = hasSpokeProblem || hasHubProblem ? `⚠ ${BASE_TITLE}` : BASE_TITLE;
 }
 
 // --- "Updated Xs/Xm ago" - stays honest without a manual refresh ----------
@@ -517,11 +719,154 @@ function refreshStatusTimestamp(statusEl) {
 
 let loadInFlight = false;
 let liveReports = [];
+let liveHubReports = [];
+
+// Everything this section touches (spokes.json + per-spoke reports) is
+// independent of loadHubHealthSection below - split out so one section's
+// failure (or its own early-exit branches) never blocks the other from
+// running. Returns true when it's set a terminal status message of its own
+// (no spokes.json, no fallback available; or a genuinely empty registry) -
+// the caller uses that to know not to overwrite it with a generic "Updated
+// ..." timestamp, matching this function's own pre-split behavior exactly.
+async function loadSpokeSection(force) {
+  const statusEl = document.getElementById('status');
+  const tbody = document.getElementById('report-body');
+  const emptyEl = document.getElementById('empty-state');
+  const windowStart = new Date(Date.now() - REPORT_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+
+  const spokesResult = await fetchDecodedFile(HUB_OWNER, HUB_REPO, 'spokes.json');
+  let spokes;
+  if (spokesResult.ok) {
+    spokes = validSpokes(safeParseJsonArray(spokesResult.text));
+    writeCache(SPOKES_CACHE_KEY, spokes);
+    writeLastKnown(SPOKES_LAST_KNOWN_KEY, spokes);
+  } else {
+    // Fall back to the last-known spoke list - sessionStorage first (any
+    // age within this browser session beats nothing), then the durable
+    // localStorage copy if the session itself is fresh too (a brand-new
+    // tab with zero network has no sessionStorage entry at all, but may
+    // still have a days-old localStorage one from a previous session) -
+    // rather than going fully blank over a failure to fetch the registry.
+    const fallback = readCache(SPOKES_CACHE_KEY, { ignoreTtl: true }) || readLastKnown(SPOKES_LAST_KNOWN_KEY);
+    if (!fallback) {
+      statusEl.textContent = spokesResult.timedOut
+        ? 'Timed out loading spokes.json - check your connection and try again.'
+        : spokesResult.rateLimited
+          ? "GitHub's unauthenticated rate limit (60 requests/hour) was hit while loading spokes.json - try again later."
+          : "Couldn't reach GitHub to load spokes.json - check your connection and try again.";
+      emptyEl.textContent = statusEl.textContent;
+      emptyEl.hidden = liveReports.length > 0; // existing rows, if any, stay visible instead of being replaced by this banner
+      return true;
+    }
+    spokes = fallback.value;
+    statusEl.textContent = `Showing the last-known spoke list (${spokesResult.timedOut ? 'timed out' : spokesResult.rateLimited ? 'rate-limited' : "couldn't reach GitHub"} just now) - will retry on next refresh.`;
+  }
+
+  if (spokes.length === 0) {
+    statusEl.textContent = 'spokes.json loaded but no spokes are registered yet.';
+    emptyEl.textContent = statusEl.textContent;
+    emptyEl.hidden = false;
+    liveReports = [];
+    renderRows(tbody, liveReports);
+    return true;
+  }
+
+  emptyEl.hidden = true;
+
+  await Promise.allSettled(
+    spokes.map(async (spoke) => {
+      const key = spokeCacheKey(spoke.owner, spoke.repo);
+      // ignoreTtl: true so an *expired* entry is still readable as a
+      // stale-while-revalidate placeholder below - freshness is checked
+      // separately via isFresh, since "a cache entry exists" and "it's
+      // still within TTL" are different questions here.
+      const cached = readCache(key, { ignoreTtl: true });
+      const isFresh = !!cached && Date.now() - cached.ts <= CACHE_TTL_MS;
+
+      if (cached) {
+        // Instant repaint from cache (fresh or stale) so there's never a
+        // blank gap while a fetch is pending.
+        upsertReport(liveReports, { ...cached.value, fromCache: true });
+        renderRows(tbody, liveReports);
+        updateDocumentTitle();
+      }
+
+      // A fresh, unforced load stops here - this is the actual budget
+      // savings, not just an instant repaint. Forced (explicit Refresh/
+      // 'r') or stale/missing always fetches.
+      if (isFresh && !force) return;
+
+      const fresh = await safeBuildReport(spoke, windowStart);
+      if (!FAILURE_STATUSES.has(fresh.capabilityStatus)) {
+        writeCache(key, fresh);
+        writeLastKnown(lastKnownSpokeKey(spoke.owner, spoke.repo), fresh);
+        upsertReport(liveReports, fresh);
+      } else if (!cached) {
+        // Nothing fresher (not even a stale sessionStorage entry) was
+        // already on screen for this spoke - before giving up and
+        // showing a bare failure, check the durable offline fallback.
+        // Rendered with its own historical status/numbers, clearly aged-
+        // labeled (see statusLabel/updateRow) rather than as if current.
+        const lastKnown = readLastKnown(lastKnownSpokeKey(spoke.owner, spoke.repo));
+        upsertReport(liveReports, lastKnown ? { ...lastKnown.value, offlineAsOf: lastKnown.ts } : fresh);
+      } else {
+        upsertReport(liveReports, fresh);
+      }
+      renderRows(tbody, liveReports);
+      updateDocumentTitle();
+    })
+  );
+
+  // Drop rows for spokes no longer registered (a real change, not a
+  // transient hiccup - unlike the fetch-failure paths above, this one
+  // should replace what's on screen).
+  liveReports = liveReports.filter((r) => spokes.some((s) => s.owner === r.owner && s.repo === r.repo));
+  renderRows(tbody, liveReports);
+  return false;
+}
+
+// The hub's own workflows are a fixed, hardcoded list (HUB_WORKFLOWS) -
+// nothing here depends on spokes.json, so this runs fully independently of
+// loadSpokeSection above. Same cache-first, stale-while-revalidate,
+// force-bypasses-cache shape as the per-spoke loop.
+async function loadHubHealthSection(force) {
+  const tbody = document.getElementById('hub-health-body');
+
+  await Promise.allSettled(
+    HUB_WORKFLOWS.map(async (entry) => {
+      const key = hubWorkflowCacheKey(entry.file);
+      const cached = readCache(key, { ignoreTtl: true });
+      const isFresh = !!cached && Date.now() - cached.ts <= CACHE_TTL_MS;
+
+      if (cached) {
+        upsertHubReport(liveHubReports, { ...cached.value, fromCache: true });
+        renderHubRows(tbody, liveHubReports);
+        updateDocumentTitle();
+      }
+
+      if (isFresh && !force) return;
+
+      const fresh = await safeBuildHubWorkflowReport(entry);
+      if (!HUB_FAILURE_STATUSES.has(fresh.hubStatus)) {
+        writeCache(key, fresh);
+        writeLastKnown(lastKnownHubWorkflowKey(entry.file), fresh);
+        upsertHubReport(liveHubReports, fresh);
+      } else if (!cached) {
+        const lastKnown = readLastKnown(lastKnownHubWorkflowKey(entry.file));
+        upsertHubReport(liveHubReports, lastKnown ? { ...lastKnown.value, offlineAsOf: lastKnown.ts } : fresh);
+      } else {
+        upsertHubReport(liveHubReports, fresh);
+      }
+      renderHubRows(tbody, liveHubReports);
+      updateDocumentTitle();
+    })
+  );
+}
 
 // force=true (an explicit Refresh click or 'r' keypress) always fetches
 // real data regardless of cache freshness. force=false (the initial load,
 // a visibility-triggered or online-triggered refetch) respects the cache -
-// skipping the network entirely for any spoke whose cache is still within
+// skipping the network entirely for anything whose cache is still within
 // CACHE_TTL_MS, which is what actually protects the disclosed request
 // budget rather than just repainting instantly and fetching anyway.
 async function loadDashboard(force = false) {
@@ -529,125 +874,46 @@ async function loadDashboard(force = false) {
   loadInFlight = true;
 
   const statusEl = document.getElementById('status');
-  const tbody = document.getElementById('report-body');
-  const emptyEl = document.getElementById('empty-state');
   const refreshBtn = document.getElementById('refresh');
-  const panel = document.querySelector('.panel');
+  const panels = document.querySelectorAll('.panel');
 
   refreshBtn.disabled = true;
   refreshBtn.setAttribute('aria-busy', 'true');
-  panel.classList.add('refreshing');
-  if (liveReports.length === 0) {
+  panels.forEach((p) => p.classList.add('refreshing'));
+  if (liveReports.length === 0 && liveHubReports.length === 0) {
     statusEl.textContent = 'Loading…'; // only shown on a genuine first-ever load - a refresh with existing rows keeps them visible instead
   }
 
   try {
-    const windowStart = new Date(Date.now() - REPORT_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+    // Two independent sections - one section's own early-exit or failure
+    // never blocks the other from loading (same fault-isolation principle
+    // already applied per-spoke, extended to per-section).
+    const [spokeResult] = await Promise.allSettled([loadSpokeSection(force), loadHubHealthSection(force)]);
+    const spokeSetTerminalMessage = spokeResult.status === 'fulfilled' && spokeResult.value === true;
 
-    const spokesResult = await fetchDecodedFile(HUB_OWNER, HUB_REPO, 'spokes.json');
-    let spokes;
-    if (spokesResult.ok) {
-      spokes = validSpokes(safeParseJsonArray(spokesResult.text));
-      writeCache(SPOKES_CACHE_KEY, spokes);
-      writeLastKnown(SPOKES_LAST_KNOWN_KEY, spokes);
-    } else {
-      // Fall back to the last-known spoke list - sessionStorage first (any
-      // age within this browser session beats nothing), then the durable
-      // localStorage copy if the session itself is fresh too (a brand-new
-      // tab with zero network has no sessionStorage entry at all, but may
-      // still have a days-old localStorage one from a previous session) -
-      // rather than going fully blank over a failure to fetch the registry.
-      const fallback = readCache(SPOKES_CACHE_KEY, { ignoreTtl: true }) || readLastKnown(SPOKES_LAST_KNOWN_KEY);
-      if (!fallback) {
-        statusEl.textContent = spokesResult.timedOut
-          ? 'Timed out loading spokes.json - check your connection and try again.'
-          : spokesResult.rateLimited
-            ? "GitHub's unauthenticated rate limit (60 requests/hour) was hit while loading spokes.json - try again later."
-            : "Couldn't reach GitHub to load spokes.json - check your connection and try again.";
-        emptyEl.textContent = statusEl.textContent;
-        emptyEl.hidden = liveReports.length > 0; // existing rows, if any, stay visible instead of being replaced by this banner
-        return;
-      }
-      spokes = fallback.value;
-      statusEl.textContent = `Showing the last-known spoke list (${spokesResult.timedOut ? 'timed out' : spokesResult.rateLimited ? 'rate-limited' : "couldn't reach GitHub"} just now) - will retry on next refresh.`;
+    // A terminal message from the spoke section (no spokes.json, no
+    // fallback; or a genuinely empty registry) is meant to stay on screen,
+    // not get overwritten by a generic timestamp - matches this function's
+    // pre-split behavior, where those branches returned before ever
+    // reaching this point.
+    if (!spokeSetTerminalMessage) {
+      lastUpdatedAt = new Date();
+      refreshStatusTimestamp(statusEl);
     }
-
-    if (spokes.length === 0) {
-      statusEl.textContent = 'spokes.json loaded but no spokes are registered yet.';
-      emptyEl.textContent = statusEl.textContent;
-      emptyEl.hidden = false;
-      liveReports = [];
-      renderRows(tbody, liveReports);
-      return;
-    }
-
-    emptyEl.hidden = true;
-
-    await Promise.allSettled(
-      spokes.map(async (spoke) => {
-        const key = spokeCacheKey(spoke.owner, spoke.repo);
-        // ignoreTtl: true so an *expired* entry is still readable as a
-        // stale-while-revalidate placeholder below - freshness is checked
-        // separately via isFresh, since "a cache entry exists" and "it's
-        // still within TTL" are different questions here.
-        const cached = readCache(key, { ignoreTtl: true });
-        const isFresh = !!cached && Date.now() - cached.ts <= CACHE_TTL_MS;
-
-        if (cached) {
-          // Instant repaint from cache (fresh or stale) so there's never a
-          // blank gap while a fetch is pending.
-          upsertReport(liveReports, { ...cached.value, fromCache: true });
-          renderRows(tbody, liveReports);
-          updateDocumentTitle(liveReports);
-        }
-
-        // A fresh, unforced load stops here - this is the actual budget
-        // savings, not just an instant repaint. Forced (explicit Refresh/
-        // 'r') or stale/missing always fetches.
-        if (isFresh && !force) return;
-
-        const fresh = await safeBuildReport(spoke, windowStart);
-        if (!FAILURE_STATUSES.has(fresh.capabilityStatus)) {
-          writeCache(key, fresh);
-          writeLastKnown(lastKnownSpokeKey(spoke.owner, spoke.repo), fresh);
-          upsertReport(liveReports, fresh);
-        } else if (!cached) {
-          // Nothing fresher (not even a stale sessionStorage entry) was
-          // already on screen for this spoke - before giving up and
-          // showing a bare failure, check the durable offline fallback.
-          // Rendered with its own historical status/numbers, clearly aged-
-          // labeled (see statusLabel/updateRow) rather than as if current.
-          const lastKnown = readLastKnown(lastKnownSpokeKey(spoke.owner, spoke.repo));
-          upsertReport(liveReports, lastKnown ? { ...lastKnown.value, offlineAsOf: lastKnown.ts } : fresh);
-        } else {
-          upsertReport(liveReports, fresh);
-        }
-        renderRows(tbody, liveReports);
-        updateDocumentTitle(liveReports);
-      })
-    );
-
-    // Drop rows for spokes no longer registered (a real change, not a
-    // transient hiccup - unlike the fetch-failure paths above, this one
-    // should replace what's on screen).
-    liveReports = liveReports.filter((r) => spokes.some((s) => s.owner === r.owner && s.repo === r.repo));
-    renderRows(tbody, liveReports);
-
-    lastUpdatedAt = new Date();
-    refreshStatusTimestamp(statusEl);
     if (!relativeTimeTimer) {
       // Same tick re-renders rows too, cheap at this table size, so a
       // rate-limited chip's "retry in Xm" countdown ticks down live
       // instead of sitting frozen between loads (formatCountdown above).
       relativeTimeTimer = setInterval(() => {
         refreshStatusTimestamp(statusEl);
-        renderRows(tbody, liveReports);
+        renderRows(document.getElementById('report-body'), liveReports);
+        renderHubRows(document.getElementById('hub-health-body'), liveHubReports);
       }, 15000);
     }
   } finally {
     refreshBtn.disabled = false;
     refreshBtn.removeAttribute('aria-busy');
-    panel.classList.remove('refreshing');
+    panels.forEach((p) => p.classList.remove('refreshing'));
     loadInFlight = false;
   }
 }
