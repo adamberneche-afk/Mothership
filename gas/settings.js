@@ -96,6 +96,61 @@ function saveSettings(token, values) {
   return { updated: Object.keys(update) };
 }
 
+// --- live diagnostics: catch a bad credential the moment this page opens,
+// not after N silent failed runs - exactly what happened this session with
+// GLOBAL_GITHUB_TOKEN's 401 on health-report.yml, undetected for 5 runs.
+// Two checks only - the two credentials whose failure mode is silent and
+// easy to miss otherwise; DRY_RUN_MODE/RATE_CAP_PER_REPO_PER_DAY/HUB_* are
+// plain values with no independent "is this valid" check to run.
+
+function checkGithubToken_(token) {
+  if (!token) return { ok: false, detail: 'not configured' };
+  const res = UrlFetchApp.fetch('https://api.github.com/rate_limit', {
+    headers: { Authorization: 'token ' + token },
+    muteHttpExceptions: true
+  });
+  const code = res.getResponseCode();
+  if (code === 200) return { ok: true, detail: 'valid' };
+  if (code === 401) return { ok: false, detail: 'invalid or expired (401)' };
+  return { ok: false, detail: 'unexpected response (' + code + ')' };
+}
+
+function checkAiKey_(baseUrl, apiKey) {
+  if (!apiKey) return { ok: false, detail: 'not configured' };
+  if (!baseUrl) return { ok: false, detail: 'AI_BASE_URL not configured' };
+  // Same URL-join convention as the real AI call in autonomous_agent.js
+  // (`${config.aiBaseUrl}/chat/completions`) - plain concatenation, no
+  // trailing-slash normalization. Listing models is the standard
+  // OpenAI-compatible way to validate a key without spending completion
+  // tokens.
+  const res = UrlFetchApp.fetch(baseUrl + '/models', {
+    headers: { Authorization: 'Bearer ' + apiKey },
+    muteHttpExceptions: true
+  });
+  const code = res.getResponseCode();
+  if (code === 200) return { ok: true, detail: 'valid' };
+  if (code === 401 || code === 403) return { ok: false, detail: 'invalid or unauthorized (' + code + ')' };
+  return { ok: false, detail: 'unexpected response (' + code + ')' };
+}
+
+// Called via google.script.run right after the settings page loads.
+// Re-validates the admin token first, exactly like saveSettings does -
+// google.script.run exposes every top-level function in this project to
+// anyone who can reach the deployed URL, admin token or not, so skipping
+// this check would turn checkConfig itself into an unauthenticated way to
+// probe whether credentials are configured.
+function checkConfig(token) {
+  const props = PropertiesService.getScriptProperties();
+  const adminToken = props.getProperty('ADMIN_SETTINGS_TOKEN');
+  if (!adminToken || token !== adminToken) {
+    throw new Error('Unauthorized');
+  }
+  return {
+    github: checkGithubToken_(props.getProperty('GLOBAL_GITHUB_TOKEN')),
+    ai: checkAiKey_(props.getProperty('AI_BASE_URL'), props.getProperty('AI_API_KEY'))
+  };
+}
+
 function renderBootstrapNeededHtml_() {
   return (
     '<!doctype html><html><body style="font-family:sans-serif;max-width:560px;margin:40px auto;line-height:1.5">' +
@@ -129,8 +184,15 @@ function renderFormHtml_(token, currentValues) {
     }
     if (isSecret) {
       const placeholder = maskSecret_(currentValues[key]);
+      // GLOBAL_GITHUB_TOKEN and AI_API_KEY are the two credentials that get
+      // a live "is this actually valid" check (see checkConfig below) - the
+      // status span next to each is filled in by that check once the page
+      // loads, starting as "checking…" rather than blank so it's clear a
+      // check is even happening.
+      const statusSpanId = key === 'GLOBAL_GITHUB_TOKEN' ? 'github-check-status' : key === 'AI_API_KEY' ? 'ai-check-status' : null;
+      const statusSpan = statusSpanId ? ' <span id="' + statusSpanId + '" style="font-size:0.85em;color:#888">checking…</span>' : '';
       return (
-        '<div style="margin-bottom:12px"><label>' + key + '<br>' +
+        '<div style="margin-bottom:12px"><label>' + key + statusSpan + '<br>' +
         '<input type="password" name="' + key + '" placeholder="' + htmlEscape_(placeholder) + ' - leave blank to keep" style="width:100%;padding:6px" autocomplete="off">' +
         '</label></div>'
       );
@@ -172,6 +234,26 @@ function renderFormHtml_(token, currentValues) {
     '    })' +
     '    .saveSettings(TOKEN, values);' +
     '});' +
+    // Auto-runs once on load, not gated behind a button - the whole point
+    // is catching a bad credential the moment this page opens, the way
+    // this session's own GLOBAL_GITHUB_TOKEN 401 sat undetected for 5 real
+    // runs because nothing checked it until something else already failed.
+    'function fillCheckStatus(id, result) {' +
+    '  var el = document.getElementById(id);' +
+    '  if (!el) return;' +
+    '  el.textContent = result.ok ? "✓ valid" : ("✗ " + result.detail);' +
+    '  el.style.color = result.ok ? "green" : "crimson";' +
+    '}' +
+    'google.script.run' +
+    '  .withSuccessHandler(function(result) {' +
+    '    fillCheckStatus("github-check-status", result.github);' +
+    '    fillCheckStatus("ai-check-status", result.ai);' +
+    '  })' +
+    '  .withFailureHandler(function(err) {' +
+    '    fillCheckStatus("github-check-status", { ok: false, detail: "check failed" });' +
+    '    fillCheckStatus("ai-check-status", { ok: false, detail: "check failed" });' +
+    '  })' +
+    '  .checkConfig(TOKEN);' +
     '</script>' +
     '</body></html>'
   );

@@ -45,13 +45,32 @@ function makeFakeHtmlService() {
   };
 }
 
-function loadSettingsWithFakes(props) {
+// Configurable per-URL response codes, plus a call log - used by
+// checkConfig's live diagnostics tests below. Defaults to 200 for any URL
+// not explicitly configured, so tests that don't care about this can omit
+// it entirely.
+function makeFakeUrlFetchApp(responsesByUrlSubstring = {}) {
+  const calls = [];
+  return {
+    calls,
+    fetch: (url, options) => {
+      calls.push({ url, options });
+      const match = Object.keys(responsesByUrlSubstring).find((k) => url.includes(k));
+      const code = match !== undefined ? responsesByUrlSubstring[match] : 200;
+      return { getResponseCode: () => code };
+    }
+  };
+}
+
+function loadSettingsWithFakes(props, urlFetchResponses) {
   const propertiesService = makeFakePropertiesService(props);
+  const urlFetchApp = makeFakeUrlFetchApp(urlFetchResponses);
   const context = loadGasGlobals('settings.js', {
     PropertiesService: propertiesService,
-    HtmlService: makeFakeHtmlService()
+    HtmlService: makeFakeHtmlService(),
+    UrlFetchApp: urlFetchApp
   });
-  return { context, propertiesService };
+  return { context, propertiesService, urlFetchApp };
 }
 
 function testNoTokenBootstrapped() {
@@ -130,12 +149,76 @@ function testSaveSettingsUpdatesOnlyPopulatedAllowlistedFields() {
   check('ADMIN_SETTINGS_TOKEN in the store is unchanged', propertiesService.store.ADMIN_SETTINGS_TOKEN === 'real-secret-token');
 }
 
+function testFormRendersStatusSpansAndAutoCheckCall() {
+  console.log('the rendered form includes the two live-check status spans and calls checkConfig on load');
+  const { context } = loadSettingsWithFakes({ ADMIN_SETTINGS_TOKEN: 'real-secret-token' });
+  const output = context.renderSettingsPage('real-secret-token');
+  check('has a github-check-status span', /id="github-check-status"/.test(output._html));
+  check('has an ai-check-status span', /id="ai-check-status"/.test(output._html));
+  check('status spans start as "checking…"', /checking…/.test(output._html));
+  check('the script calls checkConfig(TOKEN) on load', /\.checkConfig\(TOKEN\)/.test(output._html));
+}
+
+function testCheckConfigRejectsWrongToken() {
+  console.log('checkConfig throws on a wrong token and never calls UrlFetchApp');
+  const { context, urlFetchApp } = loadSettingsWithFakes({ ADMIN_SETTINGS_TOKEN: 'real-secret-token' });
+  let threw = false;
+  try {
+    context.checkConfig('wrong-token');
+  } catch (err) {
+    threw = true;
+  }
+  check('threw an Unauthorized error', threw);
+  check('UrlFetchApp.fetch was never called', urlFetchApp.calls.length === 0);
+}
+
+function testCheckConfigReportsValidCredentials() {
+  console.log('checkConfig reports ok:true for both checks when the real endpoints return 200');
+  const { context, urlFetchApp } = loadSettingsWithFakes(
+    { ADMIN_SETTINGS_TOKEN: 'real-secret-token', GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' },
+    { 'api.github.com/rate_limit': 200, 'ai.example.com/models': 200 }
+  );
+  const result = context.checkConfig('real-secret-token');
+  check('github check is ok', result.github.ok === true);
+  check('ai check is ok', result.ai.ok === true);
+  check('exactly two UrlFetchApp calls were made (one per credential)', urlFetchApp.calls.length === 2);
+  check('the github call hit rate_limit with the right token', urlFetchApp.calls.some((c) => c.url === 'https://api.github.com/rate_limit' && c.options.headers.Authorization === 'token ghp_good'));
+  check('the ai call hit AI_BASE_URL/models with the right key', urlFetchApp.calls.some((c) => c.url === 'https://ai.example.com/models' && c.options.headers.Authorization === 'Bearer sk-good'));
+}
+
+function testCheckConfigReportsInvalidCredentials() {
+  console.log('checkConfig reports ok:false with a real detail when either endpoint returns 401');
+  const { context } = loadSettingsWithFakes(
+    { ADMIN_SETTINGS_TOKEN: 'real-secret-token', GLOBAL_GITHUB_TOKEN: 'ghp_bad', AI_API_KEY: 'sk-bad', AI_BASE_URL: 'https://ai.example.com' },
+    { 'api.github.com/rate_limit': 401, 'ai.example.com/models': 401 }
+  );
+  const result = context.checkConfig('real-secret-token');
+  check('github check is not ok', result.github.ok === false);
+  check('github detail mentions 401', /401/.test(result.github.detail));
+  check('ai check is not ok', result.ai.ok === false);
+  check('ai detail mentions 401', /401/.test(result.ai.detail));
+}
+
+function testCheckConfigShortCircuitsUnsetCredentialsWithoutAnyNetworkCall() {
+  console.log('checkConfig reports "not configured" for an unset credential without ever calling UrlFetchApp for it');
+  const { context, urlFetchApp } = loadSettingsWithFakes({ ADMIN_SETTINGS_TOKEN: 'real-secret-token' });
+  const result = context.checkConfig('real-secret-token');
+  check('github check reports not configured', result.github.ok === false && result.github.detail === 'not configured');
+  check('ai check reports not configured', result.ai.ok === false && result.ai.detail === 'not configured');
+  check('zero UrlFetchApp calls were made for either', urlFetchApp.calls.length === 0);
+}
+
 function main() {
   testNoTokenBootstrapped();
   testWrongTokenIsGenericNotFound();
   testCorrectTokenRendersMaskedForm();
   testSaveSettingsRejectsWrongToken();
   testSaveSettingsUpdatesOnlyPopulatedAllowlistedFields();
+  testFormRendersStatusSpansAndAutoCheckCall();
+  testCheckConfigRejectsWrongToken();
+  testCheckConfigReportsValidCredentials();
+  testCheckConfigReportsInvalidCredentials();
+  testCheckConfigShortCircuitsUnsetCredentialsWithoutAnyNetworkCall();
 
   console.log('');
   if (failures > 0) {
