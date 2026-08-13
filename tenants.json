@@ -1,0 +1,11 @@
+[
+  {
+    "tenantId": "default",
+    "name": "Default (pre-multi-tenancy spokes)",
+    "status": "active",
+    "plan": "internal",
+    "quota": { "reviewsPerMonth": null },
+    "githubCredentialRef": "env:GLOBAL_GITHUB_TOKEN",
+    "createdAt": "2026-08-13T00:00:00Z"
+  }
+]

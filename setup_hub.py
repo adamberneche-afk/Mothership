@@ -19,6 +19,17 @@ def setup_hub():
             "path": "spokes.json",
             "content": "[]"
         },
+        {
+            # Multi-tenancy registry (see lessons.md's multi-tenancy entry).
+            # Starts empty - a fresh hub has zero spokes and needs no tenant
+            # entries yet. Every script that resolves a tenant's credential
+            # falls back to GLOBAL_GITHUB_TOKEN when no tenant is found, so
+            # an empty registry here is fully backward-compatible with the
+            # single-tenant, zero-config setup this installer has always
+            # produced.
+            "path": "tenants.json",
+            "content": "[]"
+        },
 
         # 2. THE CENTRAL INTELLIGENCE (Vercel Worker)
         {
@@ -46,11 +57,87 @@ const DECISION_LOG_MAX_ENTRIES = 500;
 // context, so the model doesn't re-report something already logged.
 const PRIOR_DECISIONS_CONTEXT_COUNT = 5;
 
+const SPOKES_REGISTRY_PATH = 'spokes.json';
+const TENANTS_REGISTRY_PATH = 'tenants.json';
+const DEFAULT_TENANT_ID = 'default';
+const USAGE_LOG_MAX_ENTRIES = 5000;
+
+// This hub's own identity, for writing its own usage/{tenantId}.json logs -
+// same env vars api/recursive_learning.js already uses for the same reason
+// (it also writes to this repo, proposing PRs against itself).
+const DEFAULT_HUB_OWNER = 'adamberneche-afk';
+const DEFAULT_HUB_REPO = 'Mothership';
+
 const MODE_INSTRUCTIONS = {
   debug: 'Review the RECENT CODE CHANGES below for bugs, unsafe patterns, and code quality issues actually present in this diff. Only report something you can point to directly in the diff text.',
   hunt: "Review the RECENT CODE CHANGES below for silent logic errors - places where the code runs without crashing but produces a wrong result. You cannot execute code or run tests; base findings only on what's visible in the diff text.",
   refactor: 'Review the RECENT CODE CHANGES below for opportunities to simplify complex logic, remove redundancy, or improve maintainability. Only report something you can point to directly in the diff text.'
 };
+
+// --- Multi-tenancy: data model + credential resolution -----------------
+//
+// spokes.json/tenants.json are both hub-root files, read from local disk the
+// same way universal_lessons.md/north_star_framework.md already are - no
+// octokit call needed, since this Vercel function's own checkout already
+// has them. Both are architecture/data-model additions only this pass (see
+// lessons.md's dated entry) - no real tenant self-service onboarding UI, no
+// real secrets store, no payment processor. What's real: every spoke is now
+// unambiguously scoped to one tenant, credential resolution has a real seam
+// instead of one shared global token, and usage gets attributed per tenant.
+
+function loadJsonArrayFromDisk(path) {
+  const fullPath = join(process.cwd(), path);
+  if (!existsSync(fullPath)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(fullPath, 'utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+// Finds which tenant a given owner/repo belongs to. Falls back to
+// DEFAULT_TENANT_ID for anything not found in spokes.json - a deliberate
+// backward-compatibility choice, not a security feature: it preserves
+// today's exact behavior (no registration required to get a response) for
+// spokes nobody has migrated into the tenant model yet. Once real
+// multi-tenant onboarding exists, an unmatched spoke should probably reject
+// instead of silently defaulting - flagged here, not fixed here.
+function resolveTenantIdForSpoke(owner, repo, spokes) {
+  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
+  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+}
+
+function findTenant(tenantId, tenants) {
+  return tenants.find(t => t && t.tenantId === tenantId) || null;
+}
+
+// githubCredentialRef/callerKeyRef use a `scheme:value` format:
+//   env:VAR_NAME - reads an env var directly. This is what keeps the
+//     "default" tenant working exactly as before with zero migration -
+//     tenants.json seeds it with "env:GLOBAL_GITHUB_TOKEN".
+//   kv:some/path - a pointer into a real dynamic secrets store (Vercel KV,
+//     a database, a secrets manager) that DOES NOT EXIST YET. Provisioning
+//     one is required, separate infrastructure work before any tenant
+//     beyond "default" can actually go live - a git-committed JSON file
+//     can't hold a raw secret without permanently leaking it into git
+//     history, so there is deliberately no local fallback for this scheme.
+// TODO: wire the kv: branch to a real secrets store before onboarding a
+// second tenant for real.
+function resolveSecretRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
+  if (ref.startsWith('kv:')) return null; // see TODO above
+  return null;
+}
+
+function loadSpokesRegistry() {
+  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
+}
+
+function loadTenantsRegistry() {
+  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
+}
 
 // Counts issues carrying HUB_ISSUE_LABEL that were created since UTC
 // midnight today, for the rate cap below. Derived on-demand from GitHub's
@@ -126,13 +213,88 @@ function makeLogEntry({ mode, commitSha, outcome, issueUrl = null, summary = nul
   return { timestamp: new Date().toISOString(), mode, commitSha, outcome, issueUrl, summary };
 }
 
+// --- Usage metering (hooks only - see lessons.md's dated entry) --------
+//
+// Lives in the HUB repo (usage/{tenantId}.json), not the spoke - the whole
+// point is the operator/billing system can read every tenant's usage
+// without needing per-spoke access, matching how a tenant's OWN credential
+// (decision #1) is scoped only to their own repos and couldn't write here
+// anyway. Written via hubOctokit, a SEPARATE credential from the
+// tenant-scoped one used for spoke operations - see processRequest's
+// factory-vs-hubOctokit split below.
+//
+// Same read-modify-write-with-retry shape as appendDecisionLogEntry/
+// scripts/prune-logs.js - reused, not reinvented.
+function usageLogPath(tenantId) {
+  return `usage/${tenantId}.json`;
+}
+
+async function readUsageLog(hubOctokit, hubOwner, hubRepo, tenantId) {
+  try {
+    const { data } = await hubOctokit.repos.getContent({ owner: hubOwner, repo: hubRepo, path: usageLogPath(tenantId) });
+    let entries = [];
+    try {
+      const parsed = JSON.parse(Buffer.from(data.content, 'base64').toString('utf8'));
+      if (Array.isArray(parsed)) entries = parsed;
+    } catch (e) {
+      entries = [];
+    }
+    return { entries, sha: data.sha };
+  } catch (e) {
+    return { entries: [], sha: null };
+  }
+}
+
+async function recordUsageEvent(hubOctokit, hubOwner, hubRepo, event) {
+  if (!hubOctokit) return; // no hub-write credential configured - see handler()
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const { entries, sha } = await readUsageLog(hubOctokit, hubOwner, hubRepo, event.tenantId);
+      const updated = [...entries, event].slice(-USAGE_LOG_MAX_ENTRIES);
+      const content = Buffer.from(JSON.stringify(updated, null, 2)).toString('base64');
+      const params = {
+        owner: hubOwner, repo: hubRepo, path: usageLogPath(event.tenantId),
+        message: `chore: record ${event.eventType} usage for tenant ${event.tenantId}`,
+        content
+      };
+      if (sha) params.sha = sha;
+      await hubOctokit.repos.createOrUpdateFileContents(params);
+      return;
+    } catch (e) {
+      // Same reasoning as appendDecisionLogEntry: best-effort, retry on a
+      // likely stale-sha conflict, swallow on the last attempt - a metering
+      // gap is a billing-accuracy problem to notice later, not a reason to
+      // fail the actual review request.
+    }
+  }
+}
+
+// Sums this calendar month's 'review_run' events for a tenant, for the
+// quota check below. `reviewsPerMonth: null` (the "default" tenant's value)
+// means unlimited - never even reads the usage log in that case.
+async function countReviewsThisMonth(hubOctokit, hubOwner, hubRepo, tenantId, now) {
+  const { entries } = await readUsageLog(hubOctokit, hubOwner, hubRepo, tenantId);
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  return entries.filter(e => e && e.eventType === 'review_run' && new Date(e.timestamp) >= monthStart).length;
+}
+
 // The actual decision logic, factored out of the Vercel handler so it can
 // be driven by a local test harness (scripts/dev-test-handler.mjs) with a
 // fake octokit/fetch instead of hitting GitHub and the AI API for real.
 // `dryRunOverride` lets tests force a specific dry-run state instead of
 // reading the DRY_RUN_MODE env var.
-export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryRunOverride } = {}) {
-  const { owner, repo, mode } = reqBody || {};
+//
+// `octokitFactory(token)` replaces a single injected `octokit` instance -
+// multi-tenancy means the credential used for a spoke's own repo operations
+// now depends on which tenant that spoke belongs to (decision #1: each
+// tenant supplies their own, not one shared master token), so it can't be
+// constructed once outside this function anymore. `hubOctokit` is a
+// SEPARATE, already-constructed client scoped to the hub's own repo (still
+// GLOBAL_GITHUB_TOKEN under the hood - see handler() below) - it's what
+// usage-log writes and quota reads use, since a tenant's own credential has
+// no access to the hub repo at all.
+export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetchImpl = fetch, dryRunOverride, now = new Date(), spokesOverride, tenantsOverride } = {}) {
+  const { owner, repo, mode, callerKey } = reqBody || {};
 
   if (!owner || !repo || !mode) {
     return { httpStatus: 400, body: { error: 'owner, repo, and mode are required' } };
@@ -142,6 +304,42 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
   if (!taskInstruction) {
     return { httpStatus: 400, body: { error: `Unknown mode: ${mode}` } };
   }
+
+  // TENANT RESOLUTION + CALLER AUTHENTICATION.
+  //
+  // Real, disclosed gap this closes a first step toward: spoke-to-hub POSTs
+  // carried ZERO credential before this - any caller who knew the hub URL
+  // could trigger a review for any registered owner/repo. The check below
+  // is deliberately opt-in per tenant: a tenant with no `callerKeyRef` set
+  // (true for "default" today) skips verification entirely, preserving
+  // today's exact zero-auth behavior for anything not yet migrated. A
+  // tenant that HAS set one gets it strictly enforced. Migrating a tenant
+  // to enforced caller-auth is then just a config change, not a breaking
+  // flag day for spokes that were already working.
+  //
+  // spokesOverride/tenantsOverride let tests inject a registry instead of
+  // reading this checkout's real spokes.json/tenants.json - same
+  // dependency-injection convention as dryRunOverride/octokitFactory.
+  const spokes = spokesOverride || loadSpokesRegistry();
+  const tenants = tenantsOverride || loadTenantsRegistry();
+  const tenantId = resolveTenantIdForSpoke(owner, repo, spokes);
+  const tenant = findTenant(tenantId, tenants);
+
+  const requiredCallerKey = tenant ? resolveSecretRef(tenant.callerKeyRef) : null;
+  if (requiredCallerKey && callerKey !== requiredCallerKey) {
+    return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
+  }
+
+  // Credential for this request's SPOKE operations - the tenant's own
+  // token (decision #1), resolved via the same env:/kv: scheme as the
+  // caller key above. Falls back to GLOBAL_GITHUB_TOKEN only when no
+  // tenant match exists at all (mirrors resolveTenantIdForSpoke's own
+  // backward-compatibility fallback) or the ref can't be resolved yet
+  // (e.g. a kv: ref with no secrets store behind it) - fails toward "use
+  // the one credential that's always been used" rather than toward a
+  // silent, harder-to-diagnose 401 from GitHub itself.
+  const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+  const octokit = octokitFactory(spokeToken);
 
   // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
   // env var never files a real issue by accident - DRY_RUN_MODE has to be
@@ -222,6 +420,11 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
     return appendDecisionLogEntry(octokit, owner, repo, makeLogEntry({ mode, commitSha: latestCommitSha, outcome, ...extra }));
   };
 
+  const hubOwner = process.env.HUB_GITHUB_OWNER || DEFAULT_HUB_OWNER;
+  const hubRepo = process.env.HUB_GITHUB_REPO || DEFAULT_HUB_REPO;
+  const recordUsage = (eventType, extra = {}) =>
+    recordUsageEvent(hubOctokit, hubOwner, hubRepo, { tenantId, timestamp: new Date().toISOString(), eventType, mode, owner, repo, ...extra });
+
   // Fetch REAL CODE context: the diff of the spoke's latest commit.
   //
   // Every "audit" used to run with zero actual code in the prompt - only
@@ -252,6 +455,26 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
   if (!codeDiff) {
     await logOutcome('no_diff_skip');
     return { httpStatus: 200, body: { status: 'Skipped', reason: 'No usable code diff found for the latest commit', dryRun } };
+  }
+
+  // BILLING/QUOTA GATE, tenant-scoped - placed before the AI call
+  // deliberately (not just before filing, like the rate cap below), since
+  // the AI call is the actual cost-incurring event the hub is metering
+  // (decision #2: one shared AI_API_KEY, usage attributed per tenant). A
+  // tenant with `quota.reviewsPerMonth: null` (the "default" tenant's
+  // value, and the only one seeded today) is never checked - unlimited.
+  // This is a hooks-only, no-payment-processor gate: it enforces a number
+  // already in tenants.json, it doesn't invoice anyone.
+  const monthlyQuota = tenant && tenant.quota && tenant.quota.reviewsPerMonth;
+  if (typeof monthlyQuota === 'number') {
+    const usedThisMonth = await countReviewsThisMonth(hubOctokit, hubOwner, hubRepo, tenantId, now);
+    if (usedThisMonth >= monthlyQuota) {
+      await logOutcome('quota_exceeded');
+      return {
+        httpStatus: 200,
+        body: { status: 'Skipped', reason: `Monthly review quota reached (${usedThisMonth}/${monthlyQuota} reviews this month)`, dryRun }
+      };
+    }
   }
 
   const priorDecisionsContext = decisionLog.length > 0
@@ -308,6 +531,13 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
     await logOutcome('ai_error', { summary: 'AI returned no content' });
     return { httpStatus: 200, body: { status: 'Skipped', reason: 'AI returned no content', dryRun } };
   }
+
+  // This is the actual cost-incurring event the quota gate above protects
+  // against overrunning - record it now that the AI call genuinely
+  // happened, regardless of what it decided. `aiData.usage` is an OpenAI-
+  // compatible response field some providers populate and some don't -
+  // captured when present, never fabricated when it's not.
+  await recordUsage('review_run', aiData && aiData.usage ? { usage: aiData.usage } : {});
 
   // Parse and STRICTLY VALIDATE the AI's response before acting on it.
   //
@@ -385,6 +615,7 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
   });
 
   await logOutcome('created', { issueUrl: created.data.html_url, summary });
+  await recordUsage('issue_created', { issueUrl: created.data.html_url });
 
   return { httpStatus: 200, body: { status: "Success", dryRun, issueUrl: created.data.html_url } };
 }
@@ -392,10 +623,16 @@ export async function processRequest(reqBody, { octokit, fetchImpl = fetch, dryR
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  // octokitFactory defers Octokit construction until processRequest knows
+  // which tenant's credential to use (decision #1) - hubOctokit stays the
+  // one, hub-repo-scoped credential (still GLOBAL_GITHUB_TOKEN) used only
+  // for this hub's own usage-log writes/quota reads, never for a tenant's
+  // spoke operations.
+  const octokitFactory = (token) => new Octokit({ auth: token });
+  const hubOctokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
 
   try {
-    const { httpStatus, body } = await processRequest(req.body, { octokit, fetchImpl: fetch });
+    const { httpStatus, body } = await processRequest(req.body, { octokitFactory, hubOctokit, fetchImpl: fetch });
     return res.status(httpStatus).json(body);
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -409,6 +646,8 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 
 const SPOKES_REGISTRY_PATH = 'spokes.json';
+const TENANTS_REGISTRY_PATH = 'tenants.json';
+const DEFAULT_TENANT_ID = 'default';
 // How many of a spoke's most recent decision-log entries get included in
 // the cross-spoke summary prompt - enough to see a pattern, not so much
 // that one busy spoke drowns out the others.
@@ -453,34 +692,47 @@ async function getDefaultBranch(octokit, owner, repo) {
   }
 }
 
-// The actual logic, factored out of the Vercel handler the same way
-// autonomous_agent.js's processRequest is, so it can be driven by a local
-// mock harness instead of hitting GitHub/the AI API for real.
-export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch, dryRunOverride, hubOwner, hubRepo } = {}) {
-  const HUB_OWNER = hubOwner || process.env.HUB_GITHUB_OWNER || DEFAULT_HUB_OWNER;
-  const HUB_REPO = hubRepo || process.env.HUB_GITHUB_REPO || DEFAULT_HUB_REPO;
+// --- Multi-tenancy: same data model/resolution as api/autonomous_agent.js
+// (see that file's header comment for the full rationale) - ported here so
+// the Recursive Learning Loop never pools two tenants' spoke data into one
+// cross-spoke prompt, which would otherwise be a real, silent isolation
+// leak specific to this endpoint's whole purpose (finding patterns ACROSS
+// spokes).
 
-  // Same safety rail as autonomous_agent.js, and the same env var - a
-  // proposal is a lower-stakes action than filing an issue (it's a PR
-  // someone has to review and merge, not something posted unattended), but
-  // this still shouldn't go live before Sprint 0's rail has been verified.
-  const dryRun = dryRunOverride !== undefined
-    ? dryRunOverride
-    : process.env.DRY_RUN_MODE !== 'false';
-
-  let spokes = safeParseJsonArray(await safeGetTextContent(octokit, HUB_OWNER, HUB_REPO, SPOKES_REGISTRY_PATH));
-
-  if (spokes.length === 0) {
-    return { httpStatus: 200, body: { status: 'Skipped', reason: 'No spokes registered in spokes.json', dryRun } };
+function groupSpokesByTenant(spokes) {
+  const byTenant = {};
+  for (const spoke of spokes) {
+    if (!spoke || !spoke.owner || !spoke.repo) continue;
+    const tenantId = spoke.tenantId || DEFAULT_TENANT_ID;
+    (byTenant[tenantId] = byTenant[tenantId] || []).push(spoke);
   }
+  return byTenant;
+}
 
-  const universalLessonsPath = join(process.cwd(), 'universal_lessons.md');
-  const globalNorthStarPath = join(process.cwd(), 'north_star_framework.md');
-  const universalLessons = existsSync(universalLessonsPath) ? readFileSync(universalLessonsPath, 'utf8') : "";
-  const globalNorthStar = existsSync(globalNorthStarPath) ? readFileSync(globalNorthStarPath, 'utf8') : "";
+function findTenant(tenantId, tenants) {
+  return tenants.find(t => t && t.tenantId === tenantId) || null;
+}
+
+// Same env:/kv: scheme as api/autonomous_agent.js's resolveSecretRef.
+// TODO: wire the kv: branch to a real secrets store before onboarding a
+// second tenant for real - see that file's identical TODO.
+function resolveSecretRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
+  if (ref.startsWith('kv:')) return null;
+  return null;
+}
+
+// Builds and runs one tenant's independent cross-spoke proposal - the unit
+// of work this whole redesign scopes tenant-isolation around. Only ever
+// sees this tenant's own spokes' lessons.md/ai_decision_log.json; never
+// pools another tenant's data into the same prompt.
+async function runForTenant({ tenantId, tenantSpokes, tenant, octokitFactory, hubOctokit, fetchImpl, dryRun, universalLessons, globalNorthStar, HUB_OWNER, HUB_REPO }) {
+  const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+  const octokit = octokitFactory(spokeToken);
 
   const perSpokeContext = [];
-  for (const spoke of spokes) {
+  for (const spoke of tenantSpokes) {
     const lessons = await safeGetTextContent(octokit, spoke.owner, spoke.repo, 'lessons.md');
     const decisionLogText = await safeGetTextContent(octokit, spoke.owner, spoke.repo, 'ai_decision_log.json');
     const recentDecisions = safeParseJsonArray(decisionLogText).slice(-RECENT_DECISIONS_PER_SPOKE);
@@ -512,7 +764,10 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
 
   const prompt = `
     ROLE: Senior AI CTO performing a cross-project retrospective across every
-    connected spoke.
+    connected spoke belonging to ONE customer (tenant "${tenantId}") - never
+    mix in patterns from any other tenant's projects, even if you happen to
+    know about them; a proposal here must be justifiable from this tenant's
+    own spokes alone.
     CURRENT GLOBAL STANDARDS (universal_lessons.md): ${universalLessons}
     CURRENT GLOBAL NORTH STAR (north_star_framework.md): ${globalNorthStar}
 
@@ -554,21 +809,18 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
   const rawContent = aiData?.choices?.[0]?.message?.content;
 
   if (typeof rawContent !== 'string' || rawContent.trim().length === 0) {
-    return { httpStatus: 200, body: { status: 'Skipped', reason: 'AI returned no content', dryRun } };
+    return { tenantId, status: 'Skipped', reason: 'AI returned no content', dryRun };
   }
 
   let result;
   try {
     result = JSON.parse(rawContent);
   } catch (parseError) {
-    return {
-      httpStatus: 200,
-      body: { status: 'Skipped', reason: 'AI did not return valid JSON', raw: rawContent.slice(0, 500), dryRun }
-    };
+    return { tenantId, status: 'Skipped', reason: 'AI did not return valid JSON', raw: rawContent.slice(0, 500), dryRun };
   }
 
   if (result.has_proposal !== true) {
-    return { httpStatus: 200, body: { status: 'Skipped', reason: 'AI found no cross-spoke pattern worth proposing', dryRun } };
+    return { tenantId, status: 'Skipped', reason: 'AI found no cross-spoke pattern worth proposing', dryRun };
   }
 
   const isNonEmptyString = (v) => typeof v === 'string' && v.trim().length > 0;
@@ -576,23 +828,25 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
   const isValidShape = isNonEmptyString(result.reasoning) && hasAnyPatch;
 
   if (!isValidShape) {
-    return {
-      httpStatus: 200,
-      body: { status: 'Skipped', reason: 'AI response did not match the required shape', raw: rawContent.slice(0, 500), dryRun }
-    };
+    return { tenantId, status: 'Skipped', reason: 'AI response did not match the required shape', raw: rawContent.slice(0, 500), dryRun };
   }
 
   if (dryRun) {
-    return { httpStatus: 200, body: { status: 'DryRunProposal', dryRun: true, proposal: result } };
+    return { tenantId, status: 'DryRunProposal', dryRun: true, proposal: result };
   }
 
-  // Live: propose via a PR against the hub itself - never push directly to
-  // the default branch. Whatever comes out of this is a suggestion a human
-  // reviews and merges (or doesn't), same as any other PR.
-  const defaultBranch = await getDefaultBranch(octokit, HUB_OWNER, HUB_REPO);
-  const { data: baseRef } = await octokit.git.getRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `heads/${defaultBranch}` });
-  const branchName = `recursive-learning-${Date.now()}`;
-  await octokit.git.createRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `refs/heads/${branchName}`, sha: baseRef.object.sha });
+  // Live: propose via a PR against the hub itself, using hubOctokit (the
+  // hub's own credential - a tenant's own token has no access to the hub
+  // repo at all, by design) - never push directly to the default branch.
+  // The PR body names which tenant's data prompted it, so the human
+  // reviewing/merging can judge whether generalizing a customer-specific
+  // pattern into the shared global standard is appropriate - this
+  // disclosure is what keeps "propose via PR, human merges" an adequate
+  // isolation safeguard instead of a silent cross-tenant leak.
+  const defaultBranch = await getDefaultBranch(hubOctokit, HUB_OWNER, HUB_REPO);
+  const { data: baseRef } = await hubOctokit.git.getRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `heads/${defaultBranch}` });
+  const branchName = `recursive-learning-${tenantId}-${Date.now()}`;
+  await hubOctokit.git.createRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `refs/heads/${branchName}`, sha: baseRef.object.sha });
 
   const filesToUpdate = [];
   if (isNonEmptyString(result.universal_lessons_patch)) {
@@ -605,38 +859,89 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
   for (const file of filesToUpdate) {
     let existingSha;
     try {
-      const { data } = await octokit.repos.getContent({ owner: HUB_OWNER, repo: HUB_REPO, path: file.path, ref: branchName });
+      const { data } = await hubOctokit.repos.getContent({ owner: HUB_OWNER, repo: HUB_REPO, path: file.path, ref: branchName });
       existingSha = data.sha;
     } catch (e) {
       existingSha = undefined;
     }
     const params = {
       owner: HUB_OWNER, repo: HUB_REPO, path: file.path, branch: branchName,
-      message: `docs: recursive-learning proposal for ${file.path}`,
+      message: `docs: recursive-learning proposal for ${file.path} (tenant ${tenantId})`,
       content: Buffer.from(file.content).toString('base64')
     };
     if (existingSha) params.sha = existingSha;
-    await octokit.repos.createOrUpdateFileContents(params);
+    await hubOctokit.repos.createOrUpdateFileContents(params);
   }
 
-  const pr = await octokit.pulls.create({
+  const pr = await hubOctokit.pulls.create({
     owner: HUB_OWNER, repo: HUB_REPO,
-    title: 'Recursive Learning: proposed cross-spoke updates',
+    title: `Recursive Learning: proposed cross-spoke updates (tenant ${tenantId})`,
     head: branchName,
     base: defaultBranch,
-    body: `### Reasoning\\n${result.reasoning}\\n\\n---\\nGenerated automatically by \\`api/recursive_learning.js\\` from patterns observed across ${spokes.length} spoke(s). This is a proposal, not a decision - review before merging.`
+    body: `### Reasoning\\n${result.reasoning}\\n\\n---\\nGenerated automatically by \\`api/recursive_learning.js\\` from patterns observed across ${tenantSpokes.length} spoke(s) belonging to **tenant \\`${tenantId}\\`** (\\`${tenant?.name || tenantId}\\`). This is a proposal, not a decision - review before merging, and consider whether generalizing a pattern from one customer's projects into the shared global standard is appropriate before doing so.`
   });
 
-  return { httpStatus: 200, body: { status: 'Success', dryRun: false, pullRequestUrl: pr.data.html_url } };
+  return { tenantId, status: 'Success', dryRun: false, pullRequestUrl: pr.data.html_url };
+}
+
+// The actual logic, factored out of the Vercel handler the same way
+// autonomous_agent.js's processRequest is, so it can be driven by a local
+// mock harness instead of hitting GitHub/the AI API for real.
+//
+// `octokitFactory(token)` replaces a single injected `octokit` instance,
+// mirroring api/autonomous_agent.js's own multi-tenancy redesign - each
+// tenant's spokes get read with THEIR OWN credential (decision #1), not one
+// shared token. `hubOctokit` is a separate, already-constructed client
+// scoped to the hub's own repo/token, used for reading spokes.json/
+// tenants.json and for the PR/branch operations against the hub itself.
+export async function runRecursiveLearning(reqBody, { octokitFactory, hubOctokit, fetchImpl = fetch, dryRunOverride, hubOwner, hubRepo, spokesOverride, tenantsOverride } = {}) {
+  const HUB_OWNER = hubOwner || process.env.HUB_GITHUB_OWNER || DEFAULT_HUB_OWNER;
+  const HUB_REPO = hubRepo || process.env.HUB_GITHUB_REPO || DEFAULT_HUB_REPO;
+
+  // Same safety rail as autonomous_agent.js, and the same env var - a
+  // proposal is a lower-stakes action than filing an issue (it's a PR
+  // someone has to review and merge, not something posted unattended), but
+  // this still shouldn't go live before Sprint 0's rail has been verified.
+  const dryRun = dryRunOverride !== undefined
+    ? dryRunOverride
+    : process.env.DRY_RUN_MODE !== 'false';
+
+  const spokes = spokesOverride || safeParseJsonArray(await safeGetTextContent(hubOctokit, HUB_OWNER, HUB_REPO, SPOKES_REGISTRY_PATH));
+
+  if (spokes.length === 0) {
+    return { httpStatus: 200, body: { status: 'Skipped', reason: 'No spokes registered in spokes.json', dryRun } };
+  }
+
+  const tenants = tenantsOverride || safeParseJsonArray(await safeGetTextContent(hubOctokit, HUB_OWNER, HUB_REPO, TENANTS_REGISTRY_PATH));
+  const byTenant = groupSpokesByTenant(spokes);
+
+  const universalLessonsPath = join(process.cwd(), 'universal_lessons.md');
+  const globalNorthStarPath = join(process.cwd(), 'north_star_framework.md');
+  const universalLessons = existsSync(universalLessonsPath) ? readFileSync(universalLessonsPath, 'utf8') : "";
+  const globalNorthStar = existsSync(globalNorthStarPath) ? readFileSync(globalNorthStarPath, 'utf8') : "";
+
+  // One independent run per tenant - never pooled. See runForTenant's own
+  // comment on why the prompt itself also says this explicitly.
+  const results = [];
+  for (const [tenantId, tenantSpokes] of Object.entries(byTenant)) {
+    const tenant = findTenant(tenantId, tenants);
+    results.push(await runForTenant({
+      tenantId, tenantSpokes, tenant, octokitFactory, hubOctokit, fetchImpl, dryRun,
+      universalLessons, globalNorthStar, HUB_OWNER, HUB_REPO
+    }));
+  }
+
+  return { httpStatus: 200, body: { status: 'Completed', dryRun, tenantCount: results.length, results } };
 }
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const octokitFactory = (token) => new Octokit({ auth: token });
+  const hubOctokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
 
   try {
-    const { httpStatus, body } = await runRecursiveLearning(req.body, { octokit, fetchImpl: fetch });
+    const { httpStatus, body } = await runRecursiveLearning(req.body, { octokitFactory, hubOctokit, fetchImpl: fetch });
     return res.status(httpStatus).json(body);
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -665,18 +970,45 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 
 const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
+const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
+const DEFAULT_TENANT_ID = 'default';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const ARCHIVE_LOG_PATH = 'ai_decision_log_archive.json';
 const DEFAULT_RETENTION_DAYS = 90;
 
-function loadSpokesRegistry() {
-  if (!existsSync(SPOKES_REGISTRY_PATH)) return [];
+function loadJsonArrayFromDisk(path) {
+  if (!existsSync(path)) return [];
   try {
-    const parsed = JSON.parse(readFileSync(SPOKES_REGISTRY_PATH, 'utf8'));
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     return [];
   }
+}
+
+function loadSpokesRegistry() {
+  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
+}
+
+function loadTenantsRegistry() {
+  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
+}
+
+// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
+function resolveSecretRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
+  if (ref.startsWith('kv:')) return null;
+  return null;
+}
+
+function resolveTenantIdForSpoke(owner, repo, spokes) {
+  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
+  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+}
+
+function findTenant(tenantId, tenants) {
+  return tenants.find(t => t && t.tenantId === tenantId) || null;
 }
 
 async function readJsonArrayFile(octokit, owner, repo, path) {
@@ -771,12 +1103,26 @@ export async function pruneSpoke(octokit, spoke, { retentionDays = DEFAULT_RETEN
   throw lastError;
 }
 
+// Multi-tenancy: each spoke's decision log is pruned using ITS tenant's own
+// resolved credential when `octokitFactory` is supplied in `options`
+// (decision #1 in lessons.md's multi-tenancy entry) - falls back to the
+// single `octokit` passed in when octokitFactory isn't given, so existing
+// single-tenant callers/tests keep working unchanged.
 export async function pruneAllSpokes(octokit, options = {}) {
-  const spokes = loadSpokesRegistry();
+  const { octokitFactory, spokesOverride, tenantsOverride, ...pruneOptions } = options;
+  const spokes = spokesOverride || loadSpokesRegistry();
+  const tenants = tenantsOverride || loadTenantsRegistry();
   const results = [];
   for (const spoke of spokes) {
     try {
-      results.push(await pruneSpoke(octokit, spoke, options));
+      let spokeOctokit = octokit;
+      if (octokitFactory) {
+        const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
+        const tenant = findTenant(tenantId, tenants);
+        const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+        spokeOctokit = octokitFactory(token);
+      }
+      results.push(await pruneSpoke(spokeOctokit, spoke, pruneOptions));
     } catch (e) {
       results.push({ owner: spoke.owner, repo: spoke.repo, error: e.message });
     }
@@ -790,8 +1136,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const retentionDays = Number(process.env.RETENTION_DAYS || DEFAULT_RETENTION_DAYS);
   const dryRun = process.env.DRY_RUN === 'true';
   const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const octokitFactory = (token) => new Octokit({ auth: token });
 
-  pruneAllSpokes(octokit, { retentionDays, dryRun })
+  pruneAllSpokes(octokit, { retentionDays, dryRun, octokitFactory })
     .then((results) => {
       console.log(JSON.stringify(results, null, 2));
       if (results.some((r) => r.error)) process.exitCode = 1;
@@ -814,6 +1161,15 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 // prune-logs.js, it only needs a GitHub token, mirrored as the
 // GLOBAL_GITHUB_TOKEN Actions secret on this repo.
 //
+// Multi-tenancy: each spoke's own data (issues filed, decision log) is read
+// using ITS tenant's own resolved credential when octokitFactory is
+// supplied (decision #1 in lessons.md's multi-tenancy entry) - falls back
+// to the single `octokit` passed to buildFullReport when octokitFactory
+// isn't given, so existing single-tenant callers/tests keep working
+// unchanged. The report itself (and the pinned issue it publishes to) stay
+// hub-wide/operator-facing - this is about using the right credential to
+// read each spoke, not about splitting the report per tenant.
+//
 // Usage: node scripts/health-report.js
 
 import { Octokit } from '@octokit/rest';
@@ -821,6 +1177,8 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 
 const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
+const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
+const DEFAULT_TENANT_ID = 'default';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const HUB_ISSUE_LABEL = 'cto-hub-auto';
 const REPORT_ISSUE_LABEL = 'mothership-health-report';
@@ -830,14 +1188,39 @@ const REPORT_WINDOW_DAYS = 7;
 const HUB_OWNER = process.env.HUB_GITHUB_OWNER || 'adamberneche-afk';
 const HUB_REPO = process.env.HUB_GITHUB_REPO || 'Mothership';
 
-function loadSpokesRegistry() {
-  if (!existsSync(SPOKES_REGISTRY_PATH)) return [];
+function loadJsonArrayFromDisk(path) {
+  if (!existsSync(path)) return [];
   try {
-    const parsed = JSON.parse(readFileSync(SPOKES_REGISTRY_PATH, 'utf8'));
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     return [];
   }
+}
+
+function loadSpokesRegistry() {
+  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
+}
+
+function loadTenantsRegistry() {
+  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
+}
+
+// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
+function resolveSecretRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
+  if (ref.startsWith('kv:')) return null;
+  return null;
+}
+
+function resolveTenantIdForSpoke(owner, repo, spokes) {
+  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
+  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+}
+
+function findTenant(tenantId, tenants) {
+  return tenants.find(t => t && t.tenantId === tenantId) || null;
 }
 
 async function safeGetTextContent(octokit, owner, repo, path) {
@@ -913,15 +1296,24 @@ export async function buildReportForSpoke(octokit, spoke, { windowStart }) {
   return { owner: spoke.owner, repo: spoke.repo, issuesFiled, entriesInWindow: total, byOutcome, skipRate, capabilityStatus };
 }
 
-export async function buildFullReport(octokit, { now = Date.now(), windowDays = REPORT_WINDOW_DAYS } = {}) {
-  const spokes = loadSpokesRegistry();
+export async function buildFullReport(octokit, { now = Date.now(), windowDays = REPORT_WINDOW_DAYS, octokitFactory, spokesOverride, tenantsOverride } = {}) {
+  const spokes = spokesOverride || loadSpokesRegistry();
+  const tenants = tenantsOverride || loadTenantsRegistry();
   const windowStart = new Date(now - windowDays * 24 * 60 * 60 * 1000);
   const generatedAt = new Date(now).toISOString();
+
+  const resolveOctokitForSpoke = (spoke) => {
+    if (!octokitFactory) return octokit;
+    const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
+    const tenant = findTenant(tenantId, tenants);
+    const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+    return octokitFactory(token);
+  };
 
   const spokeReports = [];
   for (const spoke of spokes) {
     try {
-      spokeReports.push(await buildReportForSpoke(octokit, spoke, { windowStart }));
+      spokeReports.push(await buildReportForSpoke(resolveOctokitForSpoke(spoke), spoke, { windowStart }));
     } catch (e) {
       spokeReports.push({ owner: spoke.owner, repo: spoke.repo, error: e.message });
     }
@@ -975,7 +1367,9 @@ async function findExistingReportIssue(octokit) {
 
 // Updates the same pinned issue in place on every run instead of creating a
 // new one each time - a deliberate callback to the original issue-spam
-// disaster this whole system exists to avoid repeating.
+// disaster this whole system exists to avoid repeating. Always uses the
+// hub's own credential (never a tenant-scoped one) - this issue lives on
+// the hub repo itself.
 export async function publishReport(octokit, body) {
   const existing = await findExistingReportIssue(octokit);
   if (existing) {
@@ -997,8 +1391,9 @@ export async function publishReport(octokit, body) {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const octokitFactory = (token) => new Octokit({ auth: token });
 
-  buildFullReport(octokit)
+  buildFullReport(octokit, { octokitFactory })
     .then(async (report) => {
       const body = renderReportMarkdown(report);
       console.log(body);
@@ -1028,6 +1423,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 // prune-logs.js/health-report.js, it only needs a GitHub token, mirrored as
 // the GLOBAL_GITHUB_TOKEN Actions secret on this repo.
 //
+// Multi-tenancy: each spoke's issues/decision log are read using ITS
+// tenant's own resolved credential when octokitFactory is supplied
+// (decision #1 in lessons.md's multi-tenancy entry) - falls back to the
+// single `octokit` passed to collectFeedbackForAllSpokes when
+// octokitFactory isn't given, so existing single-tenant callers/tests keep
+// working unchanged.
+//
 // Usage: node scripts/collect-issue-feedback.js
 
 import { Octokit } from '@octokit/rest';
@@ -1035,17 +1437,44 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 
 const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
+const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
+const DEFAULT_TENANT_ID = 'default';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const HUB_ISSUE_LABEL = 'cto-hub-auto';
 
-function loadSpokesRegistry() {
-  if (!existsSync(SPOKES_REGISTRY_PATH)) return [];
+function loadJsonArrayFromDisk(path) {
+  if (!existsSync(path)) return [];
   try {
-    const parsed = JSON.parse(readFileSync(SPOKES_REGISTRY_PATH, 'utf8'));
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     return [];
   }
+}
+
+function loadSpokesRegistry() {
+  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
+}
+
+function loadTenantsRegistry() {
+  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
+}
+
+// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
+function resolveSecretRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
+  if (ref.startsWith('kv:')) return null;
+  return null;
+}
+
+function resolveTenantIdForSpoke(owner, repo, spokes) {
+  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
+  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+}
+
+function findTenant(tenantId, tenants) {
+  return tenants.find(t => t && t.tenantId === tenantId) || null;
 }
 
 async function readJsonArrayFile(octokit, owner, repo, path) {
@@ -1130,11 +1559,20 @@ export async function collectFeedbackForSpoke(octokit, spoke, { now = Date.now()
 }
 
 export async function collectFeedbackForAllSpokes(octokit, options = {}) {
-  const spokes = loadSpokesRegistry();
+  const { octokitFactory, spokesOverride, tenantsOverride, ...collectOptions } = options;
+  const spokes = spokesOverride || loadSpokesRegistry();
+  const tenants = tenantsOverride || loadTenantsRegistry();
   const results = [];
   for (const spoke of spokes) {
     try {
-      results.push(await collectFeedbackForSpoke(octokit, spoke, options));
+      let spokeOctokit = octokit;
+      if (octokitFactory) {
+        const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
+        const tenant = findTenant(tenantId, tenants);
+        const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+        spokeOctokit = octokitFactory(token);
+      }
+      results.push(await collectFeedbackForSpoke(spokeOctokit, spoke, collectOptions));
     } catch (e) {
       results.push({ owner: spoke.owner, repo: spoke.repo, error: e.message });
     }
@@ -1146,8 +1584,9 @@ export async function collectFeedbackForAllSpokes(octokit, options = {}) {
 // when the test harness imports collectFeedbackForSpoke/collectFeedbackForAllSpokes.
 if (import.meta.url === `file://${process.argv[1]}`) {
   const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const octokitFactory = (token) => new Octokit({ auth: token });
 
-  collectFeedbackForAllSpokes(octokit)
+  collectFeedbackForAllSpokes(octokit, { octokitFactory })
     .then((results) => {
       console.log(JSON.stringify(results, null, 2));
       if (results.some((r) => r.error)) process.exitCode = 1;
@@ -1181,6 +1620,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 // set to an empty string or a wrong value. That's a narrower net than "the
 // exact incident," and it's stated as such rather than papered over.
 //
+// Multi-tenancy: each spoke is checked using ITS OWN tenant's resolved
+// GitHub credential (decision #1 in lessons.md's multi-tenancy entry), not
+// one shared token - see checkSpokeRepoReachable/checkSpokeHasCallHubWorkflow/
+// checkSpokeHasHubUrlSecret's octokitFactory parameter. checkGlobalGithubToken
+// still checks the HUB's own token specifically (that's what it's for), via
+// the octokit instance the CLI wrapper passes in directly.
+//
 // Usage: node scripts/doctor.js
 
 import { Octokit } from '@octokit/rest';
@@ -1188,17 +1634,44 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 
 const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
+const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
+const DEFAULT_TENANT_ID = 'default';
 const CALL_HUB_WORKFLOW_PATH = '.github/workflows/call-hub.yml';
 const HUB_URL_SECRET_NAMES = ['VERCEL_URL', 'APPS_SCRIPT_URL'];
 
-function loadSpokesRegistry() {
-  if (!existsSync(SPOKES_REGISTRY_PATH)) return [];
+function loadJsonArrayFromDisk(path) {
+  if (!existsSync(path)) return [];
   try {
-    const parsed = JSON.parse(readFileSync(SPOKES_REGISTRY_PATH, 'utf8'));
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     return [];
   }
+}
+
+function loadSpokesRegistry() {
+  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
+}
+
+function loadTenantsRegistry() {
+  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
+}
+
+// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
+function resolveSecretRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
+  if (ref.startsWith('kv:')) return null;
+  return null;
+}
+
+function resolveTenantIdForSpoke(owner, repo, spokes) {
+  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
+  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+}
+
+function findTenant(tenantId, tenants) {
+  return tenants.find(t => t && t.tenantId === tenantId) || null;
 }
 
 // This exact repo's own GLOBAL_GITHUB_TOKEN, readable at Actions runtime -
@@ -1291,16 +1764,33 @@ async function checkSpokeHasHubUrlSecret(octokit, spoke) {
 // result object rather than exiting - only the CLI wrapper below does
 // that, matching processRequest/buildFullReport/pruneAllSpokes's existing
 // testable-core/thin-CLI-shell split.
-export async function runDoctor(octokit, { fetchImpl = fetch, env = process.env } = {}) {
+//
+// `octokit` here checks the HUB's own token (GLOBAL_GITHUB_TOKEN) directly -
+// that's the whole point of checkGlobalGithubToken. `octokitFactory(token)`
+// is used per-spoke instead, resolving each spoke's OWN tenant credential
+// (decision #1) rather than reusing the hub's token for every spoke's
+// checks - falls back to `octokit` itself when octokitFactory isn't
+// supplied, so existing single-tenant callers/tests keep working unchanged.
+export async function runDoctor(octokit, { fetchImpl = fetch, env = process.env, octokitFactory, spokesOverride, tenantsOverride } = {}) {
   const checks = [];
   checks.push(await checkGlobalGithubToken(octokit, env.GLOBAL_GITHUB_TOKEN));
   checks.push(await checkAiKey(fetchImpl, env.AI_BASE_URL, env.AI_API_KEY));
 
-  const spokes = loadSpokesRegistry();
+  const spokes = spokesOverride || loadSpokesRegistry();
+  const tenants = tenantsOverride || loadTenantsRegistry();
+  const resolveOctokitForSpoke = (spoke) => {
+    if (!octokitFactory) return octokit;
+    const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
+    const tenant = findTenant(tenantId, tenants);
+    const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || env.GLOBAL_GITHUB_TOKEN;
+    return octokitFactory(token);
+  };
+
   for (const spoke of spokes) {
-    checks.push(await checkSpokeRepoReachable(octokit, spoke));
-    checks.push(await checkSpokeHasCallHubWorkflow(octokit, spoke));
-    checks.push(await checkSpokeHasHubUrlSecret(octokit, spoke));
+    const spokeOctokit = resolveOctokitForSpoke(spoke);
+    checks.push(await checkSpokeRepoReachable(spokeOctokit, spoke));
+    checks.push(await checkSpokeHasCallHubWorkflow(spokeOctokit, spoke));
+    checks.push(await checkSpokeHasHubUrlSecret(spokeOctokit, spoke));
   }
 
   return { checks, allOk: checks.every((c) => c.ok) };
@@ -1318,8 +1808,9 @@ export function renderReport(result) {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const octokitFactory = (token) => new Octokit({ auth: token });
 
-  runDoctor(octokit, { fetchImpl: fetch })
+  runDoctor(octokit, { fetchImpl: fetch, octokitFactory })
     .then((result) => {
       console.log(renderReport(result));
       if (!result.allOk) process.exitCode = 1;

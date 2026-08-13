@@ -3,6 +3,8 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 
 const SPOKES_REGISTRY_PATH = 'spokes.json';
+const TENANTS_REGISTRY_PATH = 'tenants.json';
+const DEFAULT_TENANT_ID = 'default';
 // How many of a spoke's most recent decision-log entries get included in
 // the cross-spoke summary prompt - enough to see a pattern, not so much
 // that one busy spoke drowns out the others.
@@ -47,34 +49,47 @@ async function getDefaultBranch(octokit, owner, repo) {
   }
 }
 
-// The actual logic, factored out of the Vercel handler the same way
-// autonomous_agent.js's processRequest is, so it can be driven by a local
-// mock harness instead of hitting GitHub/the AI API for real.
-export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch, dryRunOverride, hubOwner, hubRepo } = {}) {
-  const HUB_OWNER = hubOwner || process.env.HUB_GITHUB_OWNER || DEFAULT_HUB_OWNER;
-  const HUB_REPO = hubRepo || process.env.HUB_GITHUB_REPO || DEFAULT_HUB_REPO;
+// --- Multi-tenancy: same data model/resolution as api/autonomous_agent.js
+// (see that file's header comment for the full rationale) - ported here so
+// the Recursive Learning Loop never pools two tenants' spoke data into one
+// cross-spoke prompt, which would otherwise be a real, silent isolation
+// leak specific to this endpoint's whole purpose (finding patterns ACROSS
+// spokes).
 
-  // Same safety rail as autonomous_agent.js, and the same env var - a
-  // proposal is a lower-stakes action than filing an issue (it's a PR
-  // someone has to review and merge, not something posted unattended), but
-  // this still shouldn't go live before Sprint 0's rail has been verified.
-  const dryRun = dryRunOverride !== undefined
-    ? dryRunOverride
-    : process.env.DRY_RUN_MODE !== 'false';
-
-  let spokes = safeParseJsonArray(await safeGetTextContent(octokit, HUB_OWNER, HUB_REPO, SPOKES_REGISTRY_PATH));
-
-  if (spokes.length === 0) {
-    return { httpStatus: 200, body: { status: 'Skipped', reason: 'No spokes registered in spokes.json', dryRun } };
+function groupSpokesByTenant(spokes) {
+  const byTenant = {};
+  for (const spoke of spokes) {
+    if (!spoke || !spoke.owner || !spoke.repo) continue;
+    const tenantId = spoke.tenantId || DEFAULT_TENANT_ID;
+    (byTenant[tenantId] = byTenant[tenantId] || []).push(spoke);
   }
+  return byTenant;
+}
 
-  const universalLessonsPath = join(process.cwd(), 'universal_lessons.md');
-  const globalNorthStarPath = join(process.cwd(), 'north_star_framework.md');
-  const universalLessons = existsSync(universalLessonsPath) ? readFileSync(universalLessonsPath, 'utf8') : "";
-  const globalNorthStar = existsSync(globalNorthStarPath) ? readFileSync(globalNorthStarPath, 'utf8') : "";
+function findTenant(tenantId, tenants) {
+  return tenants.find(t => t && t.tenantId === tenantId) || null;
+}
+
+// Same env:/kv: scheme as api/autonomous_agent.js's resolveSecretRef.
+// TODO: wire the kv: branch to a real secrets store before onboarding a
+// second tenant for real - see that file's identical TODO.
+function resolveSecretRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
+  if (ref.startsWith('kv:')) return null;
+  return null;
+}
+
+// Builds and runs one tenant's independent cross-spoke proposal - the unit
+// of work this whole redesign scopes tenant-isolation around. Only ever
+// sees this tenant's own spokes' lessons.md/ai_decision_log.json; never
+// pools another tenant's data into the same prompt.
+async function runForTenant({ tenantId, tenantSpokes, tenant, octokitFactory, hubOctokit, fetchImpl, dryRun, universalLessons, globalNorthStar, HUB_OWNER, HUB_REPO }) {
+  const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+  const octokit = octokitFactory(spokeToken);
 
   const perSpokeContext = [];
-  for (const spoke of spokes) {
+  for (const spoke of tenantSpokes) {
     const lessons = await safeGetTextContent(octokit, spoke.owner, spoke.repo, 'lessons.md');
     const decisionLogText = await safeGetTextContent(octokit, spoke.owner, spoke.repo, 'ai_decision_log.json');
     const recentDecisions = safeParseJsonArray(decisionLogText).slice(-RECENT_DECISIONS_PER_SPOKE);
@@ -106,7 +121,10 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
 
   const prompt = `
     ROLE: Senior AI CTO performing a cross-project retrospective across every
-    connected spoke.
+    connected spoke belonging to ONE customer (tenant "${tenantId}") - never
+    mix in patterns from any other tenant's projects, even if you happen to
+    know about them; a proposal here must be justifiable from this tenant's
+    own spokes alone.
     CURRENT GLOBAL STANDARDS (universal_lessons.md): ${universalLessons}
     CURRENT GLOBAL NORTH STAR (north_star_framework.md): ${globalNorthStar}
 
@@ -148,21 +166,18 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
   const rawContent = aiData?.choices?.[0]?.message?.content;
 
   if (typeof rawContent !== 'string' || rawContent.trim().length === 0) {
-    return { httpStatus: 200, body: { status: 'Skipped', reason: 'AI returned no content', dryRun } };
+    return { tenantId, status: 'Skipped', reason: 'AI returned no content', dryRun };
   }
 
   let result;
   try {
     result = JSON.parse(rawContent);
   } catch (parseError) {
-    return {
-      httpStatus: 200,
-      body: { status: 'Skipped', reason: 'AI did not return valid JSON', raw: rawContent.slice(0, 500), dryRun }
-    };
+    return { tenantId, status: 'Skipped', reason: 'AI did not return valid JSON', raw: rawContent.slice(0, 500), dryRun };
   }
 
   if (result.has_proposal !== true) {
-    return { httpStatus: 200, body: { status: 'Skipped', reason: 'AI found no cross-spoke pattern worth proposing', dryRun } };
+    return { tenantId, status: 'Skipped', reason: 'AI found no cross-spoke pattern worth proposing', dryRun };
   }
 
   const isNonEmptyString = (v) => typeof v === 'string' && v.trim().length > 0;
@@ -170,23 +185,25 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
   const isValidShape = isNonEmptyString(result.reasoning) && hasAnyPatch;
 
   if (!isValidShape) {
-    return {
-      httpStatus: 200,
-      body: { status: 'Skipped', reason: 'AI response did not match the required shape', raw: rawContent.slice(0, 500), dryRun }
-    };
+    return { tenantId, status: 'Skipped', reason: 'AI response did not match the required shape', raw: rawContent.slice(0, 500), dryRun };
   }
 
   if (dryRun) {
-    return { httpStatus: 200, body: { status: 'DryRunProposal', dryRun: true, proposal: result } };
+    return { tenantId, status: 'DryRunProposal', dryRun: true, proposal: result };
   }
 
-  // Live: propose via a PR against the hub itself - never push directly to
-  // the default branch. Whatever comes out of this is a suggestion a human
-  // reviews and merges (or doesn't), same as any other PR.
-  const defaultBranch = await getDefaultBranch(octokit, HUB_OWNER, HUB_REPO);
-  const { data: baseRef } = await octokit.git.getRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `heads/${defaultBranch}` });
-  const branchName = `recursive-learning-${Date.now()}`;
-  await octokit.git.createRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `refs/heads/${branchName}`, sha: baseRef.object.sha });
+  // Live: propose via a PR against the hub itself, using hubOctokit (the
+  // hub's own credential - a tenant's own token has no access to the hub
+  // repo at all, by design) - never push directly to the default branch.
+  // The PR body names which tenant's data prompted it, so the human
+  // reviewing/merging can judge whether generalizing a customer-specific
+  // pattern into the shared global standard is appropriate - this
+  // disclosure is what keeps "propose via PR, human merges" an adequate
+  // isolation safeguard instead of a silent cross-tenant leak.
+  const defaultBranch = await getDefaultBranch(hubOctokit, HUB_OWNER, HUB_REPO);
+  const { data: baseRef } = await hubOctokit.git.getRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `heads/${defaultBranch}` });
+  const branchName = `recursive-learning-${tenantId}-${Date.now()}`;
+  await hubOctokit.git.createRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `refs/heads/${branchName}`, sha: baseRef.object.sha });
 
   const filesToUpdate = [];
   if (isNonEmptyString(result.universal_lessons_patch)) {
@@ -199,38 +216,89 @@ export async function runRecursiveLearning(reqBody, { octokit, fetchImpl = fetch
   for (const file of filesToUpdate) {
     let existingSha;
     try {
-      const { data } = await octokit.repos.getContent({ owner: HUB_OWNER, repo: HUB_REPO, path: file.path, ref: branchName });
+      const { data } = await hubOctokit.repos.getContent({ owner: HUB_OWNER, repo: HUB_REPO, path: file.path, ref: branchName });
       existingSha = data.sha;
     } catch (e) {
       existingSha = undefined;
     }
     const params = {
       owner: HUB_OWNER, repo: HUB_REPO, path: file.path, branch: branchName,
-      message: `docs: recursive-learning proposal for ${file.path}`,
+      message: `docs: recursive-learning proposal for ${file.path} (tenant ${tenantId})`,
       content: Buffer.from(file.content).toString('base64')
     };
     if (existingSha) params.sha = existingSha;
-    await octokit.repos.createOrUpdateFileContents(params);
+    await hubOctokit.repos.createOrUpdateFileContents(params);
   }
 
-  const pr = await octokit.pulls.create({
+  const pr = await hubOctokit.pulls.create({
     owner: HUB_OWNER, repo: HUB_REPO,
-    title: 'Recursive Learning: proposed cross-spoke updates',
+    title: `Recursive Learning: proposed cross-spoke updates (tenant ${tenantId})`,
     head: branchName,
     base: defaultBranch,
-    body: `### Reasoning\n${result.reasoning}\n\n---\nGenerated automatically by \`api/recursive_learning.js\` from patterns observed across ${spokes.length} spoke(s). This is a proposal, not a decision - review before merging.`
+    body: `### Reasoning\n${result.reasoning}\n\n---\nGenerated automatically by \`api/recursive_learning.js\` from patterns observed across ${tenantSpokes.length} spoke(s) belonging to **tenant \`${tenantId}\`** (\`${tenant?.name || tenantId}\`). This is a proposal, not a decision - review before merging, and consider whether generalizing a pattern from one customer's projects into the shared global standard is appropriate before doing so.`
   });
 
-  return { httpStatus: 200, body: { status: 'Success', dryRun: false, pullRequestUrl: pr.data.html_url } };
+  return { tenantId, status: 'Success', dryRun: false, pullRequestUrl: pr.data.html_url };
+}
+
+// The actual logic, factored out of the Vercel handler the same way
+// autonomous_agent.js's processRequest is, so it can be driven by a local
+// mock harness instead of hitting GitHub/the AI API for real.
+//
+// `octokitFactory(token)` replaces a single injected `octokit` instance,
+// mirroring api/autonomous_agent.js's own multi-tenancy redesign - each
+// tenant's spokes get read with THEIR OWN credential (decision #1), not one
+// shared token. `hubOctokit` is a separate, already-constructed client
+// scoped to the hub's own repo/token, used for reading spokes.json/
+// tenants.json and for the PR/branch operations against the hub itself.
+export async function runRecursiveLearning(reqBody, { octokitFactory, hubOctokit, fetchImpl = fetch, dryRunOverride, hubOwner, hubRepo, spokesOverride, tenantsOverride } = {}) {
+  const HUB_OWNER = hubOwner || process.env.HUB_GITHUB_OWNER || DEFAULT_HUB_OWNER;
+  const HUB_REPO = hubRepo || process.env.HUB_GITHUB_REPO || DEFAULT_HUB_REPO;
+
+  // Same safety rail as autonomous_agent.js, and the same env var - a
+  // proposal is a lower-stakes action than filing an issue (it's a PR
+  // someone has to review and merge, not something posted unattended), but
+  // this still shouldn't go live before Sprint 0's rail has been verified.
+  const dryRun = dryRunOverride !== undefined
+    ? dryRunOverride
+    : process.env.DRY_RUN_MODE !== 'false';
+
+  const spokes = spokesOverride || safeParseJsonArray(await safeGetTextContent(hubOctokit, HUB_OWNER, HUB_REPO, SPOKES_REGISTRY_PATH));
+
+  if (spokes.length === 0) {
+    return { httpStatus: 200, body: { status: 'Skipped', reason: 'No spokes registered in spokes.json', dryRun } };
+  }
+
+  const tenants = tenantsOverride || safeParseJsonArray(await safeGetTextContent(hubOctokit, HUB_OWNER, HUB_REPO, TENANTS_REGISTRY_PATH));
+  const byTenant = groupSpokesByTenant(spokes);
+
+  const universalLessonsPath = join(process.cwd(), 'universal_lessons.md');
+  const globalNorthStarPath = join(process.cwd(), 'north_star_framework.md');
+  const universalLessons = existsSync(universalLessonsPath) ? readFileSync(universalLessonsPath, 'utf8') : "";
+  const globalNorthStar = existsSync(globalNorthStarPath) ? readFileSync(globalNorthStarPath, 'utf8') : "";
+
+  // One independent run per tenant - never pooled. See runForTenant's own
+  // comment on why the prompt itself also says this explicitly.
+  const results = [];
+  for (const [tenantId, tenantSpokes] of Object.entries(byTenant)) {
+    const tenant = findTenant(tenantId, tenants);
+    results.push(await runForTenant({
+      tenantId, tenantSpokes, tenant, octokitFactory, hubOctokit, fetchImpl, dryRun,
+      universalLessons, globalNorthStar, HUB_OWNER, HUB_REPO
+    }));
+  }
+
+  return { httpStatus: 200, body: { status: 'Completed', dryRun, tenantCount: results.length, results } };
 }
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const octokitFactory = (token) => new Octokit({ auth: token });
+  const hubOctokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
 
   try {
-    const { httpStatus, body } = await runRecursiveLearning(req.body, { octokit, fetchImpl: fetch });
+    const { httpStatus, body } = await runRecursiveLearning(req.body, { octokitFactory, hubOctokit, fetchImpl: fetch });
     return res.status(httpStatus).json(body);
   } catch (err) {
     return res.status(500).json({ error: err.message });

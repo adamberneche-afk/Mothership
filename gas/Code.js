@@ -47,15 +47,24 @@ function doPost(e) {
   }
 
   const config = loadConfig();
-  const github = makeGithubClient(UrlFetchApp.fetch, config.globalGithubToken);
+  // githubFactory defers client construction until processRequest/
+  // runRecursiveLearning know which tenant's credential to use (decision
+  // #1 in lessons.md's multi-tenancy entry) - hubGithub stays the one,
+  // hub-repo-scoped client (still GLOBAL_GITHUB_TOKEN under the hood) used
+  // only for this hub's own registry/usage-log reads/writes, never for a
+  // tenant's spoke operations. config.scriptProperties lets
+  // resolveSecretRef's env: scheme read other Script Properties by name.
+  const githubFactory = (token) => makeGithubClient(UrlFetchApp.fetch, token);
+  const hubGithub = makeGithubClient(UrlFetchApp.fetch, config.globalGithubToken);
   const aiFetch = (url, options) => UrlFetchApp.fetch(url, options);
+  config.scriptProperties = PropertiesService.getScriptProperties();
 
   let result;
   try {
     if (endpoint === 'recursive_learning') {
-      result = runRecursiveLearning(reqBody, { github, aiFetch, base64Encode, base64Decode, config });
+      result = runRecursiveLearning(reqBody, { githubFactory, hubGithub, aiFetch, base64Encode, base64Decode, config });
     } else {
-      result = processRequest(reqBody, { github, aiFetch, base64Encode, base64Decode, config });
+      result = processRequest(reqBody, { githubFactory, hubGithub, aiFetch, base64Encode, base64Decode, config });
     }
   } catch (err) {
     result = { httpStatus: 500, body: { error: err.message } };

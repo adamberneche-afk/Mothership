@@ -165,6 +165,26 @@ async function testCollectFeedbackForAllSpokesUsesTheRealRegistryAndSkipsOnError
   check('no result is an error (missing log treated as empty, not a failure)', results.every((r) => !r.error));
 }
 
+async function testEachSpokeIsCheckedWithItsOwnTenantCredentialWhenFactoryIsSupplied() {
+  console.log("Multi-tenancy: with octokitFactory supplied, each spoke's feedback is collected using ITS tenant's own resolved credential, not the hub token");
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  const acmeOctokit = makeFakeOctokit({
+    files: { 'acme-org/acme-repo:ai_decision_log.json': [createdEntry('https://github.com/acme-org/acme-repo/issues/1')] },
+    issues: [issueWith('https://github.com/acme-org/acme-repo/issues/1', { thumbsDown: 1 })]
+  });
+  const hubOctokit = makeFakeOctokit({});
+  const tokensRequested = [];
+  const octokitFactory = (token) => { tokensRequested.push(token); return token === 'acme-secret-token' ? acmeOctokit : hubOctokit; };
+  const spokesOverride = [{ tenantId: 'acme', owner: 'acme-org', repo: 'acme-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active' }];
+  const tenantsOverride = [{ tenantId: 'acme', name: 'Acme', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:ACME_TEST_TOKEN', createdAt: '2026-08-13T00:00:00Z' }];
+  const results = await collectFeedbackForAllSpokes(hubOctokit, { octokitFactory, spokesOverride, tenantsOverride });
+  check("acme's own token was resolved and used", tokensRequested.includes('acme-secret-token'));
+  check("acme's spoke was checked via its own fake octokit, not the hub one", acmeOctokit.calls.listForRepo.length > 0);
+  check('the hub octokit was never asked about the acme spoke', hubOctokit.calls.listForRepo.every(c => c.owner !== 'acme-org'));
+  check('the acme spoke result has no error and reports the update', results[0]?.owner === 'acme-org' && !results[0]?.error && results[0]?.updated === 1);
+  delete process.env.ACME_TEST_TOKEN;
+}
+
 async function main() {
   await testAttachesFeedbackToMatchingEntryWithNegativeReactions();
   await testLeavesEntryUntouchedWhenNoNegativeReactions();
@@ -173,6 +193,7 @@ async function main() {
   await testRetriesOnWriteConflictAndSucceeds();
   await testGivesUpAfterMaxAttempts();
   await testCollectFeedbackForAllSpokesUsesTheRealRegistryAndSkipsOnError();
+  await testEachSpokeIsCheckedWithItsOwnTenantCredentialWhenFactoryIsSupplied();
 
   console.log('');
   if (failures > 0) {

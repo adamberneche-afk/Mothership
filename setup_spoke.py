@@ -137,6 +137,13 @@ jobs:
           # Only needed if the hub's Vercel deployment has Deployment
           # Protection enabled - see README.md on the hub repo.
           VERCEL_BYPASS_TOKEN: ${{ secrets.VERCEL_BYPASS_TOKEN }}
+          # Multi-tenancy caller auth (see the hub's lessons.md multi-tenancy
+          # entry) - only required if the hub has registered this spoke under
+          # a tenant with a callerKeyRef configured. Left unset, this is a
+          # no-op: the hub only enforces a match when the resolved tenant
+          # actually requires one, so an unconfigured single-tenant setup
+          # (the default) behaves exactly as before.
+          TENANT_CALLER_KEY: ${{ secrets.TENANT_CALLER_KEY }}
         run: |
           curl -X POST "${VERCEL_URL}/api/autonomous_agent" \\
             -H "Content-Type: application/json" \\
@@ -144,7 +151,8 @@ jobs:
             -d '{
               "owner": "${{ github.repository_owner }}",
               "repo": "${{ github.event.repository.name }}",
-              "mode": "${{ steps.mode.outputs.mode }}"
+              "mode": "${{ steps.mode.outputs.mode }}",
+              "callerKey": "${{ secrets.TENANT_CALLER_KEY }}"
             }'
 '''
         }
@@ -166,6 +174,9 @@ jobs:
     print("   - VERCEL_BYPASS_TOKEN: only needed if the hub's Vercel deployment")
     print("     has Deployment Protection enabled (a 'Protection Bypass for")
     print("     Automation' secret from the Vercel dashboard).")
+    print("   - TENANT_CALLER_KEY: only needed if the hub registers this repo")
+    print("     under a tenant with a callerKeyRef configured (multi-tenancy -")
+    print("     see the hub's README). Leave unset for a single-tenant/default setup.")
     print("3. Ensure the Hub's GLOBAL_GITHUB_TOKEN (a GitHub PAT) has access to this repo.")
     print("4. Trigger the 'Ping CTO Hub' workflow manually (workflow_dispatch) first -")
     print("   the hub defaults to DRY_RUN_MODE, so a successful test reports what it")
