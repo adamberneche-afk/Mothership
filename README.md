@@ -128,6 +128,16 @@ No backend of its own: `manifest.json`/`sw.js` make it installable (add-to-home-
 
 **Hub Health:** a second panel, above the per-spoke one, answering a different question - not "are the spokes okay," but "is the swarm's own machinery actually running." Reads this repo's own Actions run history for its four scheduled workflows (`self-reflect`, `health-report`, `recursive-learning`, `prune-logs` - `ci.yml` is left out on purpose, it's a PR/push code-quality gate, not a scheduled operational signal) via the same unauthenticated `api.github.com` access as everything else here, with the same caching/offline-fallback treatment. Statuses: `healthy` (last run succeeded), `failing` (completed with any other outcome), `never run`, `in progress`, plus the same `rate-limited`/`couldn't load`/`timed out` states the spoke panel already has - worst-first, same as the spoke table.
 
+### Pre-Flight Doctor Check (`scripts/doctor.js`)
+
+Checks exactly the class of bug found live in this repo's own history: a `GLOBAL_GITHUB_TOKEN` that's invalid or expired (`health-report.yml`'s 401, undetected through 5 straight runs before anyone noticed), and a spoke whose `call-hub.yml` has no hub-URL secret set at all (`thinkos-server`/`tais` failing 100+ scheduled runs on an unset `VERCEL_URL`) - both checkable in under a second per repo.
+
+Validates: `GLOBAL_GITHUB_TOKEN` against `GET /rate_limit`, `AI_API_KEY`/`AI_BASE_URL` against `GET /models` (same low-cost validation as the Apps Script settings page above), and per registered spoke - the repo is reachable, `call-hub.yml` exists, and at least one of `VERCEL_URL`/`APPS_SCRIPT_URL` appears in that repo's Actions secret names.
+
+**Known, disclosed limitation:** GitHub never exposes a secret's *value* via any API, only its name and timestamps - the secret check above can only confirm something with the right name exists. It would have caught a fully-unset `VERCEL_URL`, but not one set to an empty string or a wrong value. That's a narrower net than "the exact incident," stated as such rather than papered over.
+
+**Deliberately `workflow_dispatch`-only, no schedule** - this project's own investigation into its health started because scheduled workflows were failing silently with nobody watching; adding another scheduled job here would risk the identical failure mode this tool exists to catch. Run it manually when setting up a new spoke, rotating a credential, or troubleshooting.
+
 ## Setup Instructions
 
 ### 1. Deploy to Vercel

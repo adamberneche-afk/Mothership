@@ -1,0 +1,205 @@
+// Local verification harness for scripts/doctor.js.
+//
+// Same rationale as the other dev-test-*.mjs harnesses: no live GitHub or
+// AI calls here, everything runs against hand-rolled fakes.
+//
+// Usage: node scripts/dev-test-doctor.mjs
+
+import { runDoctor } from './doctor.js';
+
+let failures = 0;
+
+function check(name, condition) {
+  if (condition) {
+    console.log(`  ok - ${name}`);
+  } else {
+    console.error(`  FAIL - ${name}`);
+    failures++;
+  }
+}
+
+// --- Fakes -------------------------------------------------------------------
+
+// `rateLimitStatus`: 200 (valid token) or 401 (invalid/expired) - the exact
+// class of failure this session's own GLOBAL_GITHUB_TOKEN incident was.
+// `repos`: { "owner/repo": { reachable, hasCallHubWorkflow, secretNames } } -
+// per-spoke fixtures; a repo not listed defaults to fully healthy.
+function makeFakeOctokit({ rateLimitStatus = 200, repos = {} } = {}) {
+  const calls = { request: [], reposGet: [], getContent: [] };
+  function repoFixture(owner, repo) {
+    return repos[`${owner}/${repo}`] || { reachable: true, hasCallHubWorkflow: true, secretNames: ['VERCEL_URL'] };
+  }
+  return {
+    calls,
+    request: async (route, params) => {
+      calls.request.push({ route, params });
+      if (route === 'GET /rate_limit') {
+        if (rateLimitStatus === 200) return { data: {} };
+        const err = new Error(`${rateLimitStatus} Bad credentials`);
+        err.status = rateLimitStatus;
+        throw err;
+      }
+      if (route === 'GET /repos/{owner}/{repo}/actions/secrets') {
+        const fixture = repoFixture(params.owner, params.repo);
+        return { data: { secrets: fixture.secretNames.map((name) => ({ name })) } };
+      }
+      throw new Error(`unexpected route in fake: ${route}`);
+    },
+    repos: {
+      get: async ({ owner, repo }) => {
+        calls.reposGet.push({ owner, repo });
+        const fixture = repoFixture(owner, repo);
+        if (!fixture.reachable) throw new Error('404 not found');
+        return { data: {} };
+      },
+      getContent: async ({ owner, repo, path }) => {
+        calls.getContent.push({ owner, repo, path });
+        const fixture = repoFixture(owner, repo);
+        if (!fixture.hasCallHubWorkflow) {
+          const err = new Error('404 not found');
+          err.status = 404;
+          throw err;
+        }
+        return { data: {} };
+      }
+    }
+  };
+}
+
+function makeFakeFetch(status = 200) {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: status === 200, status };
+  };
+  fetchImpl.calls = calls;
+  return fetchImpl;
+}
+
+// --- Tests -------------------------------------------------------------------
+
+async function testAllHealthyPasses() {
+  console.log('all-healthy: every check ok, function returns without throwing');
+  const octokit = makeFakeOctokit({ rateLimitStatus: 200 });
+  const fetchImpl = makeFakeFetch(200);
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  check('allOk is true', result.allOk === true);
+  check('every check reports ok', result.checks.every((c) => c.ok));
+}
+
+async function testInvalidGithubTokenFailsButOtherChecksStillRun() {
+  console.log('a 401 on GLOBAL_GITHUB_TOKEN is caught with a clear detail, and other checks still run');
+  const octokit = makeFakeOctokit({ rateLimitStatus: 401 });
+  const fetchImpl = makeFakeFetch(200);
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  check('allOk is false', result.allOk === false);
+  const githubCheck = result.checks.find((c) => c.label === 'GLOBAL_GITHUB_TOKEN');
+  check('GLOBAL_GITHUB_TOKEN check failed with a real detail', githubCheck.ok === false && /401/.test(githubCheck.detail));
+  const aiCheck = result.checks.find((c) => c.label === 'AI_API_KEY');
+  check('the AI_API_KEY check still ran and passed (one failure does not abort the rest)', aiCheck.ok === true);
+}
+
+async function testInvalidAiKeyFails() {
+  console.log('a 401 on the AI /models check is caught with a clear detail');
+  const octokit = makeFakeOctokit({ rateLimitStatus: 200 });
+  const fetchImpl = makeFakeFetch(401);
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-bad', AI_BASE_URL: 'https://ai.example.com' } });
+  const aiCheck = result.checks.find((c) => c.label === 'AI_API_KEY');
+  check('AI_API_KEY check failed with a real detail', aiCheck.ok === false && /401/.test(aiCheck.detail));
+}
+
+async function testUnsetAiKeyReportsNotConfigured() {
+  console.log('an unset AI_API_KEY reports "not configured" without any fetch call');
+  const octokit = makeFakeOctokit({ rateLimitStatus: 200 });
+  const fetchImpl = makeFakeFetch(200);
+  const result = await runDoctor(octokit, { fetchImpl, env: {} });
+  const aiCheck = result.checks.find((c) => c.label === 'AI_API_KEY');
+  check('reports not configured', aiCheck.ok === false && aiCheck.detail === 'not configured');
+  check('no fetch call was made', fetchImpl.calls.length === 0);
+}
+
+async function testUnsetGithubTokenReportsNotConfiguredWithoutAnyRequestCall() {
+  console.log('an unset GLOBAL_GITHUB_TOKEN reports "not configured" without calling the API - GET /rate_limit itself returns 200 even fully unauthenticated, so this can only be caught by checking the token directly rather than trusting that response code');
+  const octokit = makeFakeOctokit({ rateLimitStatus: 200 });
+  const fetchImpl = makeFakeFetch(200);
+  const result = await runDoctor(octokit, { fetchImpl, env: {} });
+  const githubCheck = result.checks.find((c) => c.label === 'GLOBAL_GITHUB_TOKEN');
+  check('reports not configured', githubCheck.ok === false && githubCheck.detail === 'not configured');
+  check('no GET /rate_limit request was made', !octokit.calls.request.some((c) => c.route === 'GET /rate_limit'));
+}
+
+async function testSpokeMissingCallHubWorkflowIsFlagged() {
+  console.log('a spoke missing call-hub.yml is flagged');
+  const octokit = makeFakeOctokit({
+    repos: { 'adamberneche-afk/tso': { reachable: true, hasCallHubWorkflow: false, secretNames: ['VERCEL_URL'] } }
+  });
+  const fetchImpl = makeFakeFetch(200);
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  const workflowCheck = result.checks.find((c) => c.label.includes('tso') && c.label.includes('call-hub.yml'));
+  check('a call-hub.yml check exists for tso and fails', !!workflowCheck && workflowCheck.ok === false);
+  check('overall allOk is false', result.allOk === false);
+}
+
+async function testCallHubWorkflowCheckDistinguishesNotFoundFromOtherErrors() {
+  console.log('a non-404 error checking call-hub.yml (e.g. rate-limited) is reported distinctly, not misreported as "not wired up"');
+  const octokit = makeFakeOctokit({
+    repos: { 'adamberneche-afk/tso': { reachable: true, hasCallHubWorkflow: true, secretNames: ['VERCEL_URL'] } }
+  });
+  const originalGetContent = octokit.repos.getContent;
+  octokit.repos.getContent = async (params) => {
+    if (params.owner === 'adamberneche-afk' && params.repo === 'tso') {
+      const err = new Error('API rate limit exceeded');
+      err.status = 403;
+      throw err;
+    }
+    return originalGetContent(params);
+  };
+  const fetchImpl = makeFakeFetch(200);
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  const workflowCheck = result.checks.find((c) => c.label.includes('tso') && c.label.includes('call-hub.yml'));
+  check('reports the real error, not "not wired up"', workflowCheck.ok === false && /couldn't check/.test(workflowCheck.detail) && !/not wired up/.test(workflowCheck.detail));
+}
+
+async function testSpokeMissingHubUrlSecretIsFlagged() {
+  console.log('a spoke with neither VERCEL_URL nor APPS_SCRIPT_URL in its secrets is flagged');
+  const octokit = makeFakeOctokit({
+    repos: { 'adamberneche-afk/tso': { reachable: true, hasCallHubWorkflow: true, secretNames: [] } }
+  });
+  const fetchImpl = makeFakeFetch(200);
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  const secretCheck = result.checks.find((c) => c.label.includes('tso') && c.label.includes('secret'));
+  check('a secret-presence check exists for tso and fails', !!secretCheck && secretCheck.ok === false);
+  check('overall allOk is false', result.allOk === false);
+}
+
+async function testSpokeWithApsScriptUrlInsteadOfVercelUrlPasses() {
+  console.log('a spoke with APPS_SCRIPT_URL (instead of VERCEL_URL) still passes the secret-presence check');
+  const octokit = makeFakeOctokit({
+    repos: { 'adamberneche-afk/tso': { reachable: true, hasCallHubWorkflow: true, secretNames: ['APPS_SCRIPT_URL'] } }
+  });
+  const fetchImpl = makeFakeFetch(200);
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  const secretCheck = result.checks.find((c) => c.label.includes('tso') && c.label.includes('secret'));
+  check('the secret-presence check passes', !!secretCheck && secretCheck.ok === true);
+}
+
+async function main() {
+  await testAllHealthyPasses();
+  await testInvalidGithubTokenFailsButOtherChecksStillRun();
+  await testInvalidAiKeyFails();
+  await testUnsetAiKeyReportsNotConfigured();
+  await testUnsetGithubTokenReportsNotConfiguredWithoutAnyRequestCall();
+  await testSpokeMissingCallHubWorkflowIsFlagged();
+  await testCallHubWorkflowCheckDistinguishesNotFoundFromOtherErrors();
+  await testSpokeMissingHubUrlSecretIsFlagged();
+  await testSpokeWithApsScriptUrlInsteadOfVercelUrlPasses();
+
+  console.log('');
+  if (failures > 0) {
+    console.error(`${failures} check(s) failed.`);
+    process.exit(1);
+  }
+  console.log('All checks passed.');
+}
+
+main();
