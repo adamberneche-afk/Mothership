@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Payment Received - Mothership</title>
+<meta name="description" content="Your Mothership subscription payment was received; activation follows shortly.">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#14161a">
+<style>
+  :root {
+    --paper: #f4f3ee; --panel: #ffffff; --ink: #1e2124; --ink-soft: #5c5f57;
+    --line: #d9d5c7; --teal: #2f6459;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #14161a; --panel: #1a1d22; --ink: #e8e4d9; --ink-soft: #a9a79c;
+      --line: rgba(255,255,255,0.14); --teal: #74b4a2;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: var(--paper); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.5;
+  }
+  .card {
+    max-width: 480px; width: 100%; margin: 24px; padding: 32px; text-align: center;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 12px; color: var(--teal); }
+  p { color: var(--ink-soft); margin: 0; }
+</style>
+</head>
+<body>
+  <!--
+    IMPORTANT (see api/stripe_webhook.js's header comment): this page is a
+    static, side-effect-free landing spot for Stripe's success_url. It is
+    NOT what activates a tenant - only the verified, server-to-server
+    checkout.session.completed webhook does that. A browser reaching this
+    URL proves nothing about payment; treating it as confirmation would
+    let anyone provision a free tenant just by visiting it.
+  -->
+  <div class="card">
+    <h1>Payment received</h1>
+    <p>Thanks - we're activating your account now. This usually takes under a minute. You'll be able to use your connected repositories shortly; no further action is needed from you.</p>
+  </div>
+</body>
+</html>

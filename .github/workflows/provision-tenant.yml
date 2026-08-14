@@ -1,0 +1,78 @@
+name: Provision Tenant
+
+# Deliberately workflow_dispatch-only, no schedule - same trust/exposure
+# model as doctor.yml: an operator triggers this by hand when actually
+# provisioning someone, never on a clock. Unlike doctor.js/prune-logs.js's
+# workflows (which write via the GitHub Contents API directly),
+# scripts/provision-tenant.js writes to the local checkout on disk - this
+# job commits and pushes that change itself, since nothing else will.
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_id:
+        description: 'Tenant id (lowercase, alphanumeric + hyphens)'
+        required: true
+      name:
+        description: 'Human-readable tenant name'
+        required: true
+      plan:
+        description: 'Plan name (free-form - e.g. pro, enterprise)'
+        required: true
+      credential_ref:
+        description: 'GitHub credential ref (env:VAR_NAME or ghapp:<installation_id>)'
+        required: true
+      quota:
+        description: 'Reviews per month (blank = unlimited)'
+        required: false
+      status:
+        description: 'Tenant status'
+        required: false
+        default: 'active'
+        type: choice
+        options:
+          - active
+          - suspended
+      spokes:
+        description: 'Space-separated owner/repo entries to register as this tenant''s initial spokes (optional)'
+        required: false
+      dry_run:
+        description: 'Dry run - validate and print, write nothing'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  provision-tenant:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Provision tenant
+        run: |
+          ARGS=(--tenant-id "${{ inputs.tenant_id }}" --name "${{ inputs.name }}" --plan "${{ inputs.plan }}" --credential-ref "${{ inputs.credential_ref }}")
+          if [ -n "${{ inputs.quota }}" ]; then ARGS+=(--quota "${{ inputs.quota }}"); fi
+          if [ -n "${{ inputs.status }}" ]; then ARGS+=(--status "${{ inputs.status }}"); fi
+          for spoke in ${{ inputs.spokes }}; do ARGS+=(--spoke "$spoke"); done
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS+=(--dry-run); fi
+          node scripts/provision-tenant.js "${ARGS[@]}"
+
+      - name: Commit and push (skipped on dry run)
+        if: inputs.dry_run != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- tenants.json spokes.json; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git add tenants.json spokes.json
+          git commit -m "chore: provision tenant ${{ inputs.tenant_id }} (operator-driven, via Actions)"
+          git push

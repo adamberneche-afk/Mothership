@@ -11,6 +11,17 @@
 import { processRequest } from '../api/autonomous_agent.js';
 import { strict as assert } from 'assert';
 
+// Sprint 0/1 tests below don't override spokes/tenants, so they resolve to
+// the real on-disk "default" tenant (tenants.json), whose credential ref is
+// "env:GLOBAL_GITHUB_TOKEN" - a real deployment always has this set (it's
+// also required to construct hubOctokit in handler()), so set a fixture
+// value here rather than have this harness's fake-credential environment
+// accidentally exercise the "credential ref fails to resolve" hard-skip
+// path added for the tenant-status/credential-fallback fix. Multi-tenancy
+// tests further down set/delete their own tenant-specific tokens and don't
+// rely on this value.
+process.env.GLOBAL_GITHUB_TOKEN = 'the-global-token';
+
 let failures = 0;
 
 function check(name, condition) {
@@ -323,6 +334,42 @@ async function testRegisteredSpokeResolvesItsOwnTenantCredential() {
   delete process.env.GLOBAL_GITHUB_TOKEN;
 }
 
+async function testSuspendedTenantIsSkippedBeforeAnyGithubCall() {
+  console.log("Multi-tenancy fix: a tenant with status !== 'active' is skipped before any GitHub call");
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  const octokit = makeFakeOctokit();
+  const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
+  const suspendedTenants = TWO_TENANTS.map(t => t.tenantId === 'acme' ? { ...t, status: 'suspended' } : t);
+  const { httpStatus, body } = await processRequest(
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: suspendedTenants }
+  );
+  check('httpStatus is 200 (a quiet skip, not an error)', httpStatus === 200);
+  check("reason mentions the tenant's status", /status is 'suspended'/.test(body.reason));
+  check('zero GitHub calls were made for a suspended tenant', octokit.calls.getContent.length === 0);
+  check('the AI was never called', fetchImpl.callCount() === 0);
+  delete process.env.ACME_TEST_TOKEN;
+}
+
+async function testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken() {
+  console.log('Multi-tenancy fix: a matched tenant whose credential ref fails to resolve is a hard skip, never a silent GLOBAL_GITHUB_TOKEN fallback');
+  process.env.GLOBAL_GITHUB_TOKEN = 'the-global-token';
+  // Deliberately do NOT set ACME_TEST_TOKEN - simulates a misconfigured/
+  // revoked credential ref for a tenant that DOES exist in the registry.
+  const octokit = makeFakeOctokit();
+  const factory = makeFakeOctokitFactory(octokit);
+  const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
+  const { httpStatus, body } = await processRequest(
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { octokitFactory: factory, fetchImpl, dryRunOverride: true, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+  );
+  check('httpStatus is 200 (a quiet skip, not an error)', httpStatus === 200);
+  check('reason mentions the credential could not be resolved', /Could not resolve GitHub credential/.test(body.reason));
+  check('octokitFactory was never even called - no widened-access fallback attempted', factory.tokensUsed.length === 0);
+  check('the AI was never called', fetchImpl.callCount() === 0);
+  delete process.env.GLOBAL_GITHUB_TOKEN;
+}
+
 async function testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured() {
   console.log('Multi-tenancy: a tenant with no callerKeyRef set (acme) accepts any/no callerKey - backward compatible');
   process.env.ACME_TEST_TOKEN = 'acme-secret-token';
@@ -460,6 +507,8 @@ async function main() {
   await testReplayWithoutAnIssueUrlOmitsTheField();
   await testUnregisteredSpokeFallsBackToDefaultTenantCredential();
   await testRegisteredSpokeResolvesItsOwnTenantCredential();
+  await testSuspendedTenantIsSkippedBeforeAnyGithubCall();
+  await testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken();
   await testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured();
   await testCallerKeyRejectedWhenWrongForATenantThatRequiresOne();
   await testCallerKeyAcceptedWhenCorrect();

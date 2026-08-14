@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Waiting on Org Approval - Mothership</title>
+<meta name="description" content="Your GitHub App install request is waiting on an organization owner to approve it.">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#14161a">
+<style>
+  :root {
+    --paper: #f4f3ee; --panel: #ffffff; --ink: #1e2124; --ink-soft: #5c5f57;
+    --line: #d9d5c7; --warn: #9c7222;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #14161a; --panel: #1a1d22; --ink: #e8e4d9; --ink-soft: #a9a79c;
+      --line: rgba(255,255,255,0.14); --warn: #d9a63f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: var(--paper); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.5;
+  }
+  .card {
+    max-width: 480px; width: 100%; margin: 24px; padding: 32px; text-align: center;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 12px; color: var(--warn); }
+  p { color: var(--ink-soft); margin: 0; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Waiting on approval</h1>
+    <p>You're not an owner of this GitHub organization, so the install request needs an org owner to approve it first. Once approved, you'll be able to complete setup - no action needed from you right now.</p>
+  </div>
+</body>
+</html>

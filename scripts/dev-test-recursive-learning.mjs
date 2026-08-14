@@ -333,6 +333,29 @@ async function testTenantCredentialResolutionUsesTheRightToken() {
   delete process.env.GLOBEX_TEST_TOKEN;
 }
 
+async function testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken() {
+  console.log("Multi-tenancy fix: a matched tenant whose credential ref fails to resolve is a hard skip, never a silent GLOBAL_GITHUB_TOKEN fallback");
+  process.env.GLOBAL_GITHUB_TOKEN = 'the-global-token';
+  process.env.GLOBEX_TEST_TOKEN = 'globex-secret-token';
+  // Deliberately do NOT set ACME_TEST_TOKEN - simulates a misconfigured/
+  // revoked credential ref for a tenant that DOES exist in the registry.
+  const sharedFakeOctokit = makeFakeSpokeOctokit(TWO_TENANT_SPOKE_FILES);
+  const factory = makeFakeOctokitFactory(sharedFakeOctokit);
+  const hubOctokit = makeFakeHubOctokitForTenancy();
+  const fetchImpl = makeFakeFetch(NO_PROPOSAL_JSON);
+  const { body } = await runRecursiveLearning({}, {
+    octokitFactory: factory, hubOctokit, fetchImpl, dryRunOverride: true,
+    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
+    spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
+  });
+  const acmeResult = body.results.find(r => r.tenantId === 'acme');
+  check('acme is skipped with a credential-resolution reason', acmeResult.status === 'Skipped' && /Could not resolve GitHub credential/.test(acmeResult.reason));
+  check('the global token was never used for acme\'s repos', !factory.tokensUsed.includes('the-global-token'));
+  check("globex still resolved and ran normally, unaffected", factory.tokensUsed.includes('globex-secret-token'));
+  delete process.env.GLOBAL_GITHUB_TOKEN;
+  delete process.env.GLOBEX_TEST_TOKEN;
+}
+
 // --- Shared, opt-in, cross-organization learning pool ----------------------
 //
 // Routes AI responses by inspecting the prompt itself: the shared-pool
@@ -585,6 +608,7 @@ async function main() {
   await testTwoTenantsGetTwoIndependentPromptsNeverPooled();
   await testEachTenantWithAProposalGetsItsOwnPR();
   await testTenantCredentialResolutionUsesTheRightToken();
+  await testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken();
   await testOptedOutSpokeNeverAppearsInSharedPoolOrCountsTowardEvidence();
   await testTwoDistinctTenantsClearsEvidenceBar();
   await testThreeDistinctReposSameTenantClearsEvidenceBar();

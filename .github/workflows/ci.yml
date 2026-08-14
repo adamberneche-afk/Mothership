@@ -53,12 +53,15 @@ jobs:
 
           drift=0
           for f in \
+            lib/secrets.js lib/github_app.js lib/onboarding_token.js lib/registry_writer.js \
             api/autonomous_agent.js api/recursive_learning.js \
+            api/onboard_start.js api/github_app_callback.js api/stripe_webhook.js api/github_app_webhook.js \
             scripts/prune-logs.js scripts/health-report.js scripts/collect-issue-feedback.js \
-            scripts/doctor.js \
+            scripts/doctor.js scripts/provision-tenant.js \
             .github/workflows/self-reflect.yml .github/workflows/prune-logs.yml \
             .github/workflows/health-report.yml .github/workflows/recursive-learning.yml \
             .github/workflows/collect-issue-feedback.yml .github/workflows/doctor.yml \
+            .github/workflows/provision-tenant.yml \
             package.json .gitignore; do
             if ! diff -u <(norm "$f") <(norm "/tmp/hub-scratch/$f") > /tmp/hub-scratch-diff.txt; then
               echo "::error::setup_hub.py's embedded copy of $f has drifted from the real file"

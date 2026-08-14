@@ -240,20 +240,42 @@ function processRequest(reqBody, {
   const tenantId = resolveTenantIdForSpoke(owner, repo, spokes);
   const tenant = findTenant(tenantId, tenants);
 
+  // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
+  // config value never files a real issue by accident - DRY_RUN_MODE has to
+  // be explicitly set to the string "false" to go live. Computed up front
+  // (moved ahead of tenant/credential handling below), same reasoning as
+  // api/autonomous_agent.js, so the tenant-status gate can use it too.
+  const dryRun = dryRunOverride !== undefined
+    ? dryRunOverride
+    : config.dryRunMode !== 'false';
+
+  // TENANT STATUS GATE - same rules/rationale as api/autonomous_agent.js's
+  // identical block: an explicitly non-'active' tenant is skipped before
+  // any GitHub call, `status` optional for backward compat.
+  if (tenant && tenant.status && tenant.status !== 'active') {
+    return { httpStatus: 200, body: { status: 'Skipped', reason: `Tenant status is '${tenant.status}', not 'active'`, dryRun } };
+  }
+
   const requiredCallerKey = tenant ? resolveSecretRef(tenant.callerKeyRef, config.scriptProperties) : null;
   if (requiredCallerKey && callerKey !== requiredCallerKey) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
 
-  const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef, config.scriptProperties)) || config.globalGithubToken;
+  // Credential for SPOKE operations - same rules/rationale as
+  // api/autonomous_agent.js's identical block: config.globalGithubToken is
+  // used ONLY when no tenant matched at all; a matched tenant whose
+  // credential ref fails to resolve is a hard skip, never a silent
+  // fallback to the hub's own broad token.
+  let spokeToken;
+  if (tenant) {
+    spokeToken = resolveSecretRef(tenant.githubCredentialRef, config.scriptProperties);
+    if (!spokeToken) {
+      return { httpStatus: 200, body: { status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun } };
+    }
+  } else {
+    spokeToken = config.globalGithubToken;
+  }
   const github = githubFactory(spokeToken);
-
-  // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
-  // config value never files a real issue by accident - DRY_RUN_MODE has to
-  // be explicitly set to the string "false" to go live.
-  const dryRun = dryRunOverride !== undefined
-    ? dryRunOverride
-    : config.dryRunMode !== 'false';
 
   const universalLessons = safeGetHubFile(hubGithub, base64Decode, hubOwner, hubRepo, 'universal_lessons.md');
   const globalNorthStar = safeGetHubFile(hubGithub, base64Decode, hubOwner, hubRepo, 'north_star_framework.md');

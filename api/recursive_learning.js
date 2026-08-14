@@ -1,10 +1,8 @@
 import { Octokit } from '@octokit/rest';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { SPOKES_REGISTRY_PATH, TENANTS_REGISTRY_PATH, DEFAULT_TENANT_ID, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
-const SPOKES_REGISTRY_PATH = 'spokes.json';
-const TENANTS_REGISTRY_PATH = 'tenants.json';
-const DEFAULT_TENANT_ID = 'default';
 // How many of a spoke's most recent decision-log entries get included in
 // the cross-spoke summary prompt - enough to see a pattern, not so much
 // that one busy spoke drowns out the others.
@@ -66,19 +64,9 @@ function groupSpokesByTenant(spokes) {
   return byTenant;
 }
 
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
-
-// Same env:/kv: scheme as api/autonomous_agent.js's resolveSecretRef.
-// TODO: wire the kv: branch to a real secrets store before onboarding a
-// second tenant for real - see that file's identical TODO.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null;
-  return null;
-}
+// findTenant/resolveSecretRef now live in ../lib/secrets.js (imported
+// above) - deduped out of what used to be 6 byte-identical Node-side
+// copies of the same functions, see that file's header comment.
 
 // --- Shared, opt-in, cross-organization learning pool -----------------------
 //
@@ -154,7 +142,19 @@ async function runForSharedPool({ sharedPoolSpokes, tenants, octokitFactory, hub
     const label = `Contributor ${i + 1}`;
     const tenantId = spoke.tenantId || DEFAULT_TENANT_ID;
     const tenant = findTenant(tenantId, tenants);
-    const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+    // Same rules/rationale as runForTenant's identical fix: a matched
+    // tenant whose credential ref fails to resolve is excluded from this
+    // round of the shared pool entirely (never a silent fallback to a
+    // broader credential) - one misconfigured contributor shouldn't abort
+    // the whole cross-organization pass, so this is a `continue`, not a
+    // hard return.
+    let spokeToken;
+    if (tenant) {
+      spokeToken = await resolveSecretRef(tenant.githubCredentialRef);
+      if (!spokeToken) continue;
+    } else {
+      spokeToken = process.env.GLOBAL_GITHUB_TOKEN;
+    }
     const octokit = octokitFactory(spokeToken);
 
     labelToSpoke[label] = { owner: spoke.owner, repo: spoke.repo, tenantId };
@@ -317,7 +317,20 @@ async function runForSharedPool({ sharedPoolSpokes, tenants, octokitFactory, hub
 // sees this tenant's own spokes' lessons.md/ai_decision_log.json; never
 // pools another tenant's data into the same prompt.
 async function runForTenant({ tenantId, tenantSpokes, tenant, octokitFactory, hubOctokit, fetchImpl, dryRun, universalLessons, globalNorthStar, HUB_OWNER, HUB_REPO }) {
-  const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+  // Same rules/rationale as api/autonomous_agent.js's identical fix:
+  // GLOBAL_GITHUB_TOKEN is used only for the true legacy/no-tenant-matched
+  // case; a tenant that DID match but whose credential ref fails to
+  // resolve is a hard skip, never a silent fallback to a broader,
+  // hub-operator-owned credential reading this tenant's own repos.
+  let spokeToken;
+  if (tenant) {
+    spokeToken = await resolveSecretRef(tenant.githubCredentialRef);
+    if (!spokeToken) {
+      return { tenantId, status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun };
+    }
+  } else {
+    spokeToken = process.env.GLOBAL_GITHUB_TOKEN;
+  }
   const octokit = octokitFactory(spokeToken);
 
   const perSpokeContext = [];
