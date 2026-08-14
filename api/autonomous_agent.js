@@ -1,6 +1,7 @@
 import { Octokit } from '@octokit/rest';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
 // Caps how much diff text gets forwarded to the LLM per run - keeps prompt
 // size and API cost bounded.
@@ -21,9 +22,6 @@ const DECISION_LOG_MAX_ENTRIES = 500;
 // context, so the model doesn't re-report something already logged.
 const PRIOR_DECISIONS_CONTEXT_COUNT = 5;
 
-const SPOKES_REGISTRY_PATH = 'spokes.json';
-const TENANTS_REGISTRY_PATH = 'tenants.json';
-const DEFAULT_TENANT_ID = 'default';
 const USAGE_LOG_MAX_ENTRIES = 5000;
 
 // This hub's own identity, for writing its own usage/{tenantId}.json logs -
@@ -43,65 +41,10 @@ const MODE_INSTRUCTIONS = {
 // spokes.json/tenants.json are both hub-root files, read from local disk the
 // same way universal_lessons.md/north_star_framework.md already are - no
 // octokit call needed, since this Vercel function's own checkout already
-// has them. Both are architecture/data-model additions only this pass (see
-// lessons.md's dated entry) - no real tenant self-service onboarding UI, no
-// real secrets store, no payment processor. What's real: every spoke is now
-// unambiguously scoped to one tenant, credential resolution has a real seam
-// instead of one shared global token, and usage gets attributed per tenant.
-
-function loadJsonArrayFromDisk(path) {
-  const fullPath = join(process.cwd(), path);
-  if (!existsSync(fullPath)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(fullPath, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-// Finds which tenant a given owner/repo belongs to. Falls back to
-// DEFAULT_TENANT_ID for anything not found in spokes.json - a deliberate
-// backward-compatibility choice, not a security feature: it preserves
-// today's exact behavior (no registration required to get a response) for
-// spokes nobody has migrated into the tenant model yet. Once real
-// multi-tenant onboarding exists, an unmatched spoke should probably reject
-// instead of silently defaulting - flagged here, not fixed here.
-function resolveTenantIdForSpoke(owner, repo, spokes) {
-  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
-}
-
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
-
-// githubCredentialRef/callerKeyRef use a `scheme:value` format:
-//   env:VAR_NAME - reads an env var directly. This is what keeps the
-//     "default" tenant working exactly as before with zero migration -
-//     tenants.json seeds it with "env:GLOBAL_GITHUB_TOKEN".
-//   kv:some/path - a pointer into a real dynamic secrets store (Vercel KV,
-//     a database, a secrets manager) that DOES NOT EXIST YET. Provisioning
-//     one is required, separate infrastructure work before any tenant
-//     beyond "default" can actually go live - a git-committed JSON file
-//     can't hold a raw secret without permanently leaking it into git
-//     history, so there is deliberately no local fallback for this scheme.
-// TODO: wire the kv: branch to a real secrets store before onboarding a
-// second tenant for real.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null; // see TODO above
-  return null;
-}
-
-function loadSpokesRegistry() {
-  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
-}
-
-function loadTenantsRegistry() {
-  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
-}
+// has them. loadSpokesRegistry/loadTenantsRegistry/resolveTenantIdForSpoke/
+// findTenant/resolveSecretRef now live in ../lib/secrets.js (imported
+// above) - deduped out of what used to be 6 byte-identical Node-side
+// copies of the same functions, see that file's header comment.
 
 // Counts issues carrying HUB_ISSUE_LABEL that were created since UTC
 // midnight today, for the rate cap below. Derived on-demand from GitHub's
@@ -313,7 +256,7 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
     return { httpStatus: 200, body: { status: 'Skipped', reason: `Tenant status is '${tenant.status}', not 'active'`, dryRun } };
   }
 
-  const requiredCallerKey = tenant ? resolveSecretRef(tenant.callerKeyRef) : null;
+  const requiredCallerKey = tenant ? await resolveSecretRef(tenant.callerKeyRef) : null;
   if (requiredCallerKey && callerKey !== requiredCallerKey) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
@@ -334,7 +277,7 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   // becomes true.)
   let spokeToken;
   if (tenant) {
-    spokeToken = resolveSecretRef(tenant.githubCredentialRef);
+    spokeToken = await resolveSecretRef(tenant.githubCredentialRef);
     if (!spokeToken) {
       return { httpStatus: 200, body: { status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun } };
     }

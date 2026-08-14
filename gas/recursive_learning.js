@@ -113,7 +113,18 @@ function runForSharedPoolRL({ sharedPoolSpokes, tenants, githubFactory, hubGithu
     const label = `Contributor ${i + 1}`;
     const tenantId = spoke.tenantId || DEFAULT_TENANT_ID;
     const tenant = findTenantRL(tenantId, tenants);
-    const spokeToken = (tenant && resolveSecretRefRL(tenant.githubCredentialRef, config.scriptProperties)) || config.globalGithubToken;
+    // Same rules/rationale as api/recursive_learning.js's identical fix: a
+    // matched tenant whose credential ref fails to resolve is excluded
+    // from this round of the shared pool (never a silent fallback to a
+    // broader credential) - `continue`, not a hard return, so one
+    // misconfigured contributor doesn't abort the whole cross-org pass.
+    let spokeToken;
+    if (tenant) {
+      spokeToken = resolveSecretRefRL(tenant.githubCredentialRef, config.scriptProperties);
+      if (!spokeToken) continue;
+    } else {
+      spokeToken = config.globalGithubToken;
+    }
     const github = githubFactory(spokeToken);
 
     labelToSpoke[label] = { owner: spoke.owner, repo: spoke.repo, tenantId };
@@ -271,7 +282,20 @@ function runForSharedPoolRL({ sharedPoolSpokes, tenants, githubFactory, hubGithu
 // api/recursive_learning.js's runForTenant for the full rationale; this is
 // a direct, synchronous port (no Promises, matching UrlFetchApp).
 function runForTenantRL({ tenantId, tenantSpokes, tenant, githubFactory, hubGithub, aiFetch, base64Encode, base64Decode, config, dryRun, universalLessons, globalNorthStar, HUB_OWNER, HUB_REPO }) {
-  const spokeToken = (tenant && resolveSecretRefRL(tenant.githubCredentialRef, config.scriptProperties)) || config.globalGithubToken;
+  // Same rules/rationale as api/recursive_learning.js's identical fix:
+  // config.globalGithubToken is used only for the true legacy/no-tenant-
+  // matched case; a tenant that DID match but whose credential ref fails
+  // to resolve is a hard skip, never a silent fallback to a broader,
+  // hub-operator-owned credential reading this tenant's own repos.
+  let spokeToken;
+  if (tenant) {
+    spokeToken = resolveSecretRefRL(tenant.githubCredentialRef, config.scriptProperties);
+    if (!spokeToken) {
+      return { tenantId, status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun };
+    }
+  } else {
+    spokeToken = config.globalGithubToken;
+  }
   const github = githubFactory(spokeToken);
 
   const perSpokeContext = [];

@@ -12,50 +12,16 @@
 //   Env: RETENTION_DAYS (default 90), DRY_RUN=true to report without writing
 
 import { Octokit } from '@octokit/rest';
-import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
-const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
-const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
-const DEFAULT_TENANT_ID = 'default';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const ARCHIVE_LOG_PATH = 'ai_decision_log_archive.json';
 const DEFAULT_RETENTION_DAYS = 90;
 
-function loadJsonArrayFromDisk(path) {
-  if (!existsSync(path)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-function loadSpokesRegistry() {
-  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
-}
-
-function loadTenantsRegistry() {
-  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
-}
-
-// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null;
-  return null;
-}
-
-function resolveTenantIdForSpoke(owner, repo, spokes) {
-  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
-}
-
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
+// loadSpokesRegistry/loadTenantsRegistry/resolveTenantIdForSpoke/findTenant/
+// resolveSecretRef now live in ../lib/secrets.js (imported above) - deduped
+// out of what used to be 6 byte-identical Node-side copies of the same
+// functions, see that file's header comment.
 
 async function readJsonArrayFile(octokit, owner, repo, path) {
   try {
@@ -165,7 +131,13 @@ export async function pruneAllSpokes(octokit, options = {}) {
       if (octokitFactory) {
         const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
         const tenant = findTenant(tenantId, tenants);
-        const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+        // Read-only-adjacent maintenance script - best-effort-with-some-token
+        // is the right behavior here (matches doctor.js/health-report.js/
+        // collect-issue-feedback.js's identical, deliberate fallback),
+        // unlike the hard-skip rule in api/autonomous_agent.js/
+        // api/recursive_learning.js.
+        const resolved = tenant ? await resolveSecretRef(tenant.githubCredentialRef) : null;
+        const token = resolved || process.env.GLOBAL_GITHUB_TOKEN;
         spokeOctokit = octokitFactory(token);
       }
       results.push(await pruneSpoke(spokeOctokit, spoke, pruneOptions));
