@@ -333,6 +333,247 @@ async function testTenantCredentialResolutionUsesTheRightToken() {
   delete process.env.GLOBEX_TEST_TOKEN;
 }
 
+// --- Shared, opt-in, cross-organization learning pool ----------------------
+//
+// Routes AI responses by inspecting the prompt itself: the shared-pool
+// prompt is uniquely identifiable by its "cross-ORGANIZATION" phrasing (see
+// runForSharedPool's prompt template), so a single fetchImpl can return a
+// different, deliberately-controlled response for the shared-pool call vs.
+// every ordinary per-tenant call in the same runRecursiveLearning
+// invocation - needed because both kinds of calls happen in one run once
+// any spoke has opted in.
+function makeFakeFetchRouter(responder) {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    const prompt = JSON.parse(options.body).messages[0].content;
+    calls.push({ url, options, prompt });
+    const content = responder(prompt);
+    return { json: async () => ({ choices: [{ message: { content } }] }) };
+  };
+  fetchImpl.calls = calls;
+  fetchImpl.callCount = () => calls.length;
+  fetchImpl.allPrompts = () => calls.map(c => c.prompt);
+  fetchImpl.promptsMatching = (re) => calls.map(c => c.prompt).filter(p => re.test(p));
+  return fetchImpl;
+}
+
+function sharedPoolAwareResponder(sharedPoolJson, tenantJson = NO_PROPOSAL_JSON) {
+  return (prompt) => (prompt.includes('cross-ORGANIZATION') ? sharedPoolJson : tenantJson);
+}
+
+function sharedPoolProposalJson(supportingContributors) {
+  return JSON.stringify({
+    has_proposal: true,
+    reasoning: 'A recurring pattern observed across multiple contributors.',
+    supporting_contributors: supportingContributors,
+    universal_lessons_patch: '# Universal Engineering Standards\n\n- A genuine cross-organization pattern.',
+    north_star_patch: ''
+  });
+}
+
+const NO_PROPOSAL_SHARED_JSON = JSON.stringify({ has_proposal: false, reasoning: '', supporting_contributors: [], universal_lessons_patch: '', north_star_patch: '' });
+
+const SHARED_POOL_TWO_TENANT_SPOKES = [
+  { tenantId: 'acme', owner: 'acme-org', repo: 'acme-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active', shareLearnings: true },
+  { tenantId: 'globex', owner: 'globex-org', repo: 'globex-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active', shareLearnings: true }
+];
+
+const THREE_SAME_TENANT_SPOKES = [
+  { tenantId: 'acme', owner: 'acme-org', repo: 'repo-one', addedAt: '2026-08-13T00:00:00Z', status: 'active', shareLearnings: true },
+  { tenantId: 'acme', owner: 'acme-org', repo: 'repo-two', addedAt: '2026-08-13T00:00:00Z', status: 'active', shareLearnings: true },
+  { tenantId: 'acme', owner: 'acme-org', repo: 'repo-three', addedAt: '2026-08-13T00:00:00Z', status: 'active', shareLearnings: true }
+];
+
+const ACME_ONLY_TENANT = [
+  { tenantId: 'acme', name: 'Acme', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:ACME_TEST_TOKEN', createdAt: '2026-08-13T00:00:00Z' }
+];
+
+function makeSharedPoolOctokitFactory(mapping) {
+  const fallback = makeFakeSpokeOctokit({});
+  return (token) => mapping[token] || fallback;
+}
+
+async function testOptedOutSpokeNeverAppearsInSharedPoolOrCountsTowardEvidence() {
+  console.log("Multi-tenancy shared pool: a spoke that hasn't opted in (no shareLearnings) never appears in the shared-pool prompt, and doesn't count toward its evidence bar");
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  process.env.GLOBEX_TEST_TOKEN = 'globex-secret-token';
+  const acmeOctokit = makeFakeSpokeOctokit(TWO_TENANT_SPOKE_FILES);
+  const globexOctokit = makeFakeSpokeOctokit(TWO_TENANT_SPOKE_FILES);
+  const octokitFactory = makeSharedPoolOctokitFactory({ 'acme-secret-token': acmeOctokit, 'globex-secret-token': globexOctokit });
+  const hubOctokit = makeFakeHubOctokitForTenancy();
+  const spokesWithOneOptedOut = [
+    ...SHARED_POOL_TWO_TENANT_SPOKES,
+    { tenantId: 'someco', owner: 'someco-org', repo: 'someco-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active' } // no shareLearnings - opted out
+  ];
+  const fetchImpl = makeFakeFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2'])));
+  const { body } = await runRecursiveLearning({}, {
+    octokitFactory, hubOctokit, fetchImpl, dryRunOverride: true,
+    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
+    spokesOverride: spokesWithOneOptedOut, tenantsOverride: TWO_TENANTS
+  });
+  const sharedPoolPrompt = fetchImpl.promptsMatching(/cross-ORGANIZATION/)[0];
+  check('shared-pool prompt never mentions the opted-out spoke', sharedPoolPrompt && !sharedPoolPrompt.includes('someco'));
+  check('shared-pool prompt has exactly 2 contributor sections, not 3', (sharedPoolPrompt.match(/--- Contributor \d+ ---/g) || []).length === 2);
+  check('shared pool result is a DryRunProposal (2 opted-in spokes across 2 tenants meets the bar)', body.sharedPoolResult?.status === 'DryRunProposal');
+  delete process.env.ACME_TEST_TOKEN;
+  delete process.env.GLOBEX_TEST_TOKEN;
+}
+
+async function testTwoDistinctTenantsClearsEvidenceBar() {
+  console.log('Multi-tenancy shared pool: 2 opted-in spokes from 2 DIFFERENT tenants clears the evidence bar');
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  process.env.GLOBEX_TEST_TOKEN = 'globex-secret-token';
+  const octokitFactory = makeSharedPoolOctokitFactory({
+    'acme-secret-token': makeFakeSpokeOctokit(TWO_TENANT_SPOKE_FILES),
+    'globex-secret-token': makeFakeSpokeOctokit(TWO_TENANT_SPOKE_FILES)
+  });
+  const hubOctokit = makeFakeHubOctokitForTenancy();
+  const fetchImpl = makeFakeFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2'])));
+  const { body } = await runRecursiveLearning({}, {
+    octokitFactory, hubOctokit, fetchImpl, dryRunOverride: true,
+    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
+    spokesOverride: SHARED_POOL_TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
+  });
+  check('shared pool result is accepted (DryRunProposal)', body.sharedPoolResult?.status === 'DryRunProposal');
+  delete process.env.ACME_TEST_TOKEN;
+  delete process.env.GLOBEX_TEST_TOKEN;
+}
+
+async function testThreeDistinctReposSameTenantClearsEvidenceBar() {
+  console.log('Multi-tenancy shared pool: 3 opted-in spokes within the SAME tenant clears the evidence bar (lower confidence than cross-tenant, still accepted)');
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  const octokitFactory = makeSharedPoolOctokitFactory({ 'acme-secret-token': makeFakeSpokeOctokit({}) });
+  const hubOctokit = makeFakeHubOctokitForTenancy();
+  const fetchImpl = makeFakeFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2', 'Contributor 3'])));
+  const { body } = await runRecursiveLearning({}, {
+    octokitFactory, hubOctokit, fetchImpl, dryRunOverride: true,
+    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
+    spokesOverride: THREE_SAME_TENANT_SPOKES, tenantsOverride: ACME_ONLY_TENANT
+  });
+  check('shared pool result is accepted (DryRunProposal)', body.sharedPoolResult?.status === 'DryRunProposal');
+  delete process.env.ACME_TEST_TOKEN;
+}
+
+async function testBelowBarSkipsStructurallyWithoutCallingAIForSharedPool() {
+  console.log('Multi-tenancy shared pool: only 2 opted-in spokes in the SAME tenant cannot meet the bar - skipped before ever calling the AI for the shared pool');
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  const octokitFactory = makeSharedPoolOctokitFactory({ 'acme-secret-token': makeFakeSpokeOctokit({}) });
+  const hubOctokit = makeFakeHubOctokitForTenancy();
+  const twoSameTenantSpokes = THREE_SAME_TENANT_SPOKES.slice(0, 2);
+  const fetchImpl = makeFakeFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2'])));
+  const { body } = await runRecursiveLearning({}, {
+    octokitFactory, hubOctokit, fetchImpl, dryRunOverride: true,
+    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
+    spokesOverride: twoSameTenantSpokes, tenantsOverride: ACME_ONLY_TENANT
+  });
+  check('shared pool result is Skipped', body.sharedPoolResult?.status === 'Skipped');
+  check('reason mentions not enough opted-in spokes', /not enough opted-in spokes/i.test(body.sharedPoolResult?.reason || ''));
+  check('zero AI calls were made for the shared pool specifically', fetchImpl.promptsMatching(/cross-ORGANIZATION/).length === 0);
+  delete process.env.ACME_TEST_TOKEN;
+}
+
+async function testCitedEvidenceBelowBarIsRejectedDespiteModelClaimingProposal() {
+  console.log('Multi-tenancy shared pool (anti-hallucination): the model claims has_proposal=true and cites real labels, but those specific labels only span 1 tenant/2 repos - code rejects it regardless of the claim');
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  process.env.GLOBEX_TEST_TOKEN = 'globex-secret-token';
+  const octokitFactory = makeSharedPoolOctokitFactory({
+    'acme-secret-token': makeFakeSpokeOctokit({}),
+    'globex-secret-token': makeFakeSpokeOctokit({})
+  });
+  const hubOctokit = makeFakeHubOctokitForTenancy();
+  // 3 opted-in spokes total, 2 distinct tenants overall (acme, acme, globex) -
+  // the OVERALL pool clears the structural precheck, but the model only
+  // cites the two acme spokes (Contributor 1 and 2) as its evidence.
+  const spokes = [
+    { tenantId: 'acme', owner: 'acme-org', repo: 'acme-repo-1', addedAt: '2026-08-13T00:00:00Z', status: 'active', shareLearnings: true },
+    { tenantId: 'acme', owner: 'acme-org', repo: 'acme-repo-2', addedAt: '2026-08-13T00:00:00Z', status: 'active', shareLearnings: true },
+    { tenantId: 'globex', owner: 'globex-org', repo: 'globex-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active', shareLearnings: true }
+  ];
+  const fetchImpl = makeFakeFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2'])));
+  const { body } = await runRecursiveLearning({}, {
+    octokitFactory, hubOctokit, fetchImpl, dryRunOverride: true,
+    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
+    spokesOverride: spokes, tenantsOverride: TWO_TENANTS
+  });
+  check('shared pool result is Skipped despite has_proposal:true', body.sharedPoolResult?.status === 'Skipped');
+  check('reason cites the evidence-bar failure specifically', /cited evidence does not meet/i.test(body.sharedPoolResult?.reason || ''));
+  check('no PR was opened', hubOctokit.calls.pullsCreate.length === 0);
+  delete process.env.ACME_TEST_TOKEN;
+  delete process.env.GLOBEX_TEST_TOKEN;
+}
+
+async function testSharedPoolPromptUsesAnonymizedLabelsNotRealNames() {
+  console.log('Multi-tenancy shared pool: the prompt sent to the AI uses anonymized "Contributor N" labels, never a real owner/repo name');
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  process.env.GLOBEX_TEST_TOKEN = 'globex-secret-token';
+  const octokitFactory = makeSharedPoolOctokitFactory({
+    'acme-secret-token': makeFakeSpokeOctokit(TWO_TENANT_SPOKE_FILES),
+    'globex-secret-token': makeFakeSpokeOctokit(TWO_TENANT_SPOKE_FILES)
+  });
+  const hubOctokit = makeFakeHubOctokitForTenancy();
+  const fetchImpl = makeFakeFetchRouter(sharedPoolAwareResponder(NO_PROPOSAL_SHARED_JSON));
+  await runRecursiveLearning({}, {
+    octokitFactory, hubOctokit, fetchImpl, dryRunOverride: true,
+    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
+    spokesOverride: SHARED_POOL_TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
+  });
+  const sharedPoolPrompt = fetchImpl.promptsMatching(/cross-ORGANIZATION/)[0];
+  check('shared-pool prompt contains anonymized labels', sharedPoolPrompt.includes('Contributor 1') && sharedPoolPrompt.includes('Contributor 2'));
+  check('shared-pool prompt never contains the real owner/repo strings', !sharedPoolPrompt.includes('acme-org/acme-repo') && !sharedPoolPrompt.includes('globex-org/globex-repo'));
+  delete process.env.ACME_TEST_TOKEN;
+  delete process.env.GLOBEX_TEST_TOKEN;
+}
+
+async function testAcceptedSharedProposalOpensPRWithRealNames() {
+  console.log('Multi-tenancy shared pool: an accepted, live proposal opens exactly one PR naming the REAL contributing repos/tenants (anonymization is prompt-only, not hidden from the human reviewer)');
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  process.env.GLOBEX_TEST_TOKEN = 'globex-secret-token';
+  const octokitFactory = makeSharedPoolOctokitFactory({
+    'acme-secret-token': makeFakeSpokeOctokit(TWO_TENANT_SPOKE_FILES),
+    'globex-secret-token': makeFakeSpokeOctokit(TWO_TENANT_SPOKE_FILES)
+  });
+  const hubOctokit = makeFakeHubOctokitForTenancy();
+  // Tenant-scoped calls report no proposal, so the only PR opened is the
+  // shared pool's - keeps the assertion below unambiguous.
+  const fetchImpl = makeFakeFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2']), NO_PROPOSAL_JSON));
+  const { body } = await runRecursiveLearning({}, {
+    octokitFactory, hubOctokit, fetchImpl, dryRunOverride: false,
+    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
+    spokesOverride: SHARED_POOL_TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
+  });
+  check('shared pool result is Success', body.sharedPoolResult?.status === 'Success');
+  check('exactly one PR was opened (the shared-pool one)', hubOctokit.calls.pullsCreate.length === 1);
+  const pr = hubOctokit.calls.pullsCreate[0];
+  check("PR title says 'cross-organization pattern (shared pool)'", pr?.title === 'Recursive Learning: proposed cross-organization pattern (shared pool)');
+  check('PR body names the real contributing repos', pr?.body.includes('acme-org/acme-repo') && pr?.body.includes('globex-org/globex-repo'));
+  check('PR body names the real contributing tenants', pr?.body.includes('tenant `acme`') && pr?.body.includes('tenant `globex`'));
+  check('branch name is prefixed for the shared pool, not a tenant', hubOctokit.calls.createRef.some(r => r.ref.startsWith('refs/heads/recursive-learning-shared-pool-')));
+  delete process.env.ACME_TEST_TOKEN;
+  delete process.env.GLOBEX_TEST_TOKEN;
+}
+
+async function testOptedInSpokeStillRunsInItsOwnTenantsPrivatePassToo() {
+  console.log('Multi-tenancy shared pool: a spoke that opts in still ALSO runs in its own tenant\'s private pass, unaffected (both, not either/or)');
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  process.env.GLOBEX_TEST_TOKEN = 'globex-secret-token';
+  const octokitFactory = makeSharedPoolOctokitFactory({
+    'acme-secret-token': makeFakeSpokeOctokit(TWO_TENANT_SPOKE_FILES),
+    'globex-secret-token': makeFakeSpokeOctokit(TWO_TENANT_SPOKE_FILES)
+  });
+  const hubOctokit = makeFakeHubOctokitForTenancy();
+  const fetchImpl = makeFakeFetchRouter(sharedPoolAwareResponder(NO_PROPOSAL_SHARED_JSON));
+  const { body } = await runRecursiveLearning({}, {
+    octokitFactory, hubOctokit, fetchImpl, dryRunOverride: true,
+    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
+    spokesOverride: SHARED_POOL_TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
+  });
+  check('both tenants still got their own private per-tenant result', body.results.some(r => r.tenantId === 'acme') && body.results.some(r => r.tenantId === 'globex'));
+  check('the shared pool ALSO ran (both, not either/or)', !!body.sharedPoolResult);
+  check('exactly 3 AI calls happened - one per tenant plus one for the shared pool', fetchImpl.callCount() === 3);
+  delete process.env.ACME_TEST_TOKEN;
+  delete process.env.GLOBEX_TEST_TOKEN;
+}
+
 async function main() {
   await testNoSpokesRegisteredSkips();
   await testNoProposalSkips();
@@ -344,6 +585,14 @@ async function main() {
   await testTwoTenantsGetTwoIndependentPromptsNeverPooled();
   await testEachTenantWithAProposalGetsItsOwnPR();
   await testTenantCredentialResolutionUsesTheRightToken();
+  await testOptedOutSpokeNeverAppearsInSharedPoolOrCountsTowardEvidence();
+  await testTwoDistinctTenantsClearsEvidenceBar();
+  await testThreeDistinctReposSameTenantClearsEvidenceBar();
+  await testBelowBarSkipsStructurallyWithoutCallingAIForSharedPool();
+  await testCitedEvidenceBelowBarIsRejectedDespiteModelClaimingProposal();
+  await testSharedPoolPromptUsesAnonymizedLabelsNotRealNames();
+  await testAcceptedSharedProposalOpensPRWithRealNames();
+  await testOptedInSpokeStillRunsInItsOwnTenantsPrivatePassToo();
 
   console.log('');
   if (failures > 0) {
