@@ -52,6 +52,14 @@ The Vercel serverless worker that:
 10. Only when the response is well-formed, reports real findings, dry-run is off, AND the day's cap hasn't been reached does it post a GitHub issue with reasoning and a code patch
 11. Every outcome (skip, dry-run finding, rate-capped, created) gets appended to the spoke's `ai_decision_log.json`, best-effort - a logging failure never fails the request itself
 
+### On-Demand Live Review (`.claude/skills/mothership-live-review/`)
+
+The Autonomous Agent above has never run for real end-to-end - it needs a deployed backend (Vercel or Apps Script, neither ever actually live) *and* a configured `AI_API_KEY`/`AI_BASE_URL` (never set). Both are long-standing, disclosed blockers with no code fix. This skill sidesteps both without touching either deployment path: instead of the handler calling out to an external AI API, the Claude session invoking the skill *is* the AI step, directly, reusing every other rail above (decision-log dedup, dry-run default, rate cap, decision logging) exactly as designed - same schema, same fetch order, same all-or-nothing local-context quirk (see below), just with the "call an external `/chat/completions` endpoint" step replaced by real reasoning performed in-session.
+
+Deliberately **on-demand only, no schedule** - this project's worst incident (the ~1,974-issue hallucination spree) and its second-worst (`thinkos-server`/`tais` spamming 100+/135+ failed scheduled runs on an unset secret) were both consequences of *unattended, scheduled* automation; wiring this into a cron/Routine is a distinct, separate decision, not implied by building it. It also **never files a real issue on its own** - a finding is always reported as a dry-run "would create," and actually calling `issues.create` requires a separate, explicit go-ahead per finding.
+
+Verified working end-to-end against real data: run once against `tso`'s real commit `d020c799` (the same fix that later independently caused `thinkos-server`/`tais` to fail 100+/135+ scheduled runs on an unset `VERCEL_URL`) - found the same root cause from the diff alone (no prior guard on the secret being set before `curl` uses it), reported the dry-run finding, and appended a real `dry_run_would_create` decision-log entry to `tso`'s `ai_decision_log.json` (commit `a29cc68`). Full procedure documented in the skill file linked above.
+
 ### Safety Rails
 
 The handler that used to file ~1,974 fabricated issues over 4 months (see `DOCS_VS_CODEBASE.md`) now has two independent guards on top of the response-validation fix above, both controlled by Vercel env vars:
