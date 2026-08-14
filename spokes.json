@@ -1,17 +1,20 @@
 [
   {
+    "tenantId": "default",
     "owner": "adamberneche-afk",
     "repo": "tso",
     "addedAt": "2026-08-06T00:00:00Z",
     "status": "active"
   },
   {
+    "tenantId": "default",
     "owner": "adamberneche-afk",
     "repo": "thinkos-server",
     "addedAt": "2026-08-06T00:00:00Z",
     "status": "active"
   },
   {
+    "tenantId": "default",
     "owner": "adamberneche-afk",
     "repo": "tais",
     "addedAt": "2026-08-06T00:00:00Z",

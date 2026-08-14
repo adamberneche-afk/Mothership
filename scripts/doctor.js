@@ -18,6 +18,13 @@
 // set to an empty string or a wrong value. That's a narrower net than "the
 // exact incident," and it's stated as such rather than papered over.
 //
+// Multi-tenancy: each spoke is checked using ITS OWN tenant's resolved
+// GitHub credential (decision #1 in lessons.md's multi-tenancy entry), not
+// one shared token - see checkSpokeRepoReachable/checkSpokeHasCallHubWorkflow/
+// checkSpokeHasHubUrlSecret's octokitFactory parameter. checkGlobalGithubToken
+// still checks the HUB's own token specifically (that's what it's for), via
+// the octokit instance the CLI wrapper passes in directly.
+//
 // Usage: node scripts/doctor.js
 
 import { Octokit } from '@octokit/rest';
@@ -25,17 +32,44 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 
 const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
+const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
+const DEFAULT_TENANT_ID = 'default';
 const CALL_HUB_WORKFLOW_PATH = '.github/workflows/call-hub.yml';
 const HUB_URL_SECRET_NAMES = ['VERCEL_URL', 'APPS_SCRIPT_URL'];
 
-function loadSpokesRegistry() {
-  if (!existsSync(SPOKES_REGISTRY_PATH)) return [];
+function loadJsonArrayFromDisk(path) {
+  if (!existsSync(path)) return [];
   try {
-    const parsed = JSON.parse(readFileSync(SPOKES_REGISTRY_PATH, 'utf8'));
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     return [];
   }
+}
+
+function loadSpokesRegistry() {
+  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
+}
+
+function loadTenantsRegistry() {
+  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
+}
+
+// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
+function resolveSecretRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
+  if (ref.startsWith('kv:')) return null;
+  return null;
+}
+
+function resolveTenantIdForSpoke(owner, repo, spokes) {
+  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
+  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+}
+
+function findTenant(tenantId, tenants) {
+  return tenants.find(t => t && t.tenantId === tenantId) || null;
 }
 
 // This exact repo's own GLOBAL_GITHUB_TOKEN, readable at Actions runtime -
@@ -128,16 +162,33 @@ async function checkSpokeHasHubUrlSecret(octokit, spoke) {
 // result object rather than exiting - only the CLI wrapper below does
 // that, matching processRequest/buildFullReport/pruneAllSpokes's existing
 // testable-core/thin-CLI-shell split.
-export async function runDoctor(octokit, { fetchImpl = fetch, env = process.env } = {}) {
+//
+// `octokit` here checks the HUB's own token (GLOBAL_GITHUB_TOKEN) directly -
+// that's the whole point of checkGlobalGithubToken. `octokitFactory(token)`
+// is used per-spoke instead, resolving each spoke's OWN tenant credential
+// (decision #1) rather than reusing the hub's token for every spoke's
+// checks - falls back to `octokit` itself when octokitFactory isn't
+// supplied, so existing single-tenant callers/tests keep working unchanged.
+export async function runDoctor(octokit, { fetchImpl = fetch, env = process.env, octokitFactory, spokesOverride, tenantsOverride } = {}) {
   const checks = [];
   checks.push(await checkGlobalGithubToken(octokit, env.GLOBAL_GITHUB_TOKEN));
   checks.push(await checkAiKey(fetchImpl, env.AI_BASE_URL, env.AI_API_KEY));
 
-  const spokes = loadSpokesRegistry();
+  const spokes = spokesOverride || loadSpokesRegistry();
+  const tenants = tenantsOverride || loadTenantsRegistry();
+  const resolveOctokitForSpoke = (spoke) => {
+    if (!octokitFactory) return octokit;
+    const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
+    const tenant = findTenant(tenantId, tenants);
+    const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || env.GLOBAL_GITHUB_TOKEN;
+    return octokitFactory(token);
+  };
+
   for (const spoke of spokes) {
-    checks.push(await checkSpokeRepoReachable(octokit, spoke));
-    checks.push(await checkSpokeHasCallHubWorkflow(octokit, spoke));
-    checks.push(await checkSpokeHasHubUrlSecret(octokit, spoke));
+    const spokeOctokit = resolveOctokitForSpoke(spoke);
+    checks.push(await checkSpokeRepoReachable(spokeOctokit, spoke));
+    checks.push(await checkSpokeHasCallHubWorkflow(spokeOctokit, spoke));
+    checks.push(await checkSpokeHasHubUrlSecret(spokeOctokit, spoke));
   }
 
   return { checks, allOk: checks.every((c) => c.ok) };
@@ -155,8 +206,9 @@ export function renderReport(result) {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const octokitFactory = (token) => new Octokit({ auth: token });
 
-  runDoctor(octokit, { fetchImpl: fetch })
+  runDoctor(octokit, { fetchImpl: fetch, octokitFactory })
     .then((result) => {
       console.log(renderReport(result));
       if (!result.allOk) process.exitCode = 1;

@@ -161,6 +161,23 @@ async function testBuildFullReportUsesRealRegistryWithoutCrashing() {
   check('generatedAt is set', typeof report.generatedAt === 'string');
 }
 
+async function testEachSpokeIsReadWithItsOwnTenantCredentialWhenFactoryIsSupplied() {
+  console.log("Multi-tenancy: with octokitFactory supplied, each spoke's report is built using ITS tenant's own resolved credential, not the hub token");
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  const acmeOctokit = makeFakeOctokit({ issuesByRepo: { 'acme-org/acme-repo': [] }, decisionLogByRepo: { 'acme-org/acme-repo': [] } });
+  const hubOctokit = makeFakeOctokit({});
+  const tokensRequested = [];
+  const octokitFactory = (token) => { tokensRequested.push(token); return token === 'acme-secret-token' ? acmeOctokit : hubOctokit; };
+  const spokesOverride = [{ tenantId: 'acme', owner: 'acme-org', repo: 'acme-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active' }];
+  const tenantsOverride = [{ tenantId: 'acme', name: 'Acme', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:ACME_TEST_TOKEN', createdAt: '2026-08-13T00:00:00Z' }];
+  const report = await buildFullReport(hubOctokit, { now: NOW, octokitFactory, spokesOverride, tenantsOverride });
+  check("acme's own token was resolved and used", tokensRequested.includes('acme-secret-token'));
+  check("acme's spoke was read via its own fake octokit, not the hub one", acmeOctokit.calls.listForRepo.length > 0);
+  check('the hub octokit was never asked for the acme spoke\'s issues', hubOctokit.calls.listForRepo.every(c => c.owner !== 'acme-org'));
+  check('the report was built successfully for the acme spoke', report.spokes[0]?.owner === 'acme-org' && !report.spokes[0]?.error);
+  delete process.env.ACME_TEST_TOKEN;
+}
+
 async function main() {
   await testSpokeReportCountsAndStatusAreCorrect();
   await testDryRunOnlySpokeReportsDryRunStatus();
@@ -170,6 +187,7 @@ async function main() {
   await testPublishReportReopensAClosedIssue();
   await testPublishReportDoesNotTouchStateWhenAlreadyOpen();
   await testBuildFullReportUsesRealRegistryWithoutCrashing();
+  await testEachSpokeIsReadWithItsOwnTenantCredentialWhenFactoryIsSupplied();
 
   console.log('');
   if (failures > 0) {

@@ -8,6 +8,15 @@
 // prune-logs.js, it only needs a GitHub token, mirrored as the
 // GLOBAL_GITHUB_TOKEN Actions secret on this repo.
 //
+// Multi-tenancy: each spoke's own data (issues filed, decision log) is read
+// using ITS tenant's own resolved credential when octokitFactory is
+// supplied (decision #1 in lessons.md's multi-tenancy entry) - falls back
+// to the single `octokit` passed to buildFullReport when octokitFactory
+// isn't given, so existing single-tenant callers/tests keep working
+// unchanged. The report itself (and the pinned issue it publishes to) stay
+// hub-wide/operator-facing - this is about using the right credential to
+// read each spoke, not about splitting the report per tenant.
+//
 // Usage: node scripts/health-report.js
 
 import { Octokit } from '@octokit/rest';
@@ -15,6 +24,8 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 
 const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
+const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
+const DEFAULT_TENANT_ID = 'default';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const HUB_ISSUE_LABEL = 'cto-hub-auto';
 const REPORT_ISSUE_LABEL = 'mothership-health-report';
@@ -24,14 +35,39 @@ const REPORT_WINDOW_DAYS = 7;
 const HUB_OWNER = process.env.HUB_GITHUB_OWNER || 'adamberneche-afk';
 const HUB_REPO = process.env.HUB_GITHUB_REPO || 'Mothership';
 
-function loadSpokesRegistry() {
-  if (!existsSync(SPOKES_REGISTRY_PATH)) return [];
+function loadJsonArrayFromDisk(path) {
+  if (!existsSync(path)) return [];
   try {
-    const parsed = JSON.parse(readFileSync(SPOKES_REGISTRY_PATH, 'utf8'));
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     return [];
   }
+}
+
+function loadSpokesRegistry() {
+  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
+}
+
+function loadTenantsRegistry() {
+  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
+}
+
+// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
+function resolveSecretRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
+  if (ref.startsWith('kv:')) return null;
+  return null;
+}
+
+function resolveTenantIdForSpoke(owner, repo, spokes) {
+  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
+  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+}
+
+function findTenant(tenantId, tenants) {
+  return tenants.find(t => t && t.tenantId === tenantId) || null;
 }
 
 async function safeGetTextContent(octokit, owner, repo, path) {
@@ -107,15 +143,24 @@ export async function buildReportForSpoke(octokit, spoke, { windowStart }) {
   return { owner: spoke.owner, repo: spoke.repo, issuesFiled, entriesInWindow: total, byOutcome, skipRate, capabilityStatus };
 }
 
-export async function buildFullReport(octokit, { now = Date.now(), windowDays = REPORT_WINDOW_DAYS } = {}) {
-  const spokes = loadSpokesRegistry();
+export async function buildFullReport(octokit, { now = Date.now(), windowDays = REPORT_WINDOW_DAYS, octokitFactory, spokesOverride, tenantsOverride } = {}) {
+  const spokes = spokesOverride || loadSpokesRegistry();
+  const tenants = tenantsOverride || loadTenantsRegistry();
   const windowStart = new Date(now - windowDays * 24 * 60 * 60 * 1000);
   const generatedAt = new Date(now).toISOString();
+
+  const resolveOctokitForSpoke = (spoke) => {
+    if (!octokitFactory) return octokit;
+    const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
+    const tenant = findTenant(tenantId, tenants);
+    const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+    return octokitFactory(token);
+  };
 
   const spokeReports = [];
   for (const spoke of spokes) {
     try {
-      spokeReports.push(await buildReportForSpoke(octokit, spoke, { windowStart }));
+      spokeReports.push(await buildReportForSpoke(resolveOctokitForSpoke(spoke), spoke, { windowStart }));
     } catch (e) {
       spokeReports.push({ owner: spoke.owner, repo: spoke.repo, error: e.message });
     }
@@ -169,7 +214,9 @@ async function findExistingReportIssue(octokit) {
 
 // Updates the same pinned issue in place on every run instead of creating a
 // new one each time - a deliberate callback to the original issue-spam
-// disaster this whole system exists to avoid repeating.
+// disaster this whole system exists to avoid repeating. Always uses the
+// hub's own credential (never a tenant-scoped one) - this issue lives on
+// the hub repo itself.
 export async function publishReport(octokit, body) {
   const existing = await findExistingReportIssue(octokit);
   if (existing) {
@@ -191,8 +238,9 @@ export async function publishReport(octokit, body) {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const octokitFactory = (token) => new Octokit({ auth: token });
 
-  buildFullReport(octokit)
+  buildFullReport(octokit, { octokitFactory })
     .then(async (report) => {
       const body = renderReportMarkdown(report);
       console.log(body);

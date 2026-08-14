@@ -183,6 +183,32 @@ async function testSpokeWithApsScriptUrlInsteadOfVercelUrlPasses() {
   check('the secret-presence check passes', !!secretCheck && secretCheck.ok === true);
 }
 
+async function testEachSpokeIsCheckedWithItsOwnTenantCredentialNotTheHubToken() {
+  console.log("Multi-tenancy: with octokitFactory supplied, each spoke's checks use ITS tenant's own resolved credential, not the hub token");
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  const acmeOctokit = makeFakeOctokit({ repos: { 'acme-org/acme-repo': { reachable: true, hasCallHubWorkflow: true, secretNames: ['VERCEL_URL'] } } });
+  const hubOctokit = makeFakeOctokit({ rateLimitStatus: 200 });
+  const tokensRequested = [];
+  const octokitFactory = (token) => { tokensRequested.push(token); return token === 'acme-secret-token' ? acmeOctokit : hubOctokit; };
+  const fetchImpl = makeFakeFetch(200);
+  const spokesOverride = [{ tenantId: 'acme', owner: 'acme-org', repo: 'acme-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active' }];
+  const tenantsOverride = [{ tenantId: 'acme', name: 'Acme', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:ACME_TEST_TOKEN', createdAt: '2026-08-13T00:00:00Z' }];
+  const result = await runDoctor(hubOctokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'hub-token', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' }, octokitFactory, spokesOverride, tenantsOverride });
+  check("acme's own token was resolved and used, not the hub token", tokensRequested.includes('acme-secret-token'));
+  check("acme's spoke checks actually ran against acme's own fake octokit", acmeOctokit.calls.reposGet.length === 1);
+  check('the hub octokit was never asked to check the acme spoke directly', hubOctokit.calls.reposGet.length === 0);
+  check('acme spoke checks pass (using its own healthy fixture)', result.checks.filter(c => c.label.includes('acme-org/acme-repo')).every(c => c.ok));
+  delete process.env.ACME_TEST_TOKEN;
+}
+
+async function testNoOctokitFactoryFallsBackToTheSingleOctokitUnchanged() {
+  console.log('Multi-tenancy: omitting octokitFactory entirely (no tenant awareness needed) behaves exactly like before - single octokit for everything');
+  const octokit = makeFakeOctokit({ repos: { 'adamberneche-afk/tso': { reachable: true, hasCallHubWorkflow: true, secretNames: ['VERCEL_URL'] } } });
+  const fetchImpl = makeFakeFetch(200);
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  check('still runs and passes using the one octokit for every spoke', result.allOk === true);
+}
+
 async function main() {
   await testAllHealthyPasses();
   await testInvalidGithubTokenFailsButOtherChecksStillRun();
@@ -193,6 +219,8 @@ async function main() {
   await testCallHubWorkflowCheckDistinguishesNotFoundFromOtherErrors();
   await testSpokeMissingHubUrlSecretIsFlagged();
   await testSpokeWithApsScriptUrlInsteadOfVercelUrlPasses();
+  await testEachSpokeIsCheckedWithItsOwnTenantCredentialNotTheHubToken();
+  await testNoOctokitFactoryFallsBackToTheSingleOctokitUnchanged();
 
   console.log('');
   if (failures > 0) {

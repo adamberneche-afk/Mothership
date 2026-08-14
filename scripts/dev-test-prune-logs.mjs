@@ -169,6 +169,23 @@ async function testPruneAllSpokesUsesTheRealRegistryAndSkipsOnError() {
   check('no result is an error (missing log treated as empty, not a failure)', results.every(r => !r.error));
 }
 
+async function testEachSpokeIsPrunedWithItsOwnTenantCredentialWhenFactoryIsSupplied() {
+  console.log("Multi-tenancy: with octokitFactory supplied, each spoke is pruned using ITS tenant's own resolved credential, not the hub token");
+  process.env.ACME_TEST_TOKEN = 'acme-secret-token';
+  const acmeOctokit = makeFakeOctokit({ files: {} });
+  const hubOctokit = makeFakeOctokit({ files: {} });
+  const tokensRequested = [];
+  const octokitFactory = (token) => { tokensRequested.push(token); return token === 'acme-secret-token' ? acmeOctokit : hubOctokit; };
+  const spokesOverride = [{ tenantId: 'acme', owner: 'acme-org', repo: 'acme-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active' }];
+  const tenantsOverride = [{ tenantId: 'acme', name: 'Acme', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:ACME_TEST_TOKEN', createdAt: '2026-08-13T00:00:00Z' }];
+  const results = await pruneAllSpokes(hubOctokit, { retentionDays: 90, now: NOW, octokitFactory, spokesOverride, tenantsOverride });
+  check("acme's own token was resolved and used", tokensRequested.includes('acme-secret-token'));
+  check("acme's spoke was pruned via its own fake octokit, not the hub one", acmeOctokit.calls.getContent.length > 0);
+  check('the hub octokit was never asked about the acme spoke', hubOctokit.calls.getContent.every(c => c.owner !== 'acme-org'));
+  check('the acme spoke result has no error', results[0]?.owner === 'acme-org' && !results[0]?.error);
+  delete process.env.ACME_TEST_TOKEN;
+}
+
 async function main() {
   await testNoOldEntriesSkipsWithoutWriting();
   await testDryRunReportsWithoutWriting();
@@ -178,6 +195,7 @@ async function main() {
   await testRetryDoesNotDuplicateAlreadyArchivedEntries();
   await testGivesUpAfterMaxAttempts();
   await testPruneAllSpokesUsesTheRealRegistryAndSkipsOnError();
+  await testEachSpokeIsPrunedWithItsOwnTenantCredentialWhenFactoryIsSupplied();
 
   console.log('');
   if (failures > 0) {

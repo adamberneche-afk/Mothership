@@ -16,18 +16,45 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 
 const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
+const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
+const DEFAULT_TENANT_ID = 'default';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const ARCHIVE_LOG_PATH = 'ai_decision_log_archive.json';
 const DEFAULT_RETENTION_DAYS = 90;
 
-function loadSpokesRegistry() {
-  if (!existsSync(SPOKES_REGISTRY_PATH)) return [];
+function loadJsonArrayFromDisk(path) {
+  if (!existsSync(path)) return [];
   try {
-    const parsed = JSON.parse(readFileSync(SPOKES_REGISTRY_PATH, 'utf8'));
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
     return Array.isArray(parsed) ? parsed : [];
   } catch (e) {
     return [];
   }
+}
+
+function loadSpokesRegistry() {
+  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
+}
+
+function loadTenantsRegistry() {
+  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
+}
+
+// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
+function resolveSecretRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
+  if (ref.startsWith('kv:')) return null;
+  return null;
+}
+
+function resolveTenantIdForSpoke(owner, repo, spokes) {
+  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
+  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+}
+
+function findTenant(tenantId, tenants) {
+  return tenants.find(t => t && t.tenantId === tenantId) || null;
 }
 
 async function readJsonArrayFile(octokit, owner, repo, path) {
@@ -122,12 +149,26 @@ export async function pruneSpoke(octokit, spoke, { retentionDays = DEFAULT_RETEN
   throw lastError;
 }
 
+// Multi-tenancy: each spoke's decision log is pruned using ITS tenant's own
+// resolved credential when `octokitFactory` is supplied in `options`
+// (decision #1 in lessons.md's multi-tenancy entry) - falls back to the
+// single `octokit` passed in when octokitFactory isn't given, so existing
+// single-tenant callers/tests keep working unchanged.
 export async function pruneAllSpokes(octokit, options = {}) {
-  const spokes = loadSpokesRegistry();
+  const { octokitFactory, spokesOverride, tenantsOverride, ...pruneOptions } = options;
+  const spokes = spokesOverride || loadSpokesRegistry();
+  const tenants = tenantsOverride || loadTenantsRegistry();
   const results = [];
   for (const spoke of spokes) {
     try {
-      results.push(await pruneSpoke(octokit, spoke, options));
+      let spokeOctokit = octokit;
+      if (octokitFactory) {
+        const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
+        const tenant = findTenant(tenantId, tenants);
+        const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+        spokeOctokit = octokitFactory(token);
+      }
+      results.push(await pruneSpoke(spokeOctokit, spoke, pruneOptions));
     } catch (e) {
       results.push({ owner: spoke.owner, repo: spoke.repo, error: e.message });
     }
@@ -141,8 +182,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const retentionDays = Number(process.env.RETENTION_DAYS || DEFAULT_RETENTION_DAYS);
   const dryRun = process.env.DRY_RUN === 'true';
   const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const octokitFactory = (token) => new Octokit({ auth: token });
 
-  pruneAllSpokes(octokit, { retentionDays, dryRun })
+  pruneAllSpokes(octokit, { retentionDays, dryRun, octokitFactory })
     .then((results) => {
       console.log(JSON.stringify(results, null, 2));
       if (results.some((r) => r.error)) process.exitCode = 1;
