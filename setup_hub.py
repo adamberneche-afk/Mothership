@@ -31,12 +31,435 @@ def setup_hub():
             "content": "[]"
         },
 
+        # Canonical tenant-registry + credential-resolution helpers (see
+        # lib/secrets.js's own header comment) - lives outside api/ and
+        # scripts/ since every Node-side entry point imports from it.
+        {
+            "path": "lib/secrets.js",
+            "content": """// Canonical tenant-registry + credential-resolution helpers, extracted from
+// what used to be 6 byte-identical Node-side copies of the same functions:
+// api/autonomous_agent.js, api/recursive_learning.js, scripts/doctor.js,
+// scripts/health-report.js, scripts/prune-logs.js,
+// scripts/collect-issue-feedback.js (plus matching embedded string-literal
+// copies inside setup_hub.py, kept re-synced - see that file's generated
+// file list).
+//
+// resolveSecretRef is async as of the ghapp: scheme below (minting an
+// installation token is a real network call, via lib/github_app.js) -
+// every call site now needs `await`. Confirmed call sites at the time of
+// this change: api/autonomous_agent.js (callerKeyRef + githubCredentialRef
+// resolution), api/recursive_learning.js's runForTenant and
+// runForSharedPool, and scripts/doctor.js/health-report.js/prune-logs.js/
+// collect-issue-feedback.js's resolveOctokitForSpoke-style helpers.
+//
+// gas/constants.js stays the separate, synchronous GAS-side home for this
+// same logic (Apps Script has no `import`, so it can't use this module
+// directly, and has no asymmetric-RSA-sign primitive either - ghapp: is
+// Vercel-only this sprint, disclosed in README) - it cross-references this
+// file as the canonical Node behavior spec, same convention
+// gas/autonomous_agent.js already uses for api/autonomous_agent.js.
+
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
+import { mintInstallationToken } from './github_app.js';
+
+export const SPOKES_REGISTRY_PATH = 'spokes.json';
+export const TENANTS_REGISTRY_PATH = 'tenants.json';
+export const DEFAULT_TENANT_ID = 'default';
+
+// Reads a hub-root JSON file straight off local disk (every Node caller of
+// this module runs with this repo checked out alongside it - a Vercel
+// function's own deployment, or a GitHub Actions job). Missing file,
+// unreadable, or not a JSON array all come back as [] rather than
+// throwing - callers treat an empty registry as "nothing registered yet",
+// not an error.
+export function loadJsonArrayFromDisk(relativePath) {
+  const fullPath = join(process.cwd(), relativePath);
+  if (!existsSync(fullPath)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(fullPath, 'utf8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+export function loadSpokesRegistry() {
+  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
+}
+
+export function loadTenantsRegistry() {
+  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
+}
+
+// Finds which tenant a given owner/repo belongs to. Falls back to
+// DEFAULT_TENANT_ID for anything not found in spokes.json - a deliberate
+// backward-compatibility choice, not a security feature: it preserves the
+// original zero-registration behavior for spokes nobody has migrated into
+// the tenant model yet.
+export function resolveTenantIdForSpoke(owner, repo, spokes) {
+  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
+  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+}
+
+export function findTenant(tenantId, tenants) {
+  return tenants.find(t => t && t.tenantId === tenantId) || null;
+}
+
+// githubCredentialRef/callerKeyRef use a `scheme:value` format:
+//   env:VAR_NAME - reads an env var directly. This is what keeps the
+//     "default" tenant working exactly as before with zero migration -
+//     tenants.json seeds it with "env:GLOBAL_GITHUB_TOKEN".
+//   kv:some/path - reserved for a future non-GitHub-credential secret. A
+//     git-committed JSON file can't hold a raw secret without permanently
+//     leaking it into git history, so this scheme has no local fallback.
+//   ghapp:<installation_id> - mints a short-lived GitHub App installation
+//     token via lib/github_app.js. The installation id itself is NOT
+//     sensitive (it's a non-exploitable pointer, safe to commit in
+//     tenants.json in plaintext, same as "env:GLOBAL_GITHUB_TOKEN" is safe
+//     today) - the only secret is the App's own private key
+//     (GITHUB_APP_PRIVATE_KEY), one operator-held env var at the same
+//     trust tier GLOBAL_GITHUB_TOKEN already occupies.
+//
+// Every failure mode - malformed ref, missing App config, a revoked or
+// suspended installation, GitHub unreachable - resolves to `null` here,
+// never a thrown exception and never a fallback to a broader credential.
+// Enforcing that the calling tenant is actually allowed to use this
+// credential (status === 'active') is the CALLER's job, same as it already
+// is for env: - this function only resolves a ref, it doesn't gate access.
+export async function resolveSecretRef(ref) {
+  if (!ref || typeof ref !== 'string') return null;
+  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
+  if (ref.startsWith('kv:')) return null; // see the scheme comment above
+  if (ref.startsWith('ghapp:')) {
+    return mintInstallationToken(ref.slice(6), {
+      appId: process.env.GITHUB_APP_ID,
+      privateKey: process.env.GITHUB_APP_PRIVATE_KEY
+    });
+  }
+  return null;
+}"""
+        },
+
+        # GitHub App JWT/installation-token minting - see that file's own
+        # header comment for the design rationale.
+        {
+            "path": "lib/github_app.js",
+            "content": """// Mints short-lived GitHub App installation access tokens - the backing
+// implementation for lib/secrets.js's `ghapp:<installation_id>` scheme.
+//
+// Uses @octokit/auth-app (official, same vendor family as this repo's only
+// other dependency, @octokit/rest) rather than hand-rolling RS256 JWT
+// signing or adding a generic JWT library - it already handles JWT
+// construction, the installation-token exchange, and expiry-aware caching
+// (an internal LRU, see its own README's "Implementation details") so
+// there's materially less hand-written crypto/cache code in this repo to
+// audit than either alternative.
+//
+// Fail-closed contract, matching resolveSecretRef's existing rule for a
+// broken env: ref: every failure mode here (missing/malformed App
+// credentials, a revoked or suspended installation, GitHub unreachable)
+// resolves to `null`, never a thrown exception a caller has to remember to
+// catch and never a fallback to a broader credential. Enforcing the tenant
+// is actually allowed to use this credential (status === 'active') is the
+// caller's job, same as it already is for env: - this module has no
+// concept of tenants.json at all.
+
+import { createAppAuth } from '@octokit/auth-app';
+
+const INSTALLATION_ID_PATTERN = /^[1-9][0-9]{0,15}$/;
+
+// One createAppAuth instance per distinct (appId, privateKey) pair,
+// reused across calls so its internal token cache/expiry-refresh logic
+// actually gets to do its job instead of re-minting on every call. Keyed
+// by both fields (not just appId) so a test harness swapping in a
+// different fake key per scenario never accidentally reuses another
+// scenario's cached auth instance/token.
+const authInstances = new Map();
+
+function getAppAuth({ appId, privateKey, request }) {
+  const key = `${appId}::${privateKey}`;
+  let instance = authInstances.get(key);
+  if (!instance) {
+    instance = createAppAuth({ appId, privateKey, request });
+    authInstances.set(key, instance);
+  }
+  return instance;
+}
+
+// GitHub App private keys are routinely mangled by copy/paste through an
+// env-var UI (Vercel, GitHub Actions secrets) that doesn't preserve real
+// newlines - a PEM pasted or templated in often arrives with literal
+// backslash-n sequences instead. Normalize before handing it to
+// @octokit/auth-app, and return null (never throw) if what's left still
+// doesn't look like a PEM - a malformed key must fail closed exactly like
+// any other unresolvable credential, not crash the request path.
+export function normalizePrivateKeyPem(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const pem = raw.includes('\\\\n') ? raw.replace(/\\\\n/g, '\\n') : raw;
+  const looksLikePem = /-----BEGIN (RSA )?PRIVATE KEY-----[\\s\\S]+-----END (RSA )?PRIVATE KEY-----/.test(pem);
+  return looksLikePem ? pem : null;
+}
+
+// Mints (or returns a still-valid cached) installation access token.
+// Returns the token string, or null on ANY failure - malformed
+// installationId, missing App config, a revoked/uninstalled installation,
+// an App suspended by GitHub, or GitHub simply being unreachable. Callers
+// must treat null exactly like a broken env: ref: a hard skip, never a
+// fallback to a wider credential.
+export async function mintInstallationToken(installationId, { appId, privateKey, request } = {}) {
+  if (!INSTALLATION_ID_PATTERN.test(String(installationId || ''))) return null;
+  if (!appId) return null;
+  const normalizedKey = normalizePrivateKeyPem(privateKey);
+  if (!normalizedKey) return null;
+  try {
+    const auth = getAppAuth({ appId, privateKey: normalizedKey, request });
+    const authentication = await auth({ type: 'installation', installationId: Number(installationId) });
+    return (authentication && authentication.token) || null;
+  } catch (e) {
+    // Covers every failure mode uniformly: 404 (revoked/uninstalled), 401/403
+    // (bad App credentials or a suspended App), malformed key rejected by
+    // the signing step, network/5xx errors. None of these should ever
+    // surface as an uncaught exception up through resolveSecretRef.
+    return null;
+  }
+}
+
+// Confirms an installation is real and currently active, authenticated as
+// the App itself (a JWT, via auth({type: 'app'})) rather than trusting a
+// browser-supplied installation_id query-string value - this is the
+// second half of api/github_app_callback.js's defense against a crafted
+// URL naming an arbitrary installation_id (the first half is the signed
+// state token). Returns the installation's `account` info (login/id/type)
+// on success, or null on ANY failure (malformed id, missing config,
+// revoked/uninstalled, GitHub unreachable) - same fail-closed contract as
+// mintInstallationToken, never a thrown exception.
+export async function confirmInstallationExists(installationId, { appId, privateKey, fetchImpl = fetch } = {}) {
+  if (!INSTALLATION_ID_PATTERN.test(String(installationId || ''))) return null;
+  if (!appId) return null;
+  const normalizedKey = normalizePrivateKeyPem(privateKey);
+  if (!normalizedKey) return null;
+  try {
+    const auth = getAppAuth({ appId, privateKey: normalizedKey });
+    const appAuthentication = await auth({ type: 'app' });
+    if (!appAuthentication || !appAuthentication.token) return null;
+    const res = await fetchImpl(`https://api.github.com/app/installations/${installationId}`, {
+      headers: { Authorization: `Bearer ${appAuthentication.token}`, Accept: 'application/vnd.github+json' }
+    });
+    if (!res.ok) return null; // 404 revoked/uninstalled, 401/403 bad/suspended App, 5xx GitHub down
+    const data = await res.json();
+    return (data && data.account) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Test-only reset hook - authInstances is module-level state, so a test
+// harness running multiple mint scenarios with different fake
+// appId/privateKey fixtures needs a clean slate between them.
+export function _clearAppAuthCacheForTests() {
+  authInstances.clear();
+}"""
+        },
+
+        # Signed state tokens for the self-service onboarding flow.
+        {
+            "path": "lib/onboarding_token.js",
+            "content": """// HMAC-signed, short-lived tokens carrying onboarding state between hops of
+// the self-service flow (api/onboard_start.js -> GitHub's install redirect
+// -> api/github_app_callback.js -> Stripe Checkout -> api/stripe_webhook.js).
+//
+// Why a signed token instead of a server-side pending-state record: two
+// independent signals (GitHub App install, Stripe payment) can otherwise
+// arrive in either order, which would normally need a committed
+// pending-state file to reconcile them - but Mothership is a PUBLIC repo,
+// and a file tying installation IDs to Stripe customer IDs together would
+// be a real, avoidable data-exposure surface in permanent git history.
+// This flow sidesteps that entirely by enforcing a strict sequence (App
+// install completes and is independently re-verified BEFORE a Stripe
+// Checkout link is even generated - see api/github_app_callback.js) and
+// carrying the confirmed installation identity forward in a signed token
+// instead of a database row. No server-side state, nothing to leak,
+// nothing to prune.
+//
+// Security properties, each defending a specific threat:
+//   - HMAC-SHA256 over the payload, using a secret only this deployment
+//     holds (ONBOARDING_STATE_SECRET) - an attacker without the secret
+//     cannot forge a token that verifies, closing the "craft a URL with an
+//     arbitrary installation_id/state directly" hijack.
+//   - Signature compared via crypto.timingSafeEqual, never `===` - a
+//     naive string comparison leaks how many leading bytes matched via
+//     response-time differences, letting an attacker guess the signature
+//     one byte at a time; timingSafeEqual takes constant time regardless
+//     of where the mismatch is.
+//   - A short TTL (iat + a few minutes) - a leaked or logged token stops
+//     being useful on its own well before anyone could act on it.
+
+import { createHmac, timingSafeEqual } from 'crypto';
+
+const DEFAULT_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+function requireSecret() {
+  const secret = process.env.ONBOARDING_STATE_SECRET;
+  if (!secret) {
+    // Fail closed, never sign/verify with an empty or default secret - an
+    // unset secret must break onboarding loudly, not silently accept
+    // anything.
+    throw new Error('ONBOARDING_STATE_SECRET is not configured');
+  }
+  return secret;
+}
+
+function base64url(input) {
+  return Buffer.from(input).toString('base64url');
+}
+
+// Signs a plain JSON-serializable payload, stamping it with `iat` (unless
+// already present - tests can inject a fixed `now`). Returns a
+// `<payload>.<signature>` string, both base64url-encoded.
+export function signOnboardingToken(payload, { now = Date.now() } = {}) {
+  const secret = requireSecret();
+  const fullPayload = { iat: now, ...payload };
+  const encodedPayload = base64url(JSON.stringify(fullPayload));
+  const signature = createHmac('sha256', secret).update(encodedPayload).digest('base64url');
+  return `${encodedPayload}.${signature}`;
+}
+
+// Verifies a token produced by signOnboardingToken. Returns the decoded
+// payload on success, or null on ANY failure - wrong/missing secret,
+// tampered signature, malformed structure, unparseable payload, or an
+// expired `iat`. Never throws for a bad TOKEN (only requireSecret's
+// missing-config case throws, since that's an environment misconfiguration,
+// not attacker input) and deliberately gives the same "invalid" outcome
+// for every failure reason, so a caller can't use timing or error detail
+// to fingerprint which check failed.
+export function verifyOnboardingToken(token, { now = Date.now(), ttlMs = DEFAULT_TTL_MS } = {}) {
+  const secret = requireSecret();
+  if (typeof token !== 'string' || !token.includes('.')) return null;
+  const lastDot = token.lastIndexOf('.');
+  const encodedPayload = token.slice(0, lastDot);
+  const signature = token.slice(lastDot + 1);
+  if (!encodedPayload || !signature) return null;
+
+  const expectedSignature = createHmac('sha256', secret).update(encodedPayload).digest('base64url');
+  const signatureBuf = Buffer.from(signature, 'utf8');
+  const expectedBuf = Buffer.from(expectedSignature, 'utf8');
+  // Length must match before timingSafeEqual - it throws on mismatched
+  // lengths rather than comparing, so this check is required, not
+  // optional, and itself leaks nothing useful (an attacker can already see
+  // valid tokens' overall shape).
+  if (signatureBuf.length !== expectedBuf.length) return null;
+  if (!timingSafeEqual(signatureBuf, expectedBuf)) return null;
+
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
+  } catch (e) {
+    return null;
+  }
+  if (!payload || typeof payload.iat !== 'number') return null;
+  if (now - payload.iat > ttlMs || now < payload.iat) return null; // expired, or iat in the future (clock skew/tamper)
+  return payload;
+}"""
+        },
+
+        # Shared read-modify-write-with-retry helper for tenants.json/spokes.json.
+        {
+            "path": "lib/registry_writer.js",
+            "content": """// Shared read-modify-write-with-retry helper for appending to a hub-root
+// JSON array file (tenants.json, spokes.json) via the GitHub Contents API.
+// Generalizes the retry-on-conflict pattern scripts/prune-logs.js already
+// uses for ai_decision_log.json - factored out here because
+// api/stripe_webhook.js's tenant-provisioning write needs the exact same
+// shape, and a third real caller is a good point to share it rather than
+// hand-copy it again.
+
+export async function readJsonArrayFile(octokit, owner, repo, path) {
+  try {
+    const { data } = await octokit.repos.getContent({ owner, repo, path });
+    const parsed = JSON.parse(Buffer.from(data.content, 'base64').toString('utf8'));
+    return { entries: Array.isArray(parsed) ? parsed : [], sha: data.sha };
+  } catch (e) {
+    return { entries: [], sha: null };
+  }
+}
+
+export async function writeJsonArrayFile(octokit, owner, repo, path, entries, sha, message) {
+  const content = Buffer.from(JSON.stringify(entries, null, 2)).toString('base64');
+  const params = { owner, repo, path, message, content };
+  if (sha) params.sha = sha;
+  await octokit.repos.createOrUpdateFileContents(params);
+}
+
+// Appends one entry to a hub-root JSON registry, re-reading fresh on every
+// retry attempt so a conflict discovered mid-retry (e.g. a DIFFERENT
+// writer already added the exact entry this call was about to add) is
+// detected as "already present -> skip", not blindly retried into a
+// duplicate. `decide(freshEntries)` is called against the just-read data
+// on every attempt and must return either:
+//   { skip: true, result }             - don't write anything, return `result` as-is
+//   { skip: false, entry, result }     - append `entry`, then return `result`
+// This is what makes a call like "provision a tenant for this
+// installation id" safe to run twice (a genuine Stripe webhook retry, or
+// two near-simultaneous deliveries racing each other) - whichever call
+// loses the race sees the winner's entry on its next re-read and skips,
+// rather than creating a duplicate or clobbering the file with a stale sha.
+export async function appendToJsonRegistryWithRetry(octokit, owner, repo, path, { decide, message, maxAttempts = 3 }) {
+  let lastError;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const { entries, sha } = await readJsonArrayFile(octokit, owner, repo, path);
+    const decision = decide(entries);
+    if (decision.skip) return decision.result;
+    try {
+      await writeJsonArrayFile(octokit, owner, repo, path, [...entries, decision.entry], sha, message);
+      return decision.result;
+    } catch (e) {
+      lastError = e;
+      // Most likely a stale-sha conflict from a concurrent writer - loop
+      // and re-read from scratch, which will see that writer's change and
+      // re-run `decide` against it.
+    }
+  }
+  throw lastError;
+}
+
+// Updates one existing entry in a hub-root JSON registry (e.g. flipping a
+// tenant's status), same retry-on-conflict shape as
+// appendToJsonRegistryWithRetry. `find(freshEntries)` returns the index to
+// update, or -1 if no matching entry exists (returns `{found: false}`
+// without writing). `update(existingEntry)` returns the replacement entry,
+// or `null` to mean "found it, but nothing needs to change" (returns
+// `{found: true, changed: false, entry: existingEntry}` without writing -
+// e.g. an unsuspend webhook arriving for a tenant that isn't suspended for
+// the reason this webhook is allowed to undo).
+export async function updateJsonRegistryEntryWithRetry(octokit, owner, repo, path, { find, update, message, maxAttempts = 3 }) {
+  let lastError;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const { entries, sha } = await readJsonArrayFile(octokit, owner, repo, path);
+    const index = find(entries);
+    if (index === -1) return { found: false };
+    const updatedEntry = update(entries[index]);
+    if (updatedEntry === null) return { found: true, changed: false, entry: entries[index] };
+    const newEntries = entries.slice();
+    newEntries[index] = updatedEntry;
+    try {
+      await writeJsonArrayFile(octokit, owner, repo, path, newEntries, sha, message);
+      return { found: true, changed: true, entry: updatedEntry };
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError;
+}"""
+        },
+
         # 2. THE CENTRAL INTELLIGENCE (Vercel Worker)
         {
             "path": "api/autonomous_agent.js",
             "content": """import { Octokit } from '@octokit/rest';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
 // Caps how much diff text gets forwarded to the LLM per run - keeps prompt
 // size and API cost bounded.
@@ -57,9 +480,6 @@ const DECISION_LOG_MAX_ENTRIES = 500;
 // context, so the model doesn't re-report something already logged.
 const PRIOR_DECISIONS_CONTEXT_COUNT = 5;
 
-const SPOKES_REGISTRY_PATH = 'spokes.json';
-const TENANTS_REGISTRY_PATH = 'tenants.json';
-const DEFAULT_TENANT_ID = 'default';
 const USAGE_LOG_MAX_ENTRIES = 5000;
 
 // This hub's own identity, for writing its own usage/{tenantId}.json logs -
@@ -79,65 +499,10 @@ const MODE_INSTRUCTIONS = {
 // spokes.json/tenants.json are both hub-root files, read from local disk the
 // same way universal_lessons.md/north_star_framework.md already are - no
 // octokit call needed, since this Vercel function's own checkout already
-// has them. Both are architecture/data-model additions only this pass (see
-// lessons.md's dated entry) - no real tenant self-service onboarding UI, no
-// real secrets store, no payment processor. What's real: every spoke is now
-// unambiguously scoped to one tenant, credential resolution has a real seam
-// instead of one shared global token, and usage gets attributed per tenant.
-
-function loadJsonArrayFromDisk(path) {
-  const fullPath = join(process.cwd(), path);
-  if (!existsSync(fullPath)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(fullPath, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-// Finds which tenant a given owner/repo belongs to. Falls back to
-// DEFAULT_TENANT_ID for anything not found in spokes.json - a deliberate
-// backward-compatibility choice, not a security feature: it preserves
-// today's exact behavior (no registration required to get a response) for
-// spokes nobody has migrated into the tenant model yet. Once real
-// multi-tenant onboarding exists, an unmatched spoke should probably reject
-// instead of silently defaulting - flagged here, not fixed here.
-function resolveTenantIdForSpoke(owner, repo, spokes) {
-  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
-}
-
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
-
-// githubCredentialRef/callerKeyRef use a `scheme:value` format:
-//   env:VAR_NAME - reads an env var directly. This is what keeps the
-//     "default" tenant working exactly as before with zero migration -
-//     tenants.json seeds it with "env:GLOBAL_GITHUB_TOKEN".
-//   kv:some/path - a pointer into a real dynamic secrets store (Vercel KV,
-//     a database, a secrets manager) that DOES NOT EXIST YET. Provisioning
-//     one is required, separate infrastructure work before any tenant
-//     beyond "default" can actually go live - a git-committed JSON file
-//     can't hold a raw secret without permanently leaking it into git
-//     history, so there is deliberately no local fallback for this scheme.
-// TODO: wire the kv: branch to a real secrets store before onboarding a
-// second tenant for real.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null; // see TODO above
-  return null;
-}
-
-function loadSpokesRegistry() {
-  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
-}
-
-function loadTenantsRegistry() {
-  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
-}
+// has them. loadSpokesRegistry/loadTenantsRegistry/resolveTenantIdForSpoke/
+// findTenant/resolveSecretRef now live in ../lib/secrets.js (imported
+// above) - deduped out of what used to be 6 byte-identical Node-side
+// copies of the same functions, see that file's header comment.
 
 // Counts issues carrying HUB_ISSUE_LABEL that were created since UTC
 // midnight today, for the rate cap below. Derived on-demand from GitHub's
@@ -325,31 +690,59 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   const tenantId = resolveTenantIdForSpoke(owner, repo, spokes);
   const tenant = findTenant(tenantId, tenants);
 
-  const requiredCallerKey = tenant ? resolveSecretRef(tenant.callerKeyRef) : null;
+  // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
+  // env var never files a real issue by accident - DRY_RUN_MODE has to be
+  // explicitly set to the string "false" in Vercel to go live. Every
+  // response from this point on carries `dryRun` so callers (and the
+  // decision log / health report built on top of this) can always tell
+  // which mode produced it. Computed up front (moved ahead of tenant/
+  // credential handling below) so the tenant-status gate can use it too.
+  const dryRun = dryRunOverride !== undefined
+    ? dryRunOverride
+    : process.env.DRY_RUN_MODE !== 'false';
+
+  // TENANT STATUS GATE: an explicitly non-'active' tenant (suspended, e.g.
+  // for a failed payment) must never be served, checked before any
+  // GitHub call - including the credential resolution below - so a
+  // suspended tenant costs nothing, not even a failed auth attempt.
+  // `status` is optional for backward compat: a record with no `status`
+  // field, or the "default" tenant's seeded "active", is always served -
+  // only an EXPLICIT non-'active' value skips. (Found while building the
+  // GitHub App credential path: `status` was defined in tenants.json's own
+  // schema but never actually read anywhere in this handler until now.)
+  if (tenant && tenant.status && tenant.status !== 'active') {
+    return { httpStatus: 200, body: { status: 'Skipped', reason: `Tenant status is '${tenant.status}', not 'active'`, dryRun } };
+  }
+
+  const requiredCallerKey = tenant ? await resolveSecretRef(tenant.callerKeyRef) : null;
   if (requiredCallerKey && callerKey !== requiredCallerKey) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
 
   // Credential for this request's SPOKE operations - the tenant's own
   // token (decision #1), resolved via the same env:/kv: scheme as the
-  // caller key above. Falls back to GLOBAL_GITHUB_TOKEN only when no
-  // tenant match exists at all (mirrors resolveTenantIdForSpoke's own
-  // backward-compatibility fallback) or the ref can't be resolved yet
-  // (e.g. a kv: ref with no secrets store behind it) - fails toward "use
-  // the one credential that's always been used" rather than toward a
-  // silent, harder-to-diagnose 401 from GitHub itself.
-  const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+  // caller key above. GLOBAL_GITHUB_TOKEN is used ONLY for the true
+  // legacy/pre-migration case: no tenant record matched this spoke at all
+  // (mirrors resolveTenantIdForSpoke's own backward-compatibility
+  // fallback). A tenant that DID match but whose credential ref fails to
+  // resolve (unset env var, revoked/misconfigured ref) is a hard skip, not
+  // a fallback - silently widening to the hub's own broad
+  // GLOBAL_GITHUB_TOKEN here would be exactly backwards: a tenant whose
+  // credential is broken or was just revoked should lose access, not gain
+  // the operator's own token against their repo. (Inert while only one
+  // tenant with one credential path existed; a real, live bug the moment a
+  // second, revocable per-tenant credential does - fixed here before that
+  // becomes true.)
+  let spokeToken;
+  if (tenant) {
+    spokeToken = await resolveSecretRef(tenant.githubCredentialRef);
+    if (!spokeToken) {
+      return { httpStatus: 200, body: { status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun } };
+    }
+  } else {
+    spokeToken = process.env.GLOBAL_GITHUB_TOKEN;
+  }
   const octokit = octokitFactory(spokeToken);
-
-  // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
-  // env var never files a real issue by accident - DRY_RUN_MODE has to be
-  // explicitly set to the string "false" in Vercel to go live. Every
-  // response from this point on carries `dryRun` so callers (and the
-  // decision log / health report built on top of this) can always tell
-  // which mode produced it.
-  const dryRun = dryRunOverride !== undefined
-    ? dryRunOverride
-    : process.env.DRY_RUN_MODE !== 'false';
 
   // Fetch Global Context from Hub
   const universalLessonsPath = join(process.cwd(), 'universal_lessons.md');
@@ -644,10 +1037,8 @@ export default async function handler(req, res) {
             "content": """import { Octokit } from '@octokit/rest';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { SPOKES_REGISTRY_PATH, TENANTS_REGISTRY_PATH, DEFAULT_TENANT_ID, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
-const SPOKES_REGISTRY_PATH = 'spokes.json';
-const TENANTS_REGISTRY_PATH = 'tenants.json';
-const DEFAULT_TENANT_ID = 'default';
 // How many of a spoke's most recent decision-log entries get included in
 // the cross-spoke summary prompt - enough to see a pattern, not so much
 // that one busy spoke drowns out the others.
@@ -709,19 +1100,9 @@ function groupSpokesByTenant(spokes) {
   return byTenant;
 }
 
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
-
-// Same env:/kv: scheme as api/autonomous_agent.js's resolveSecretRef.
-// TODO: wire the kv: branch to a real secrets store before onboarding a
-// second tenant for real - see that file's identical TODO.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null;
-  return null;
-}
+// findTenant/resolveSecretRef now live in ../lib/secrets.js (imported
+// above) - deduped out of what used to be 6 byte-identical Node-side
+// copies of the same functions, see that file's header comment.
 
 // --- Shared, opt-in, cross-organization learning pool -----------------------
 //
@@ -797,7 +1178,19 @@ async function runForSharedPool({ sharedPoolSpokes, tenants, octokitFactory, hub
     const label = `Contributor ${i + 1}`;
     const tenantId = spoke.tenantId || DEFAULT_TENANT_ID;
     const tenant = findTenant(tenantId, tenants);
-    const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+    // Same rules/rationale as runForTenant's identical fix: a matched
+    // tenant whose credential ref fails to resolve is excluded from this
+    // round of the shared pool entirely (never a silent fallback to a
+    // broader credential) - one misconfigured contributor shouldn't abort
+    // the whole cross-organization pass, so this is a `continue`, not a
+    // hard return.
+    let spokeToken;
+    if (tenant) {
+      spokeToken = await resolveSecretRef(tenant.githubCredentialRef);
+      if (!spokeToken) continue;
+    } else {
+      spokeToken = process.env.GLOBAL_GITHUB_TOKEN;
+    }
     const octokit = octokitFactory(spokeToken);
 
     labelToSpoke[label] = { owner: spoke.owner, repo: spoke.repo, tenantId };
@@ -960,7 +1353,20 @@ async function runForSharedPool({ sharedPoolSpokes, tenants, octokitFactory, hub
 // sees this tenant's own spokes' lessons.md/ai_decision_log.json; never
 // pools another tenant's data into the same prompt.
 async function runForTenant({ tenantId, tenantSpokes, tenant, octokitFactory, hubOctokit, fetchImpl, dryRun, universalLessons, globalNorthStar, HUB_OWNER, HUB_REPO }) {
-  const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+  // Same rules/rationale as api/autonomous_agent.js's identical fix:
+  // GLOBAL_GITHUB_TOKEN is used only for the true legacy/no-tenant-matched
+  // case; a tenant that DID match but whose credential ref fails to
+  // resolve is a hard skip, never a silent fallback to a broader,
+  // hub-operator-owned credential reading this tenant's own repos.
+  let spokeToken;
+  if (tenant) {
+    spokeToken = await resolveSecretRef(tenant.githubCredentialRef);
+    if (!spokeToken) {
+      return { tenantId, status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun };
+    }
+  } else {
+    spokeToken = process.env.GLOBAL_GITHUB_TOKEN;
+  }
   const octokit = octokitFactory(spokeToken);
 
   const perSpokeContext = [];
@@ -1192,6 +1598,509 @@ export default async function handler(req, res) {
 }"""
         },
 
+        # Self-service onboarding entry point - GET redirect into GitHub's
+        # own install picker with a signed state token.
+        {
+            "path": "api/onboard_start.js",
+            "content": """// Entry point for self-service onboarding - a plain GET redirect into
+// GitHub's own hosted App-install picker, carrying a freshly signed state
+// token (see lib/onboarding_token.js) so api/github_app_callback.js can
+// later verify this specific install flow wasn't forged.
+//
+// No tenant, spoke, or any other record is created here - this endpoint's
+// only side effect is a redirect. Provisioning only ever happens in
+// api/stripe_webhook.js, after BOTH the App install (re-verified against
+// GitHub, not just trusted from the query string) and a real payment are
+// confirmed - see api/github_app_callback.js's header comment for the
+// full sequencing rationale.
+
+import { randomUUID } from 'crypto';
+import { signOnboardingToken } from '../lib/onboarding_token.js';
+
+export function buildInstallRedirect({ now = Date.now(), generateId = randomUUID, env = process.env } = {}) {
+  const appSlug = env.GITHUB_APP_SLUG;
+  if (!appSlug) {
+    return { httpStatus: 500, body: { error: 'GITHUB_APP_SLUG is not configured' } };
+  }
+  const onboardingId = generateId();
+  const state = signOnboardingToken({ onboardingId }, { now });
+  const redirectUrl = `https://github.com/apps/${appSlug}/installations/new?state=${encodeURIComponent(state)}`;
+  return { httpStatus: 302, redirectUrl };
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  const result = buildInstallRedirect({});
+  if (result.httpStatus === 302) {
+    res.writeHead(302, { Location: result.redirectUrl });
+    res.end();
+    return;
+  }
+  res.status(result.httpStatus).json(result.body);
+}"""
+        },
+
+        # GitHub's post-install redirect target - re-verifies the installation
+        # against GitHub itself before proceeding to Stripe Checkout.
+        {
+            "path": "api/github_app_callback.js",
+            "content": """// GitHub's post-install redirect target - a GET request anyone can, in
+// principle, craft and hit directly with an arbitrary installation_id.
+// Two independent layers close that off:
+//
+//   1. `state` must verify against ONBOARDING_STATE_SECRET (see
+//      lib/onboarding_token.js) - an attacker without the secret cannot
+//      produce a token that passes verification, so a forged/absent
+//      state is rejected before anything else runs.
+//   2. Even with a VALID state token, `installation_id` is independently
+//      re-confirmed against GitHub itself (lib/github_app.js's
+//      confirmInstallationExists, authenticated with the App's own JWT -
+//      never trusting the browser-supplied query string alone). This
+//      closes the narrower case of a leaked-but-still-valid state token
+//      being replayed against a DIFFERENT installation_id than the one it
+//      was actually issued for.
+//
+// This endpoint's only side effect is a redirect - no tenant, no spoke, no
+// file write, nothing persisted server-side. Mothership is a PUBLIC repo;
+// a committed pending-state file tying installation IDs to Stripe
+// customer IDs together would be a real, avoidable data-exposure surface
+// in permanent git history. Provisioning only happens in
+// api/stripe_webhook.js, gated on a REAL payment - never on reaching this
+// endpoint or any redirect target it points at.
+//
+// Every rejection path returns the identical generic failure redirect
+// regardless of WHICH check failed (bad state vs malformed id vs GitHub
+// unreachable all look the same from outside) - so probing this URL can't
+// be used to fingerprint which defense exists or tripped.
+
+import { verifyOnboardingToken, signOnboardingToken } from '../lib/onboarding_token.js';
+import { confirmInstallationExists } from '../lib/github_app.js';
+
+const INSTALLATION_ID_PATTERN = /^[1-9][0-9]{0,15}$/;
+
+function failureResult(env) {
+  return { httpStatus: 302, redirectUrl: env.ONBOARDING_FAILURE_URL || '/onboarding-failed.html' };
+}
+
+function pendingApprovalResult(env) {
+  return { httpStatus: 302, redirectUrl: env.ONBOARDING_PENDING_APPROVAL_URL || '/onboarding-pending-approval.html' };
+}
+
+export async function handleInstallCallback(query, { now = Date.now(), fetchImpl = fetch, env = process.env } = {}) {
+  const { installation_id: installationId, setup_action: setupAction, state } = query || {};
+
+  // GitHub sends setup_action: 'request' (no installation_id at all) when
+  // the installing user isn't an org owner and approval is still pending -
+  // a distinct, non-error outcome, not a failure.
+  if (setupAction === 'request') {
+    return pendingApprovalResult(env);
+  }
+
+  if (!INSTALLATION_ID_PATTERN.test(String(installationId || ''))) return failureResult(env);
+
+  const claims = verifyOnboardingToken(state, { now });
+  if (!claims) return failureResult(env);
+
+  const account = await confirmInstallationExists(installationId, {
+    appId: env.GITHUB_APP_ID,
+    privateKey: env.GITHUB_APP_PRIVATE_KEY,
+    fetchImpl
+  });
+  if (!account) return failureResult(env); // revoked, App suspended, GitHub down, malformed config - fail closed, never proceed to payment
+
+  const paymentLinkUrl = env.STRIPE_PAYMENT_LINK_URL;
+  if (!paymentLinkUrl) return failureResult(env);
+
+  // Carries the CONFIRMED installation identity forward - never re-derived
+  // from the original, less-trusted `state` claims alone - as a fresh
+  // signed token used as the Stripe Payment Link's client_reference_id.
+  // api/stripe_webhook.js verifies this same way before provisioning
+  // anything.
+  const checkoutToken = signOnboardingToken({
+    onboardingId: claims.onboardingId,
+    installationId: String(installationId),
+    accountLogin: account.login
+  }, { now });
+
+  return { httpStatus: 302, redirectUrl: `${paymentLinkUrl}?client_reference_id=${encodeURIComponent(checkoutToken)}` };
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  const result = await handleInstallCallback(req.query || {});
+  res.writeHead(result.httpStatus, { Location: result.redirectUrl });
+  res.end();
+}"""
+        },
+
+        # Verifies a real Stripe payment and, only then, provisions a tenant.
+        {
+            "path": "api/stripe_webhook.js",
+            "content": """// Verifies a real Stripe payment and, only then, provisions a tenant. The
+// entire billing surface this sprint is this one event
+// (checkout.session.completed) - no subscription lifecycle, no portal, no
+// dunning (see lessons.md's dated entry for the full disclosed scope).
+//
+// Deliberately does NOT reuse api/autonomous_agent.js/api/recursive_learning.js's
+// `req.body` convention - Stripe's signature is computed over the exact
+// raw request bytes, and Vercel's default body-parsing would discard them
+// before this handler ever saw them. `config.api.bodyParser = false` below
+// opts out of that, and readRawBody manually drains the request stream
+// with an explicit byte cap (a concrete, cheap DoS mitigation - reject and
+// stop reading past ~1MB before buffering further). This file's `req.body`
+// is NEVER touched anywhere, on purpose.
+//
+// Uses the official `stripe` package for signature verification
+// specifically because real money is on the line here: `constructEvent`
+// correctly handles secret rotation, multiple simultaneous v1= signatures,
+// and timestamp tolerance in a way a hand-rolled HMAC check would have to
+// re-implement and re-verify itself. Every other new endpoint this sprint
+// intentionally avoids new dependencies; this is the one deliberate
+// exception.
+//
+// Idempotency: Stripe can and does redeliver the same event (retries on
+// any non-2xx, and can occasionally redeliver even after a 200). The new
+// tenant's tenantId is DETERMINISTIC (`ghapp-<installationId>`, never
+// random) specifically so a duplicate/retried delivery re-derives the
+// exact same id - appendToJsonRegistryWithRetry's `decide` callback reads
+// tenants.json fresh on every attempt and returns AlreadyProvisioned
+// instead of writing again if that id is already there, closing the
+// "webhook redelivered/raced twice" double-provisioning risk.
+//
+// A Stripe Checkout Session's/Payment Link's success_url must be a
+// static, side-effect-free "thanks, check back shortly" page
+// (dashboard/onboarding-success.html) - NEVER the trigger for
+// provisioning. Only this verified, server-to-server webhook provisions
+// anything; conflating "the browser reached success_url" with "payment is
+// confirmed" would let anyone provision a free tenant just by visiting
+// that URL.
+
+import Stripe from 'stripe';
+import { verifyOnboardingToken } from '../lib/onboarding_token.js';
+import { mintInstallationToken } from '../lib/github_app.js';
+import { appendToJsonRegistryWithRetry } from '../lib/registry_writer.js';
+
+export const config = { api: { bodyParser: false } };
+
+const MAX_BODY_BYTES = 1_000_000;
+
+// v1 scope: exactly one plan tier, one Stripe Payment Link - matches this
+// sprint's deliberate "single Checkout gate, not a full billing platform"
+// scope. Extending to multiple plans needs a per-price lookup (e.g. via
+// stripe.checkout.sessions.listLineItems) and is real, disclosed follow-up
+// work, not built here.
+const DEFAULT_PLAN = 'standard';
+const DEFAULT_QUOTA = { reviewsPerMonth: null };
+
+export function readRawBody(req, { maxBytes = MAX_BODY_BYTES } = {}) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(new Error('payload too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+function tenantIdForInstallation(installationId) {
+  return `ghapp-${installationId}`;
+}
+
+async function provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId, hubOctokit, hubOwner, hubRepo, now }) {
+  const tenantId = tenantIdForInstallation(installationId);
+  return appendToJsonRegistryWithRetry(hubOctokit, hubOwner, hubRepo, 'tenants.json', {
+    message: `chore: provision tenant for GitHub App installation ${installationId} (self-service onboarding)`,
+    decide: (existingTenants) => {
+      const existing = existingTenants.find((t) => t && t.tenantId === tenantId);
+      if (existing) return { skip: true, result: { status: 'AlreadyProvisioned', tenantId } };
+      const entry = {
+        tenantId,
+        name: accountLogin,
+        status: 'active',
+        plan: DEFAULT_PLAN,
+        quota: DEFAULT_QUOTA,
+        githubCredentialRef: `ghapp:${installationId}`,
+        installationId: Number(installationId),
+        // Recorded for operator support/reconciliation (looking a tenant up
+        // in the Stripe dashboard) - not read by any code path this sprint.
+        // A dedicated billing/{tenantId}.json file and a doctor.js
+        // live-subscription cross-check are real, deliberately deferred
+        // follow-up (this sprint's scope is "gate onboarding on a real
+        // payment," not a billing platform).
+        stripeCustomerId: stripeCustomerId || null,
+        createdAt: new Date(now).toISOString()
+      };
+      return { skip: false, entry, result: { status: 'Provisioned', tenantId } };
+    }
+  });
+}
+
+// Best-effort: registers a spokes.json entry for every repo this
+// installation actually covers, so onboarding is genuinely self-service
+// rather than "tenant exists but still needs a manual spoke-registration
+// step." Failure here does not fail the whole webhook - the
+// payment-linked tenant record is the thing that must not be lost; a
+// missing spoke is a lesser, recoverable gap an operator can register by
+// hand, and idempotency above already makes a Stripe retry safe either
+// way.
+async function autoRegisterSpokesForInstallation({ installationId, tenantId, hubOctokit, hubOwner, hubRepo, now, fetchImpl, appId, privateKey, githubAppRequest }) {
+  const token = await mintInstallationToken(installationId, { appId, privateKey, request: githubAppRequest });
+  if (!token) return { registered: 0, skipped: true, reason: 'could not mint an installation token' };
+  let repos;
+  try {
+    const res = await fetchImpl('https://api.github.com/installation/repositories', {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' }
+    });
+    if (!res.ok) return { registered: 0, skipped: true, reason: `GET /installation/repositories returned ${res.status}` };
+    const data = await res.json();
+    repos = data.repositories || [];
+  } catch (e) {
+    return { registered: 0, skipped: true, reason: e.message };
+  }
+
+  let registered = 0;
+  for (const repo of repos) {
+    const [owner, name] = (repo.full_name || '').split('/');
+    if (!owner || !name) continue;
+    const result = await appendToJsonRegistryWithRetry(hubOctokit, hubOwner, hubRepo, 'spokes.json', {
+      message: `chore: register spoke ${owner}/${name} for tenant ${tenantId} (self-service onboarding)`,
+      decide: (existingSpokes) => {
+        const existing = existingSpokes.find((s) => s && s.owner === owner && s.repo === name);
+        if (existing) return { skip: true, result: { added: false } };
+        const entry = { tenantId, owner, repo: name, addedAt: new Date(now).toISOString(), status: 'active' };
+        return { skip: false, entry, result: { added: true } };
+      }
+    });
+    if (result.added) registered++;
+  }
+  return { registered, skipped: false };
+}
+
+export async function handleStripeWebhook(rawBody, signatureHeader, {
+  stripeSecretKey = process.env.STRIPE_SECRET_KEY,
+  stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET,
+  hubOctokit,
+  hubOwner = process.env.HUB_GITHUB_OWNER || 'adamberneche-afk',
+  hubRepo = process.env.HUB_GITHUB_REPO || 'Mothership',
+  fetchImpl = fetch,
+  now = Date.now(),
+  stripeClient,
+  githubAppId = process.env.GITHUB_APP_ID,
+  githubAppPrivateKey = process.env.GITHUB_APP_PRIVATE_KEY,
+  githubAppRequest
+} = {}) {
+  if (!stripeWebhookSecret) {
+    return { httpStatus: 500, body: { error: 'STRIPE_WEBHOOK_SECRET is not configured' } };
+  }
+  const stripe = stripeClient || new Stripe(stripeSecretKey || 'sk_missing');
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(rawBody, signatureHeader, stripeWebhookSecret);
+  } catch (e) {
+    // The single most important line in this file - a bad/missing/tampered
+    // signature is an immediate 400, before the body is even parsed as
+    // JSON, let alone acted on.
+    return { httpStatus: 400, body: { error: 'invalid signature' } };
+  }
+
+  if (event.type !== 'checkout.session.completed') {
+    return { httpStatus: 200, body: { status: 'Ignored', reason: `unhandled event type ${event.type}` } };
+  }
+
+  const session = event.data.object;
+  const claims = session.client_reference_id ? verifyOnboardingToken(session.client_reference_id, { now }) : null;
+  if (!claims || !claims.installationId) {
+    // Someone completed a checkout without going through
+    // api/github_app_callback.js first (a bookmarked/shared/direct hit on
+    // the bare Payment Link). Acked, not provisioned, not treated as an
+    // error Stripe should retry - surfaced in Vercel's function logs for
+    // manual reconciliation rather than a new persisted registry file.
+    console.warn(`stripe_webhook: checkout.session.completed with no valid onboarding token (session ${session.id}) - needs manual reconciliation`);
+    return { httpStatus: 200, body: { status: 'Unlinked', reason: 'no valid onboarding token on this session' } };
+  }
+
+  const { installationId, accountLogin } = claims;
+  const provisionResult = await provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId: session.customer, hubOctokit, hubOwner, hubRepo, now });
+
+  if (provisionResult.status === 'Provisioned') {
+    const spokeResult = await autoRegisterSpokesForInstallation({
+      installationId, tenantId: provisionResult.tenantId, hubOctokit, hubOwner, hubRepo, now, fetchImpl,
+      appId: githubAppId, privateKey: githubAppPrivateKey, githubAppRequest
+    });
+    return { httpStatus: 200, body: { ...provisionResult, spokes: spokeResult } };
+  }
+
+  return { httpStatus: 200, body: provisionResult };
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  let rawBody;
+  try {
+    rawBody = await readRawBody(req);
+  } catch (e) {
+    res.status(413).json({ error: 'payload too large' });
+    return;
+  }
+  const signatureHeader = req.headers['stripe-signature'];
+  const { Octokit } = await import('@octokit/rest');
+  const hubOctokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const result = await handleStripeWebhook(rawBody, signatureHeader, { hubOctokit });
+  res.status(result.httpStatus).json(result.body);
+}"""
+        },
+
+        # GitHub's own App-level webhook - proactive suspend/unsuspend on
+        # installation.deleted/suspend/unsuspend.
+        {
+            "path": "api/github_app_webhook.js",
+            "content": """// GitHub's own App-level webhook - handles `installation` events
+// (deleted/suspend/unsuspend) to make credential revocation PROACTIVE
+// rather than only lazy. lib/github_app.js's mintInstallationToken/
+// lib/secrets.js's ghapp: scheme already fail closed the next time a
+// revoked installation's credential is resolved (a hard skip, never a
+// fallback) - this endpoint makes that immediate: as soon as GitHub tells
+// us an installation was removed or suspended, the matching tenant is
+// flipped to `status: 'suspended'` right away, before any request would
+// have hit the lazy failure path at all.
+//
+// HMAC-verified via GITHUB_APP_WEBHOOK_SECRET, same raw-body/no-bodyParser
+// discipline as api/stripe_webhook.js (GitHub's signature is computed over
+// the exact raw bytes too).
+//
+// Deliberately conservative on `unsuspend`: only restores a tenant to
+// `active` if `suspendedReason` was specifically set by THIS webhook
+// (`github_app_uninstalled`) - never silently undoes a status an operator
+// set manually for an unrelated reason (e.g. non-payment, abuse). An
+// operator's manual suspension always wins.
+
+import { createHmac, timingSafeEqual } from 'crypto';
+import { updateJsonRegistryEntryWithRetry } from '../lib/registry_writer.js';
+
+export const config = { api: { bodyParser: false } };
+
+const MAX_BODY_BYTES = 1_000_000;
+const REVOCATION_REASON = 'github_app_uninstalled';
+
+export function readRawBody(req, { maxBytes = MAX_BODY_BYTES } = {}) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    req.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(new Error('payload too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+export function verifyGithubWebhookSignature(rawBody, signatureHeader, secret) {
+  if (!secret || !signatureHeader || !signatureHeader.startsWith('sha256=')) return false;
+  const expected = `sha256=${createHmac('sha256', secret).update(rawBody).digest('hex')}`;
+  const provided = Buffer.from(signatureHeader);
+  const expectedBuf = Buffer.from(expected);
+  if (provided.length !== expectedBuf.length) return false;
+  return timingSafeEqual(provided, expectedBuf);
+}
+
+export async function handleGithubAppWebhook(rawBody, signatureHeader, {
+  webhookSecret = process.env.GITHUB_APP_WEBHOOK_SECRET,
+  hubOctokit,
+  hubOwner = process.env.HUB_GITHUB_OWNER || 'adamberneche-afk',
+  hubRepo = process.env.HUB_GITHUB_REPO || 'Mothership'
+} = {}) {
+  if (!verifyGithubWebhookSignature(rawBody, signatureHeader, webhookSecret)) {
+    return { httpStatus: 400, body: { error: 'invalid signature' } };
+  }
+
+  let event;
+  try {
+    event = JSON.parse(rawBody.toString('utf8'));
+  } catch (e) {
+    return { httpStatus: 400, body: { error: 'invalid JSON' } };
+  }
+
+  const installationId = event && event.installation && event.installation.id;
+  if (!installationId || !['deleted', 'suspend', 'unsuspend'].includes(event.action)) {
+    return { httpStatus: 200, body: { status: 'Ignored', reason: `unhandled action ${event && event.action}` } };
+  }
+
+  const tenantId = `ghapp-${installationId}`;
+  const find = (tenants) => tenants.findIndex((t) => t && t.tenantId === tenantId);
+
+  if (event.action === 'deleted' || event.action === 'suspend') {
+    const result = await updateJsonRegistryEntryWithRetry(hubOctokit, hubOwner, hubRepo, 'tenants.json', {
+      message: `chore: suspend tenant ${tenantId} (GitHub App ${event.action})`,
+      find,
+      update: (tenant) => {
+        if (tenant.status === 'suspended') return null; // already suspended - nothing to change
+        return { ...tenant, status: 'suspended', suspendedReason: REVOCATION_REASON };
+      }
+    });
+    if (!result.found) return { httpStatus: 200, body: { status: 'Ignored', reason: `no tenant found for installation ${installationId}` } };
+    return { httpStatus: 200, body: { status: result.changed ? 'Suspended' : 'AlreadySuspended', tenantId } };
+  }
+
+  // event.action === 'unsuspend'
+  const result = await updateJsonRegistryEntryWithRetry(hubOctokit, hubOwner, hubRepo, 'tenants.json', {
+    message: `chore: restore tenant ${tenantId} (GitHub App unsuspend)`,
+    find,
+    update: (tenant) => {
+      // Only restore if THIS webhook is what suspended it - never override
+      // an operator's own, unrelated manual suspension.
+      if (tenant.suspendedReason !== REVOCATION_REASON) return null;
+      const { suspendedReason, ...rest } = tenant;
+      return { ...rest, status: 'active' };
+    }
+  });
+  if (!result.found) return { httpStatus: 200, body: { status: 'Ignored', reason: `no tenant found for installation ${installationId}` } };
+  return { httpStatus: 200, body: { status: result.changed ? 'Restored' : 'NotRestored', tenantId } };
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  let rawBody;
+  try {
+    rawBody = await readRawBody(req);
+  } catch (e) {
+    res.status(413).json({ error: 'payload too large' });
+    return;
+  }
+  const signatureHeader = req.headers['x-hub-signature-256'];
+  const { Octokit } = await import('@octokit/rest');
+  const hubOctokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const result = await handleGithubAppWebhook(rawBody, signatureHeader, { hubOctokit });
+  res.status(result.httpStatus).json(result.body);
+}"""
+        },
+
         # 3. MEMORY MANAGEMENT
         {
             "path": "scripts/prune-logs.js",
@@ -1209,50 +2118,16 @@ export default async function handler(req, res) {
 //   Env: RETENTION_DAYS (default 90), DRY_RUN=true to report without writing
 
 import { Octokit } from '@octokit/rest';
-import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
-const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
-const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
-const DEFAULT_TENANT_ID = 'default';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const ARCHIVE_LOG_PATH = 'ai_decision_log_archive.json';
 const DEFAULT_RETENTION_DAYS = 90;
 
-function loadJsonArrayFromDisk(path) {
-  if (!existsSync(path)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-function loadSpokesRegistry() {
-  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
-}
-
-function loadTenantsRegistry() {
-  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
-}
-
-// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null;
-  return null;
-}
-
-function resolveTenantIdForSpoke(owner, repo, spokes) {
-  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
-}
-
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
+// loadSpokesRegistry/loadTenantsRegistry/resolveTenantIdForSpoke/findTenant/
+// resolveSecretRef now live in ../lib/secrets.js (imported above) - deduped
+// out of what used to be 6 byte-identical Node-side copies of the same
+// functions, see that file's header comment.
 
 async function readJsonArrayFile(octokit, owner, repo, path) {
   try {
@@ -1362,7 +2237,13 @@ export async function pruneAllSpokes(octokit, options = {}) {
       if (octokitFactory) {
         const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
         const tenant = findTenant(tenantId, tenants);
-        const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+        // Read-only-adjacent maintenance script - best-effort-with-some-token
+        // is the right behavior here (matches doctor.js/health-report.js/
+        // collect-issue-feedback.js's identical, deliberate fallback),
+        // unlike the hard-skip rule in api/autonomous_agent.js/
+        // api/recursive_learning.js.
+        const resolved = tenant ? await resolveSecretRef(tenant.githubCredentialRef) : null;
+        const token = resolved || process.env.GLOBAL_GITHUB_TOKEN;
         spokeOctokit = octokitFactory(token);
       }
       results.push(await pruneSpoke(spokeOctokit, spoke, pruneOptions));
@@ -1416,12 +2297,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 // Usage: node scripts/health-report.js
 
 import { Octokit } from '@octokit/rest';
-import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
-const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
-const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
-const DEFAULT_TENANT_ID = 'default';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const HUB_ISSUE_LABEL = 'cto-hub-auto';
 const REPORT_ISSUE_LABEL = 'mothership-health-report';
@@ -1431,40 +2308,10 @@ const REPORT_WINDOW_DAYS = 7;
 const HUB_OWNER = process.env.HUB_GITHUB_OWNER || 'adamberneche-afk';
 const HUB_REPO = process.env.HUB_GITHUB_REPO || 'Mothership';
 
-function loadJsonArrayFromDisk(path) {
-  if (!existsSync(path)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-function loadSpokesRegistry() {
-  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
-}
-
-function loadTenantsRegistry() {
-  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
-}
-
-// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null;
-  return null;
-}
-
-function resolveTenantIdForSpoke(owner, repo, spokes) {
-  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
-}
-
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
+// loadSpokesRegistry/loadTenantsRegistry/resolveTenantIdForSpoke/findTenant/
+// resolveSecretRef now live in ../lib/secrets.js (imported above) - deduped
+// out of what used to be 6 byte-identical Node-side copies of the same
+// functions, see that file's header comment.
 
 async function safeGetTextContent(octokit, owner, repo, path) {
   try {
@@ -1545,18 +2392,23 @@ export async function buildFullReport(octokit, { now = Date.now(), windowDays = 
   const windowStart = new Date(now - windowDays * 24 * 60 * 60 * 1000);
   const generatedAt = new Date(now).toISOString();
 
-  const resolveOctokitForSpoke = (spoke) => {
+  // Read-only diagnostic tool - best-effort-with-some-token is the right
+  // behavior here (matches doctor.js/prune-logs.js/collect-issue-feedback.js's
+  // identical, deliberate fallback), unlike the hard-skip rule in
+  // api/autonomous_agent.js/api/recursive_learning.js.
+  const resolveOctokitForSpoke = async (spoke) => {
     if (!octokitFactory) return octokit;
     const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
     const tenant = findTenant(tenantId, tenants);
-    const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+    const resolved = tenant ? await resolveSecretRef(tenant.githubCredentialRef) : null;
+    const token = resolved || process.env.GLOBAL_GITHUB_TOKEN;
     return octokitFactory(token);
   };
 
   const spokeReports = [];
   for (const spoke of spokes) {
     try {
-      spokeReports.push(await buildReportForSpoke(resolveOctokitForSpoke(spoke), spoke, { windowStart }));
+      spokeReports.push(await buildReportForSpoke(await resolveOctokitForSpoke(spoke), spoke, { windowStart }));
     } catch (e) {
       spokeReports.push({ owner: spoke.owner, repo: spoke.repo, error: e.message });
     }
@@ -1676,49 +2528,15 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 // Usage: node scripts/collect-issue-feedback.js
 
 import { Octokit } from '@octokit/rest';
-import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
-const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
-const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
-const DEFAULT_TENANT_ID = 'default';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const HUB_ISSUE_LABEL = 'cto-hub-auto';
 
-function loadJsonArrayFromDisk(path) {
-  if (!existsSync(path)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-function loadSpokesRegistry() {
-  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
-}
-
-function loadTenantsRegistry() {
-  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
-}
-
-// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null;
-  return null;
-}
-
-function resolveTenantIdForSpoke(owner, repo, spokes) {
-  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
-}
-
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
+// loadSpokesRegistry/loadTenantsRegistry/resolveTenantIdForSpoke/findTenant/
+// resolveSecretRef now live in ../lib/secrets.js (imported above) - deduped
+// out of what used to be 6 byte-identical Node-side copies of the same
+// functions, see that file's header comment.
 
 async function readJsonArrayFile(octokit, owner, repo, path) {
   try {
@@ -1812,7 +2630,12 @@ export async function collectFeedbackForAllSpokes(octokit, options = {}) {
       if (octokitFactory) {
         const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
         const tenant = findTenant(tenantId, tenants);
-        const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+        // Read-only-adjacent maintenance script - best-effort-with-some-token
+        // is the right behavior here (matches doctor.js/health-report.js/
+        // prune-logs.js's identical, deliberate fallback), unlike the
+        // hard-skip rule in api/autonomous_agent.js/api/recursive_learning.js.
+        const resolved = tenant ? await resolveSecretRef(tenant.githubCredentialRef) : null;
+        const token = resolved || process.env.GLOBAL_GITHUB_TOKEN;
         spokeOctokit = octokitFactory(token);
       }
       results.push(await collectFeedbackForSpoke(spokeOctokit, spoke, collectOptions));
@@ -1873,49 +2696,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 // Usage: node scripts/doctor.js
 
 import { Octokit } from '@octokit/rest';
-import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
-const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
-const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
-const DEFAULT_TENANT_ID = 'default';
 const CALL_HUB_WORKFLOW_PATH = '.github/workflows/call-hub.yml';
 const HUB_URL_SECRET_NAMES = ['VERCEL_URL', 'APPS_SCRIPT_URL'];
-
-function loadJsonArrayFromDisk(path) {
-  if (!existsSync(path)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-function loadSpokesRegistry() {
-  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
-}
-
-function loadTenantsRegistry() {
-  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
-}
-
-// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null;
-  return null;
-}
-
-function resolveTenantIdForSpoke(owner, repo, spokes) {
-  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
-}
-
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
 
 // This exact repo's own GLOBAL_GITHUB_TOKEN, readable at Actions runtime -
 // a 401 here is precisely this session's own confirmed incident.
@@ -2003,6 +2787,26 @@ async function checkSpokeHasHubUrlSecret(octokit, spoke) {
   }
 }
 
+// Catches exactly the class of bug this whole file exists to catch, now
+// for the credential model itself: a bad App ID, a revoked/uninstalled
+// GitHub App installation, a malformed private key, or a plain typo in a
+// tenant's githubCredentialRef, surfaced before it accumulates into a
+// silent, live failure the next time that tenant's spoke is actually
+// served. Only checks tenants that would actually be served today
+// (status !== 'active' is a deliberate, separate suspension, not a
+// misconfiguration - excluded here so a doctor run on a suspended tenant
+// doesn't cry wolf about a credential nobody expects to work right now).
+async function checkTenantCredentialResolves(tenant) {
+  const label = `tenant '${tenant.tenantId}': githubCredentialRef resolves`;
+  const ref = tenant.githubCredentialRef;
+  if (!ref || typeof ref !== 'string') {
+    return { label, ok: false, detail: 'no githubCredentialRef configured' };
+  }
+  const token = await resolveSecretRef(ref);
+  if (token) return { label, ok: true, detail: `resolves (${ref})` };
+  return { label, ok: false, detail: `does not resolve to a working credential (${ref}) - check for a revoked/uninstalled GitHub App installation, an unset env var, or a typo` };
+}
+
 // Core check, testable without any real network access. Returns a plain
 // result object rather than exiting - only the CLI wrapper below does
 // that, matching processRequest/buildFullReport/pruneAllSpokes's existing
@@ -2021,16 +2825,28 @@ export async function runDoctor(octokit, { fetchImpl = fetch, env = process.env,
 
   const spokes = spokesOverride || loadSpokesRegistry();
   const tenants = tenantsOverride || loadTenantsRegistry();
-  const resolveOctokitForSpoke = (spoke) => {
+
+  for (const tenant of tenants) {
+    if (tenant && tenant.status && tenant.status !== 'active') continue;
+    checks.push(await checkTenantCredentialResolves(tenant));
+  }
+
+  // Read-only diagnostic tool, not request-serving credential resolution -
+  // best-effort-with-some-token is the right behavior here (matches
+  // health-report.js/prune-logs.js/collect-issue-feedback.js's identical,
+  // deliberate fallback), unlike the hard-skip rule in
+  // api/autonomous_agent.js/api/recursive_learning.js.
+  const resolveOctokitForSpoke = async (spoke) => {
     if (!octokitFactory) return octokit;
     const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
     const tenant = findTenant(tenantId, tenants);
-    const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || env.GLOBAL_GITHUB_TOKEN;
+    const resolved = tenant ? await resolveSecretRef(tenant.githubCredentialRef) : null;
+    const token = resolved || env.GLOBAL_GITHUB_TOKEN;
     return octokitFactory(token);
   };
 
   for (const spoke of spokes) {
-    const spokeOctokit = resolveOctokitForSpoke(spoke);
+    const spokeOctokit = await resolveOctokitForSpoke(spoke);
     checks.push(await checkSpokeRepoReachable(spokeOctokit, spoke));
     checks.push(await checkSpokeHasCallHubWorkflow(spokeOctokit, spoke));
     checks.push(await checkSpokeHasHubUrlSecret(spokeOctokit, spoke));
@@ -2062,6 +2878,260 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       console.error(err);
       process.exitCode = 1;
     });
+}"""
+        },
+
+        # Operator-driven manual tenant provisioning - the escape hatch for
+        # everything self-service onboarding can't cover.
+        {
+            "path": "scripts/provision-tenant.js",
+            "content": """// Operator-driven manual tenant provisioning - the escape hatch for
+// everything self-service (api/onboard_start.js -> api/github_app_callback.js
+// -> api/stripe_webhook.js) can't cover: plan changes, manual suspension,
+// or a tenant who can't use a GitHub App at all and needs an `env:`-scoped
+// credential set up by hand. Not the primary onboarding path any more -
+// that's the self-service flow - but necessary as a correction/override
+// tool, and it's what closes the loop on `tenant.status` actually
+// mattering (api/autonomous_agent.js's tenant-status gate).
+//
+// CLI surface: no argument-parsing convention exists anywhere else in this
+// repo (every other admin script reads config from env vars only) - this
+// is the first, kept deliberately minimal: hand-parsed named flags, no new
+// dependency (no commander/yargs).
+//
+//   node scripts/provision-tenant.js \\
+//     --tenant-id acme --name "Acme Corp" --plan pro \\
+//     --credential-ref ghapp:12345678 \\
+//     [--quota 100] [--caller-key-ref env:ACME_CALLER_KEY] \\
+//     [--status active] [--spoke owner/repo ...] [--dry-run]
+//
+// Trust model: writes DIRECTLY to the local tenants.json/spokes.json on
+// disk (no PR), same as scripts/prune-logs.js's own direct-write
+// precedent. recursive_learning.js's PR-gate exists specifically to put a
+// human between UNTRUSTED, AI-generated content and the repo - an
+// operator running this CLI by hand, with their own already-trusted
+// credentials, already IS that human. Routing an already-reviewed,
+// operator-driven change through a review gate would add process with no
+// added safety.
+
+import { writeFileSync } from 'fs';
+import { loadTenantsRegistry, loadSpokesRegistry, resolveSecretRef } from '../lib/secrets.js';
+
+const TENANT_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const CREDENTIAL_SCHEME_PATTERN = /^(env|ghapp|kv):(.*)$/;
+const ENV_VAR_NAME_PATTERN = /^[A-Z][A-Z0-9_]*$/;
+// Common live-token shapes an operator might mistakenly paste where an
+// env: var NAME belongs - a concrete, code-level enforcement of the
+// already-documented "never commit a raw credential into tenants.json"
+// rule, catching the exact mistake before it becomes a permanent, public
+// git-history leak.
+const RAW_TOKEN_SHAPE_PATTERN = /^(ghp_|github_pat_|gho_|ghs_|ghu_|sk-)/;
+const MAX_ENV_VAR_NAME_LENGTH = 64;
+const GHAPP_ID_PATTERN = /^[1-9][0-9]{0,15}$/;
+const VALID_STATUSES = ['active', 'suspended'];
+const SPOKE_PATTERN = /^([A-Za-z0-9._-]+)\\/([A-Za-z0-9._-]+)$/;
+
+function validateCredentialRefShape(ref, fieldName, errors) {
+  if (typeof ref !== 'string' || !ref) {
+    errors.push(`${fieldName} is required`);
+    return;
+  }
+  const match = ref.match(CREDENTIAL_SCHEME_PATTERN);
+  if (!match) {
+    errors.push(`${fieldName} must start with env:, ghapp:, or kv: (got '${ref}')`);
+    return;
+  }
+  const [, scheme, value] = match;
+  if (scheme === 'kv') {
+    errors.push(`${fieldName}: kv: scheme is not implemented yet - see lib/secrets.js`);
+    return;
+  }
+  if (scheme === 'env') {
+    // Checked BEFORE the generic name-shape check, and case-insensitively -
+    // a value that looks like an actual live credential is a more urgent,
+    // more specific problem than a naming-convention mismatch, and must
+    // never be masked by the generic "doesn't look like a real env var
+    // name" message.
+    if (value.length > MAX_ENV_VAR_NAME_LENGTH || RAW_TOKEN_SHAPE_PATTERN.test(value)) {
+      errors.push(`${fieldName}: '${value}' looks like it might be a raw token pasted where a variable NAME belongs - never commit a raw credential into tenants.json`);
+      return;
+    }
+    if (!ENV_VAR_NAME_PATTERN.test(value)) {
+      errors.push(`${fieldName}: 'env:${value}' doesn't look like a real environment-variable name`);
+    }
+    return;
+  }
+  if (scheme === 'ghapp' && !GHAPP_ID_PATTERN.test(value)) {
+    errors.push(`${fieldName}: 'ghapp:${value}' is not a valid installation id`);
+  }
+}
+
+// Pure validation, no I/O - takes the caller's already-loaded registries
+// so it's trivially testable and reusable from a dry-run.
+export function validateTenantInput(input, { existingTenants = [], existingSpokes = [] } = {}) {
+  const errors = [];
+
+  if (!input.tenantId || !TENANT_ID_PATTERN.test(input.tenantId)) {
+    errors.push(`tenant-id must match ${TENANT_ID_PATTERN} (got '${input.tenantId}')`);
+  } else if (existingTenants.some((t) => t && typeof t.tenantId === 'string' && t.tenantId.toLowerCase() === input.tenantId.toLowerCase())) {
+    errors.push(`tenant-id '${input.tenantId}' already exists (case-insensitive match)`);
+  }
+
+  if (!input.name || typeof input.name !== 'string' || !input.name.trim()) {
+    errors.push('name is required');
+  } else if (/[\\n\\r`]/.test(input.name)) {
+    // tenant.name is embedded raw into a hub-authored PR body in
+    // api/recursive_learning.js - an unsanitized name is a real, if minor,
+    // Markdown/PR-body injection surface into a PR the hub opens against
+    // itself.
+    errors.push('name must not contain newlines or backticks');
+  }
+
+  const status = input.status || 'active';
+  if (!VALID_STATUSES.includes(status)) {
+    errors.push(`status must be one of ${VALID_STATUSES.join(', ')} (got '${status}')`);
+  }
+
+  if (!input.plan || typeof input.plan !== 'string' || !input.plan.trim()) {
+    errors.push('plan is required');
+  }
+
+  let reviewsPerMonth = null;
+  if (input.quota !== undefined && input.quota !== null && input.quota !== '') {
+    const n = Number(input.quota);
+    if (!Number.isInteger(n) || n < 1) {
+      errors.push(`quota must be a positive integer or omitted for unlimited (got '${input.quota}')`);
+    } else {
+      reviewsPerMonth = n;
+    }
+  }
+
+  validateCredentialRefShape(input.credentialRef, 'credential-ref', errors);
+  if (input.credentialRef && CREDENTIAL_SCHEME_PATTERN.test(input.credentialRef)) {
+    const [, scheme, value] = input.credentialRef.match(CREDENTIAL_SCHEME_PATTERN);
+    if (scheme === 'ghapp' && GHAPP_ID_PATTERN.test(value)) {
+      const alreadyUsed = existingTenants.find((t) => t && t.githubCredentialRef === `ghapp:${value}`);
+      if (alreadyUsed) errors.push(`ghapp:${value} is already used by tenant '${alreadyUsed.tenantId}' - one installation, one tenant`);
+    }
+  }
+
+  if (input.callerKeyRef) {
+    validateCredentialRefShape(input.callerKeyRef, 'caller-key-ref', errors);
+  }
+
+  const spokesToAdd = [];
+  for (const spokeArg of input.spokes || []) {
+    const match = SPOKE_PATTERN.exec(spokeArg);
+    if (!match) {
+      errors.push(`--spoke '${spokeArg}' must be in owner/repo form`);
+      continue;
+    }
+    const [, owner, repo] = match;
+    const existing = existingSpokes.find((s) => s && s.owner === owner && s.repo === repo);
+    if (existing && existing.tenantId !== input.tenantId) {
+      errors.push(`spoke ${owner}/${repo} is already registered to a different tenant ('${existing.tenantId}')`);
+      continue;
+    }
+    if (existing) continue; // already belongs to this exact tenant - nothing to add
+    spokesToAdd.push({ owner, repo });
+  }
+
+  if (errors.length > 0) return { valid: false, errors };
+
+  return {
+    valid: true,
+    tenant: {
+      tenantId: input.tenantId,
+      name: input.name.trim(),
+      status,
+      plan: input.plan.trim(),
+      quota: { reviewsPerMonth },
+      githubCredentialRef: input.credentialRef,
+      ...(input.callerKeyRef ? { callerKeyRef: input.callerKeyRef } : {}),
+      createdAt: new Date(input.now || Date.now()).toISOString()
+    },
+    spokesToAdd
+  };
+}
+
+// Pure - takes/returns data, never touches fs. The CLI block below does
+// the actual read-from-disk/write-to-disk.
+export function provisionTenant(input, { existingTenants = [], existingSpokes = [] } = {}) {
+  const validation = validateTenantInput(input, { existingTenants, existingSpokes });
+  if (!validation.valid) return { status: 'Invalid', errors: validation.errors };
+
+  const spokeEntries = validation.spokesToAdd.map((s) => ({
+    tenantId: input.tenantId,
+    owner: s.owner,
+    repo: s.repo,
+    addedAt: new Date(input.now || Date.now()).toISOString(),
+    status: 'active'
+  }));
+
+  if (input.dryRun) {
+    return { status: 'DryRun', tenant: validation.tenant, spokesToAdd: spokeEntries };
+  }
+
+  return {
+    status: 'Provisioned',
+    tenant: validation.tenant,
+    spokesToAdd: spokeEntries,
+    tenantsJson: [...existingTenants, validation.tenant],
+    spokesJson: [...existingSpokes, ...spokeEntries]
+  };
+}
+
+// --- CLI-only from here down ------------------------------------------------
+
+function parseArgs(argv) {
+  const input = { spokes: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const next = () => argv[++i];
+    switch (arg) {
+      case '--tenant-id': input.tenantId = next(); break;
+      case '--name': input.name = next(); break;
+      case '--plan': input.plan = next(); break;
+      case '--credential-ref': input.credentialRef = next(); break;
+      case '--caller-key-ref': input.callerKeyRef = next(); break;
+      case '--quota': input.quota = next(); break;
+      case '--status': input.status = next(); break;
+      case '--spoke': input.spokes.push(next()); break;
+      case '--dry-run': input.dryRun = true; break;
+      default:
+        console.error(`unrecognized argument: ${arg}`);
+        process.exitCode = 1;
+        return null;
+    }
+  }
+  return input;
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const input = parseArgs(process.argv.slice(2));
+  if (input) {
+    const existingTenants = loadTenantsRegistry();
+    const existingSpokes = loadSpokesRegistry();
+    const result = provisionTenant(input, { existingTenants, existingSpokes });
+
+    if (result.status === 'Invalid') {
+      console.error('Validation failed:');
+      for (const err of result.errors) console.error(`  - ${err}`);
+      process.exitCode = 1;
+    } else if (result.status === 'DryRun') {
+      console.log('Dry run - nothing written. Would create:');
+      console.log(JSON.stringify(result.tenant, null, 2));
+      if (result.spokesToAdd.length) console.log('And register spokes:', JSON.stringify(result.spokesToAdd, null, 2));
+    } else {
+      writeFileSync('tenants.json', JSON.stringify(result.tenantsJson, null, 2) + '\\n');
+      writeFileSync('spokes.json', JSON.stringify(result.spokesJson, null, 2) + '\\n');
+      console.log(`Provisioned tenant '${result.tenant.tenantId}'${result.spokesToAdd.length ? ` with ${result.spokesToAdd.length} spoke(s)` : ''}.`);
+      console.log('tenants.json/spokes.json updated on disk - review and commit:');
+      console.log('  git add tenants.json spokes.json');
+      console.log(`  git commit -m "chore: provision tenant ${result.tenant.tenantId}"`);
+      console.log('  git push');
+    }
+  }
 }"""
         },
 
@@ -2285,10 +3355,93 @@ jobs:
             -d '{}'"""
         },
 
+        # Operator-driven, workflow_dispatch-only tenant provisioning.
+        {
+            "path": ".github/workflows/provision-tenant.yml",
+            "content": """name: Provision Tenant
+
+# Deliberately workflow_dispatch-only, no schedule - same trust/exposure
+# model as doctor.yml: an operator triggers this by hand when actually
+# provisioning someone, never on a clock. Unlike doctor.js/prune-logs.js's
+# workflows (which write via the GitHub Contents API directly),
+# scripts/provision-tenant.js writes to the local checkout on disk - this
+# job commits and pushes that change itself, since nothing else will.
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_id:
+        description: 'Tenant id (lowercase, alphanumeric + hyphens)'
+        required: true
+      name:
+        description: 'Human-readable tenant name'
+        required: true
+      plan:
+        description: 'Plan name (free-form - e.g. pro, enterprise)'
+        required: true
+      credential_ref:
+        description: 'GitHub credential ref (env:VAR_NAME or ghapp:<installation_id>)'
+        required: true
+      quota:
+        description: 'Reviews per month (blank = unlimited)'
+        required: false
+      status:
+        description: 'Tenant status'
+        required: false
+        default: 'active'
+        type: choice
+        options:
+          - active
+          - suspended
+      spokes:
+        description: 'Space-separated owner/repo entries to register as this tenant''s initial spokes (optional)'
+        required: false
+      dry_run:
+        description: 'Dry run - validate and print, write nothing'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  provision-tenant:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Provision tenant
+        run: |
+          ARGS=(--tenant-id "${{ inputs.tenant_id }}" --name "${{ inputs.name }}" --plan "${{ inputs.plan }}" --credential-ref "${{ inputs.credential_ref }}")
+          if [ -n "${{ inputs.quota }}" ]; then ARGS+=(--quota "${{ inputs.quota }}"); fi
+          if [ -n "${{ inputs.status }}" ]; then ARGS+=(--status "${{ inputs.status }}"); fi
+          for spoke in ${{ inputs.spokes }}; do ARGS+=(--spoke "$spoke"); done
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS+=(--dry-run); fi
+          node scripts/provision-tenant.js "${ARGS[@]}"
+
+      - name: Commit and push (skipped on dry run)
+        if: inputs.dry_run != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- tenants.json spokes.json; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git add tenants.json spokes.json
+          git commit -m "chore: provision tenant ${{ inputs.tenant_id }} (operator-driven, via Actions)"
+          git push"""
+        },
+
         # 5. INFRASTRUCTURE
         {
             "path": "package.json",
-            "content": "{\n  \"name\": \"ai-cto-hub\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"test\": \"for f in scripts/dev-test-*.mjs; do node \\\"$f\\\" || exit 1; done\"\n  },\n  \"dependencies\": {\n    \"@octokit/rest\": \"^19.0.0\"\n  }\n}"
+            "content": "{\n  \"name\": \"ai-cto-hub\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"test\": \"for f in scripts/dev-test-*.mjs; do node \\\"$f\\\" || exit 1; done\"\n  },\n  \"dependencies\": {\n    \"@octokit/auth-app\": \"^6.1.4\",\n    \"@octokit/rest\": \"^19.0.0\",\n    \"stripe\": \"^17.7.0\"\n  }\n}",
         },
         {
             "path": ".gitignore",
