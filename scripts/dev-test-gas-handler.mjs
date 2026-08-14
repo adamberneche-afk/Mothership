@@ -355,6 +355,42 @@ function testRegisteredSpokeResolvesItsOwnTenantCredential() {
   check("resolved to acme's own token, not the global one", factory.tokensUsed[0] === 'acme-secret-token');
 }
 
+function testSuspendedTenantIsSkippedBeforeAnyGithubCall() {
+  console.log("Multi-tenancy fix: a tenant with status !== 'active' is skipped before any GitHub call");
+  const github = makeFakeGithub();
+  const hubGithub = makeFakeHubGithub();
+  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
+  const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
+  const suspendedTenants = TWO_TENANTS.map(t => t.tenantId === 'acme' ? { ...t, status: 'suspended' } : t);
+  const { httpStatus, body } = processRequest(
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: suspendedTenants }
+  );
+  check('httpStatus is 200 (a quiet skip, not an error)', httpStatus === 200);
+  check("reason mentions the tenant's status", /status is 'suspended'/.test(body.reason));
+  check('zero GitHub calls were made for a suspended tenant', github.calls.getContent.length === 0);
+  check('the AI was never called', aiFetch.callCount() === 0);
+}
+
+function testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken() {
+  console.log('Multi-tenancy fix: a matched tenant whose credential ref fails to resolve is a hard skip, never a silent global-token fallback');
+  const github = makeFakeGithub();
+  const factory = makeFakeGithubFactory(github);
+  const hubGithub = makeFakeHubGithub();
+  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
+  // Deliberately no ACME_TEST_TOKEN in scriptProperties - simulates a
+  // misconfigured/revoked credential ref for a tenant that DOES exist.
+  const scriptProperties = makeFakeScriptProperties({});
+  const { httpStatus, body } = processRequest(
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: factory, hubGithub, aiFetch, dryRunOverride: true, config: { globalGithubToken: 'the-global-token', scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+  );
+  check('httpStatus is 200 (a quiet skip, not an error)', httpStatus === 200);
+  check('reason mentions the credential could not be resolved', /Could not resolve GitHub credential/.test(body.reason));
+  check('githubFactory was never even called - no widened-access fallback attempted', factory.tokensUsed.length === 0);
+  check('the AI was never called', aiFetch.callCount() === 0);
+}
+
 function testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured() {
   console.log('Multi-tenancy: a tenant with no callerKeyRef set (acme) accepts any/no callerKey - backward compatible');
   const github = makeFakeGithub();
@@ -475,6 +511,8 @@ function main() {
   testBase64RoundTripsThroughInjectedFunctions();
   testUnregisteredSpokeFallsBackToDefaultTenantCredential();
   testRegisteredSpokeResolvesItsOwnTenantCredential();
+  testSuspendedTenantIsSkippedBeforeAnyGithubCall();
+  testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken();
   testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured();
   testCallerKeyRejectedWhenWrongForATenantThatRequiresOne();
   testCallerKeyAcceptedWhenCorrect();

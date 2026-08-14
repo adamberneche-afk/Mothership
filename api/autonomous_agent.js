@@ -289,6 +289,30 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   const tenantId = resolveTenantIdForSpoke(owner, repo, spokes);
   const tenant = findTenant(tenantId, tenants);
 
+  // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
+  // env var never files a real issue by accident - DRY_RUN_MODE has to be
+  // explicitly set to the string "false" in Vercel to go live. Every
+  // response from this point on carries `dryRun` so callers (and the
+  // decision log / health report built on top of this) can always tell
+  // which mode produced it. Computed up front (moved ahead of tenant/
+  // credential handling below) so the tenant-status gate can use it too.
+  const dryRun = dryRunOverride !== undefined
+    ? dryRunOverride
+    : process.env.DRY_RUN_MODE !== 'false';
+
+  // TENANT STATUS GATE: an explicitly non-'active' tenant (suspended, e.g.
+  // for a failed payment) must never be served, checked before any
+  // GitHub call - including the credential resolution below - so a
+  // suspended tenant costs nothing, not even a failed auth attempt.
+  // `status` is optional for backward compat: a record with no `status`
+  // field, or the "default" tenant's seeded "active", is always served -
+  // only an EXPLICIT non-'active' value skips. (Found while building the
+  // GitHub App credential path: `status` was defined in tenants.json's own
+  // schema but never actually read anywhere in this handler until now.)
+  if (tenant && tenant.status && tenant.status !== 'active') {
+    return { httpStatus: 200, body: { status: 'Skipped', reason: `Tenant status is '${tenant.status}', not 'active'`, dryRun } };
+  }
+
   const requiredCallerKey = tenant ? resolveSecretRef(tenant.callerKeyRef) : null;
   if (requiredCallerKey && callerKey !== requiredCallerKey) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
@@ -296,24 +320,28 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
 
   // Credential for this request's SPOKE operations - the tenant's own
   // token (decision #1), resolved via the same env:/kv: scheme as the
-  // caller key above. Falls back to GLOBAL_GITHUB_TOKEN only when no
-  // tenant match exists at all (mirrors resolveTenantIdForSpoke's own
-  // backward-compatibility fallback) or the ref can't be resolved yet
-  // (e.g. a kv: ref with no secrets store behind it) - fails toward "use
-  // the one credential that's always been used" rather than toward a
-  // silent, harder-to-diagnose 401 from GitHub itself.
-  const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+  // caller key above. GLOBAL_GITHUB_TOKEN is used ONLY for the true
+  // legacy/pre-migration case: no tenant record matched this spoke at all
+  // (mirrors resolveTenantIdForSpoke's own backward-compatibility
+  // fallback). A tenant that DID match but whose credential ref fails to
+  // resolve (unset env var, revoked/misconfigured ref) is a hard skip, not
+  // a fallback - silently widening to the hub's own broad
+  // GLOBAL_GITHUB_TOKEN here would be exactly backwards: a tenant whose
+  // credential is broken or was just revoked should lose access, not gain
+  // the operator's own token against their repo. (Inert while only one
+  // tenant with one credential path existed; a real, live bug the moment a
+  // second, revocable per-tenant credential does - fixed here before that
+  // becomes true.)
+  let spokeToken;
+  if (tenant) {
+    spokeToken = resolveSecretRef(tenant.githubCredentialRef);
+    if (!spokeToken) {
+      return { httpStatus: 200, body: { status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun } };
+    }
+  } else {
+    spokeToken = process.env.GLOBAL_GITHUB_TOKEN;
+  }
   const octokit = octokitFactory(spokeToken);
-
-  // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
-  // env var never files a real issue by accident - DRY_RUN_MODE has to be
-  // explicitly set to the string "false" in Vercel to go live. Every
-  // response from this point on carries `dryRun` so callers (and the
-  // decision log / health report built on top of this) can always tell
-  // which mode produced it.
-  const dryRun = dryRunOverride !== undefined
-    ? dryRunOverride
-    : process.env.DRY_RUN_MODE !== 'false';
 
   // Fetch Global Context from Hub
   const universalLessonsPath = join(process.cwd(), 'universal_lessons.md');
