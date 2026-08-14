@@ -723,6 +723,238 @@ function resolveSecretRef(ref) {
   return null;
 }
 
+// --- Shared, opt-in, cross-organization learning pool -----------------------
+//
+// Repo-scoped opt-in (spoke.shareLearnings === true), NOT tenant-scoped -
+// deliberately: whether a codebase's patterns are safe to pool into a wider
+// corpus is a property of that codebase, not of who's paying for it. A repo
+// that opts in still ALSO runs in its own tenant's private runForTenant pass
+// above - this is purely additive, nothing existing changes.
+//
+// Two structural safeguards against exactly the failure mode this feature
+// exists to avoid ("co-mingle/hallucinate codebase"):
+//   1. The per-spoke context sent to the AI is labeled with an anonymized
+//      "Contributor N" tag instead of the real owner/repo. There's no
+//      actual source code to redact here in the first place (this loop
+//      never fetches diffs, only lessons.md/decision-log text - same as
+//      runForTenant's per-spoke fetch above), but a real org/repo name
+//      could still get echoed back into the merged, hub-global lessons
+//      text, so it's kept out of the model's view entirely.
+//   2. The model must CITE which anonymized contributors back its proposal
+//      (`supporting_contributors`) - and that citation is verified in CODE
+//      against the real spokes those labels map to (distinct tenants /
+//      distinct repos), never just trusted because the model said
+//      "has_proposal: true". Same "validate the claim, don't trust the
+//      free-text self-report" discipline already applied to
+//      has_findings/has_proposal everywhere else in this project.
+const MIN_DISTINCT_TENANTS_CROSS_ORG = 2;
+const MIN_DISTINCT_REPOS_SAME_TENANT = 3;
+
+function selectSharedPoolSpokes(spokes) {
+  return spokes.filter(s => s && s.owner && s.repo && s.shareLearnings === true);
+}
+
+// Cheap precondition, checked before spending an AI call: can this set of
+// opted-in spokes even theoretically satisfy the evidence bar yet?
+function poolCouldSatisfyEvidenceBar(sharedPoolSpokes) {
+  const distinctTenants = new Set(sharedPoolSpokes.map(s => s.tenantId || DEFAULT_TENANT_ID));
+  if (distinctTenants.size >= MIN_DISTINCT_TENANTS_CROSS_ORG) return true;
+  return sharedPoolSpokes.length >= MIN_DISTINCT_REPOS_SAME_TENANT;
+}
+
+// The anti-hallucination gate: given the labels the model actually cited,
+// counts DISTINCT real tenants and DISTINCT real repos behind them and
+// checks that against the locked bar - never trusts "has_proposal: true"
+// on its own.
+function citedEvidenceMeetsBar(citedLabels, labelToSpoke) {
+  const citedSpokes = citedLabels.map(label => labelToSpoke[label]).filter(Boolean);
+  const distinctRepoKeys = new Set(citedSpokes.map(s => `${s.owner}/${s.repo}`));
+  const distinctTenantIds = new Set(citedSpokes.map(s => s.tenantId));
+  if (distinctTenantIds.size >= MIN_DISTINCT_TENANTS_CROSS_ORG) return true;
+  if (distinctRepoKeys.size >= MIN_DISTINCT_REPOS_SAME_TENANT) return true;
+  return false;
+}
+
+// Builds and runs the shared cross-organization pass - parallel in shape to
+// runForTenant, but spans every tenant's opted-in spokes in one pool
+// instead of being confined to one tenant.
+async function runForSharedPool({ sharedPoolSpokes, tenants, octokitFactory, hubOctokit, fetchImpl, dryRun, universalLessons, globalNorthStar, HUB_OWNER, HUB_REPO }) {
+  if (sharedPoolSpokes.length === 0) {
+    return { pool: 'shared', status: 'Skipped', reason: 'No spokes opted into the shared learning pool', dryRun };
+  }
+  if (!poolCouldSatisfyEvidenceBar(sharedPoolSpokes)) {
+    return { pool: 'shared', status: 'Skipped', reason: 'Not enough opted-in spokes yet to meet the cross-organization evidence bar', dryRun };
+  }
+
+  // Per-spoke credential resolution still happens per-spoke, not once - the
+  // pool spans multiple tenants' repos, so each one is still fetched using
+  // ITS OWN resolved tenant credential, exactly like runForTenant, just
+  // inside one aggregating loop instead of one tenant-scoped loop.
+  const labelToSpoke = {};
+  const perSpokeContext = [];
+  for (let i = 0; i < sharedPoolSpokes.length; i++) {
+    const spoke = sharedPoolSpokes[i];
+    const label = `Contributor ${i + 1}`;
+    const tenantId = spoke.tenantId || DEFAULT_TENANT_ID;
+    const tenant = findTenant(tenantId, tenants);
+    const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+    const octokit = octokitFactory(spokeToken);
+
+    labelToSpoke[label] = { owner: spoke.owner, repo: spoke.repo, tenantId };
+
+    const lessons = await safeGetTextContent(octokit, spoke.owner, spoke.repo, 'lessons.md');
+    const decisionLogText = await safeGetTextContent(octokit, spoke.owner, spoke.repo, 'ai_decision_log.json');
+    const recentDecisions = safeParseJsonArray(decisionLogText).slice(-RECENT_DECISIONS_PER_SPOKE);
+    const negativeFeedbackCount = recentDecisions.filter((d) => d && d.feedback && d.feedback.thumbsDown > 0).length;
+    const feedbackSummary = negativeFeedbackCount > 0
+      ? `${negativeFeedbackCount} of the last ${recentDecisions.length} decisions received negative maintainer feedback (a real thumbs-down reaction on the filed issue).`
+      : 'none of the last decisions received negative maintainer feedback.';
+
+    perSpokeContext.push({ label, lessons: lessons || 'No lessons.md found.', recentDecisions, feedbackSummary });
+  }
+
+  const perSpokeSection = perSpokeContext.map(s => `
+    --- ${s.label} ---
+    LESSONS: ${s.lessons}
+    RECENT HUB DECISIONS: ${JSON.stringify(s.recentDecisions)}
+    MAINTAINER FEEDBACK: ${s.feedbackSummary}
+  `).join('\\n');
+
+  const prompt = `
+    ROLE: Senior AI CTO performing a cross-ORGANIZATION retrospective across
+    every repo that has opted into a shared learning pool. These
+    contributors belong to DIFFERENT organizations/customers - you are only
+    given anonymized labels ("Contributor N"), never real names, precisely
+    so nothing organization-identifying ends up in a shared standard.
+    CURRENT GLOBAL STANDARDS (universal_lessons.md): ${universalLessons}
+    CURRENT GLOBAL NORTH STAR (north_star_framework.md): ${globalNorthStar}
+
+    PER-CONTRIBUTOR CONTEXT:
+    ${perSpokeSection}
+
+    TASK: Look for a genuine pattern that recurs across MULTIPLE DISTINCT
+    contributors above - not something specific to only one - that the
+    CURRENT GLOBAL STANDARDS or GLOBAL NORTH STAR don't already cover. You
+    MUST list every contributor label your proposal is actually evidenced
+    by in "supporting_contributors" - a proposal with no real, cited
+    supporting evidence will be rejected regardless of what you say in
+    "has_proposal". Never phrase the proposed lesson text in terms of a
+    specific contributor or organization - describe only the underlying,
+    general engineering principle. If you find one, propose it as the
+    FULL, updated text of universal_lessons.md and/or north_star_framework.md
+    (not a diff - the complete file content with your addition folded in).
+    If nothing genuinely cross-cutting stands out, set "has_proposal" to
+    false, leave both patch fields as empty strings, and leave
+    "supporting_contributors" as an empty array - do not invent a pattern
+    just to have something to propose.
+    Respond with ONLY valid JSON, exactly this shape:
+    {
+      "has_proposal": boolean,
+      "reasoning": string,
+      "supporting_contributors": string[],
+      "universal_lessons_patch": string,
+      "north_star_patch": string
+    }
+  `;
+
+  const aiResponse = await fetchImpl(`${process.env.AI_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${process.env.AI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: process.env.AI_MODEL,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.1
+    })
+  });
+
+  const aiData = await aiResponse.json();
+  const rawContent = aiData?.choices?.[0]?.message?.content;
+
+  if (typeof rawContent !== 'string' || rawContent.trim().length === 0) {
+    return { pool: 'shared', status: 'Skipped', reason: 'AI returned no content', dryRun };
+  }
+
+  let result;
+  try {
+    result = JSON.parse(rawContent);
+  } catch (parseError) {
+    return { pool: 'shared', status: 'Skipped', reason: 'AI did not return valid JSON', raw: rawContent.slice(0, 500), dryRun };
+  }
+
+  if (result.has_proposal !== true) {
+    return { pool: 'shared', status: 'Skipped', reason: 'AI found no cross-organization pattern worth proposing', dryRun };
+  }
+
+  const isNonEmptyStringSP = (v) => typeof v === 'string' && v.trim().length > 0;
+  const hasAnyPatch = isNonEmptyStringSP(result.universal_lessons_patch) || isNonEmptyStringSP(result.north_star_patch);
+  const citedLabels = Array.isArray(result.supporting_contributors) ? result.supporting_contributors : [];
+  const isValidShape = isNonEmptyStringSP(result.reasoning) && hasAnyPatch && citedLabels.length > 0;
+
+  if (!isValidShape) {
+    return { pool: 'shared', status: 'Skipped', reason: 'AI response did not match the required shape', raw: rawContent.slice(0, 500), dryRun };
+  }
+
+  // The critical anti-hallucination gate - see this function's header
+  // comment. Rejects the proposal outright if the model's own cited
+  // evidence doesn't actually clear the bar, regardless of has_proposal.
+  if (!citedEvidenceMeetsBar(citedLabels, labelToSpoke)) {
+    return { pool: 'shared', status: 'Skipped', reason: 'Cited evidence does not meet the cross-organization bar (needs 2+ distinct tenants, or 3+ distinct repos within one tenant)', dryRun };
+  }
+
+  const supportingSpokes = citedLabels.map(label => labelToSpoke[label]).filter(Boolean);
+
+  if (dryRun) {
+    return { pool: 'shared', status: 'DryRunProposal', dryRun: true, proposal: result, supportingSpokes };
+  }
+
+  // Live: same "propose via PR against the hub, never push directly"
+  // mechanism as runForTenant - real names are used here in the PR body
+  // (built from the code-side labelToSpoke map, never from model output),
+  // since the human reviewing/merging already has full visibility into
+  // spokes.json/tenants.json. The anonymization boundary is the model's
+  // own reasoning, not the operator reading the PR.
+  const defaultBranch = await getDefaultBranch(hubOctokit, HUB_OWNER, HUB_REPO);
+  const { data: baseRef } = await hubOctokit.git.getRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `heads/${defaultBranch}` });
+  const branchName = `recursive-learning-shared-pool-${Date.now()}`;
+  await hubOctokit.git.createRef({ owner: HUB_OWNER, repo: HUB_REPO, ref: `refs/heads/${branchName}`, sha: baseRef.object.sha });
+
+  const filesToUpdate = [];
+  if (isNonEmptyStringSP(result.universal_lessons_patch)) {
+    filesToUpdate.push({ path: 'universal_lessons.md', content: result.universal_lessons_patch });
+  }
+  if (isNonEmptyStringSP(result.north_star_patch)) {
+    filesToUpdate.push({ path: 'north_star_framework.md', content: result.north_star_patch });
+  }
+
+  for (const file of filesToUpdate) {
+    let existingSha;
+    try {
+      const { data } = await hubOctokit.repos.getContent({ owner: HUB_OWNER, repo: HUB_REPO, path: file.path, ref: branchName });
+      existingSha = data.sha;
+    } catch (e) {
+      existingSha = undefined;
+    }
+    const params = {
+      owner: HUB_OWNER, repo: HUB_REPO, path: file.path, branch: branchName,
+      message: `docs: recursive-learning proposal for ${file.path} (shared cross-organization pool)`,
+      content: Buffer.from(file.content).toString('base64')
+    };
+    if (existingSha) params.sha = existingSha;
+    await hubOctokit.repos.createOrUpdateFileContents(params);
+  }
+
+  const supportingList = supportingSpokes.map(s => `\\`${s.owner}/${s.repo}\\` (tenant \\`${s.tenantId}\\`)`).join(', ');
+  const pr = await hubOctokit.pulls.create({
+    owner: HUB_OWNER, repo: HUB_REPO,
+    title: `Recursive Learning: proposed cross-organization pattern (shared pool)`,
+    head: branchName,
+    base: defaultBranch,
+    body: `### Reasoning\\n${result.reasoning}\\n\\n### Supporting repos\\n${supportingList}\\n\\n---\\nGenerated automatically by \\`api/recursive_learning.js\\` from a pattern the model reported recurring across the repos above - all opted into the shared learning pool (\\`shareLearnings: true\\`) and spanning ${new Set(supportingSpokes.map(s => s.tenantId)).size} distinct tenant(s). This is a proposal, not a decision - review before merging, and consider whether this generalization is fair to every contributing organization.`
+  });
+
+  return { pool: 'shared', status: 'Success', dryRun: false, pullRequestUrl: pr.data.html_url, supportingSpokes };
+}
+
 // Builds and runs one tenant's independent cross-spoke proposal - the unit
 // of work this whole redesign scopes tenant-isolation around. Only ever
 // sees this tenant's own spokes' lessons.md/ai_decision_log.json; never
@@ -931,7 +1163,18 @@ export async function runRecursiveLearning(reqBody, { octokitFactory, hubOctokit
     }));
   }
 
-  return { httpStatus: 200, body: { status: 'Completed', dryRun, tenantCount: results.length, results } };
+  // Additional, separate pass: repos that opted in (spoke.shareLearnings)
+  // get pooled together regardless of which tenant owns them, looking for
+  // patterns that recur ACROSS organizations - see runForSharedPool's own
+  // header comment for the anonymization/anti-hallucination safeguards.
+  // Not a tenant, so it isn't forced into the `results` array shape above.
+  const sharedPoolSpokes = selectSharedPoolSpokes(spokes);
+  const sharedPoolResult = await runForSharedPool({
+    sharedPoolSpokes, tenants, octokitFactory, hubOctokit, fetchImpl, dryRun,
+    universalLessons, globalNorthStar, HUB_OWNER, HUB_REPO
+  });
+
+  return { httpStatus: 200, body: { status: 'Completed', dryRun, tenantCount: results.length, results, sharedPoolResult } };
 }
 
 export default async function handler(req, res) {
