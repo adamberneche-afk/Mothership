@@ -1,0 +1,38 @@
+name: 'Notify on Failure'
+description: >-
+  Posts a Slack-compatible webhook message when the calling job has
+  failed. Opt-in and silent by design: a missing/empty webhook-url is a
+  no-op, never a job failure of its own - alerting is a real, disclosed
+  gap when unconfigured, not a hard requirement. Add as the LAST step in
+  a job, with `if: failure()`, so it only ever fires once something has
+  already actually gone wrong.
+inputs:
+  webhook-url:
+    description: >-
+      Slack-compatible incoming webhook URL (the ALERT_WEBHOOK_URL
+      secret). A Discord webhook also works if you append /slack to its
+      URL - Discord's own compatibility mode for this exact payload
+      shape. Empty/unset = no-op.
+    required: false
+    default: ''
+  workflow-name:
+    description: 'Human-readable label for which workflow/job failed, shown in the alert.'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      run: |
+        if [ -z "${{ inputs.webhook-url }}" ]; then
+          echo "ALERT_WEBHOOK_URL not configured - skipping failure notification (see README's Deployment & Maintenance section)."
+          exit 0
+        fi
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        PAYLOAD=$(printf '{"text":":rotating_light: Mothership workflow *%s* failed - %s"}' "${{ inputs.workflow-name }}" "$RUN_URL")
+        # Never fails this step (and so never adds a second, confusing
+        # failure on top of the real one that triggered it) if the
+        # notification itself can't be delivered - the underlying
+        # workflow failure is still the real signal either way; check the
+        # Actions tab directly if this warning appears.
+        curl -sf -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "${{ inputs.webhook-url }}" \
+          || echo "::warning::Failed to deliver the failure notification itself - the workflow failure that triggered it is still real, see the Actions tab."

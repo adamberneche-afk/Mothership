@@ -32,3 +32,10 @@ jobs:
           GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: node scripts/prune-logs.js
+
+      - name: Notify on failure
+        if: failure()
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Prune Decision Logs'
