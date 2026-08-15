@@ -10,12 +10,12 @@
 <style>
   :root {
     --paper: #f4f3ee; --panel: #ffffff; --ink: #1e2124; --ink-soft: #5c5f57;
-    --line: #d9d5c7; --accent: #a5551e; --critical: #a23b36;
+    --line: #d9d5c7; --accent: #a5551e; --critical: #a23b36; --teal: #2f6459;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --paper: #14161a; --panel: #1a1d22; --ink: #e8e4d9; --ink-soft: #a9a79c;
-      --line: rgba(255,255,255,0.14); --accent: #de9455; --critical: #de7a6e;
+      --line: rgba(255,255,255,0.14); --accent: #de9455; --critical: #de7a6e; --teal: #74b4a2;
     }
   }
   * { box-sizing: border-box; }
@@ -34,6 +34,9 @@
     display: inline-block; padding: 10px 20px; background: var(--accent); color: #fff;
     text-decoration: none; border-radius: 8px; font-weight: 600;
   }
+  .btn:focus-visible, a:focus-visible {
+    outline: 2px solid var(--teal); outline-offset: 2px; border-radius: 4px;
+  }
 </style>
 </head>
 <body>
@@ -42,11 +45,14 @@
     rejection reason in api/github_app_callback.js (forged/expired state,
     malformed installation id, a revoked/unreachable GitHub App) - the
     same page every time, so probing this flow can't be used to
-    fingerprint which check failed.
+    fingerprint which check failed. The copy below is worded to build the
+    right mental model (an expired/reused link, not a network fault)
+    without naming which specific check tripped - keep it that generic if
+    it's ever reworded again.
   -->
   <div class="card">
     <h1>Setup didn't complete</h1>
-    <p>Something interrupted the connection - the link may have expired, or the installation couldn't be confirmed. Please start over.</p>
+    <p>This link expired or was already used - that's common, and usually just means starting over works right away.</p>
     <a class="btn" href="install.html">Try again</a>
   </div>
 </body>

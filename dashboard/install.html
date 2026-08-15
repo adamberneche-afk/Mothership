@@ -38,18 +38,23 @@
     font-weight: 600;
   }
   .btn:hover { opacity: 0.9; }
+  .btn:focus-visible, a:focus-visible {
+    outline: 2px solid var(--teal); outline-offset: 2px; border-radius: 4px;
+  }
+  .footnote { margin: 16px 0 0; font-size: 0.8rem; text-align: center; }
 </style>
 </head>
 <body>
   <div class="card">
     <h1>Connect your repositories</h1>
-    <p>Mothership reviews your code and files issues directly on GitHub - no shared token, only access to what you install it on.</p>
+    <p>Mothership gives you leverage: engineering judgment written down once and continuously applied to every repository you connect, instead of re-reviewing each project by hand. It's deliberately safety-railed - dry-run by default, rate-capped, every finding validated before anything is ever filed - because trusting an AI reviewer to act autonomously has to be earned, not assumed.</p>
     <ol>
       <li>Install the GitHub App on the org/repos you want reviewed.</li>
       <li>Complete a short checkout to activate your subscription.</li>
       <li>You're done - Mothership starts covering your connected repos automatically.</li>
     </ol>
     <a class="btn" href="/api/onboard_start">Install &amp; get started</a>
+    <p class="footnote">No shared token - Mothership only ever gets access to what you install it on.</p>
   </div>
 </body>
 </html>

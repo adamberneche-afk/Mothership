@@ -1973,14 +1973,18 @@ export default async function handler(req, res) {
         {
             "path": "api/github_app_webhook.js",
             "content": """// GitHub's own App-level webhook - handles `installation` events
-// (deleted/suspend/unsuspend) to make credential revocation PROACTIVE
-// rather than only lazy. lib/github_app.js's mintInstallationToken/
-// lib/secrets.js's ghapp: scheme already fail closed the next time a
-// revoked installation's credential is resolved (a hard skip, never a
-// fallback) - this endpoint makes that immediate: as soon as GitHub tells
-// us an installation was removed or suspended, the matching tenant is
-// flipped to `status: 'suspended'` right away, before any request would
-// have hit the lazy failure path at all.
+// (deleted/suspend/unsuspend). lib/github_app.js's mintInstallationToken/
+// lib/secrets.js's ghapp: scheme already fail closed the moment a revoked
+// installation's credential is next resolved (a hard skip, never a
+// fallback) - so there is no functional security gap this endpoint closes;
+// that lazy path was already correct on its own. What this endpoint
+// actually adds is operator-facing clarity: without it, a revoked
+// installation just surfaces as a perpetual, ambiguous credential-
+// resolution failure (indistinguishable from a misconfigured App ID or a
+// transient GitHub outage) until someone investigates. With it, the
+// matching tenant is flipped to `status: 'suspended'` with a named
+// `suspendedReason` the moment GitHub reports the revocation - immediate
+// and legible, rather than eventually-and-unexplained.
 //
 // HMAC-verified via GITHUB_APP_WEBHOOK_SECRET, same raw-body/no-bodyParser
 // discipline as api/stripe_webhook.js (GitHub's signature is computed over
