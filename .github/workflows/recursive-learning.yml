@@ -9,6 +9,11 @@ jobs:
   aggregate:
     runs-on: ubuntu-latest
     steps:
+      # Only needed so the notify-on-failure composite action below (a
+      # local action, referenced by path) is present on the runner - this
+      # job itself reads no repo files.
+      - uses: actions/checkout@v4
+
       - name: Ping Hub for cross-spoke aggregation
         env:
           HUB_VERCEL_URL: ${{ secrets.HUB_VERCEL_URL }}
@@ -16,7 +21,14 @@ jobs:
           # Deployment Protection enabled.
           VERCEL_BYPASS_TOKEN: ${{ secrets.VERCEL_BYPASS_TOKEN }}
         run: |
-          curl -X POST "${HUB_VERCEL_URL}/api/recursive_learning" \
+          curl -sf -X POST "${HUB_VERCEL_URL}/api/recursive_learning" \
             -H "Content-Type: application/json" \
             -H "x-vercel-protection-bypass: ${VERCEL_BYPASS_TOKEN}" \
             -d '{}'
+
+      - name: Notify on failure
+        if: failure()
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Recursive Learning'

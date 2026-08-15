@@ -1,0 +1,123 @@
+name: Deploy to Google Apps Script
+
+# Real CD for the Apps Script backend, matching deploy-vercel.yml's shape:
+# push to main -> production (GAS_PROD_DEPLOYMENT_ID); a pull request
+# targeting main -> a separate, persistent staging deployment
+# (GAS_STAGING_DEPLOYMENT_ID) - Apps Script's equivalent of a PR preview.
+# Both are existing Apps Script deployments, created once by hand via the
+# IDE (see README's "Alternative: Deploy Without Vercel" section) -
+# `clasp deploy -i <id>` updates a specific deployment's code in place
+# rather than minting a new one, which is what keeps each deployment's Web
+# App URL stable across every CD run instead of changing on every deploy
+# the way a plain `clasp deploy` (no `-i`) would.
+#
+# NOT live-verified end-to-end: no Google account/clasp credential is
+# reachable from this environment. clasp's own OAuth credential file has
+# moved location across versions (~/.clasprc.json in older releases,
+# ~/.config/clasp/.clasprc.json from clasp 2.4+) - this workflow writes the
+# decoded CLASPRC_JSON secret to both paths to hedge against that, but
+# which one a real `clasp push`/`clasp deploy` actually reads has never
+# been confirmed from this session. Flagged honestly, same disclosure
+# standard as deploy-vercel.yml.
+#
+# Known, disclosed limitation: same as deploy-vercel.yml - a pull_request
+# from a fork doesn't receive repository secrets, so a staging deploy only
+# works for PRs from branches within this same repository.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-apps-script-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # only used to comment the staging URL back onto the PR
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install clasp
+        run: npm install --global @google/clasp@latest
+
+      - name: Restore clasp credentials
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+        run: |
+          mkdir -p "$HOME/.config/clasp"
+          echo "$CLASPRC_JSON" | base64 -d > "$HOME/.clasprc.json"
+          echo "$CLASPRC_JSON" | base64 -d > "$HOME/.config/clasp/.clasprc.json"
+
+      - name: Write .clasp.json for this run
+        env:
+          GAS_SCRIPT_ID: ${{ secrets.GAS_SCRIPT_ID }}
+        run: |
+          cat > gas/.clasp.json <<CLASPJSON
+          { "scriptId": "$GAS_SCRIPT_ID", "rootDir": "." }
+          CLASPJSON
+
+      # Step output, not an inline ternary expression repeated in every
+      # later step - matches deploy-vercel.yml and this project's own
+      # established preference (see lessons.md's Sprint 4 entry).
+      - name: Determine deploy target
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "deployment_id=${{ secrets.GAS_STAGING_DEPLOYMENT_ID }}" >> "$GITHUB_OUTPUT"
+            echo "web_app_url=${{ secrets.GAS_STAGING_WEB_APP_URL }}" >> "$GITHUB_OUTPUT"
+            echo "label=staging" >> "$GITHUB_OUTPUT"
+          else
+            echo "deployment_id=${{ secrets.GAS_PROD_DEPLOYMENT_ID }}" >> "$GITHUB_OUTPUT"
+            echo "web_app_url=${{ secrets.GAS_WEB_APP_URL }}" >> "$GITHUB_OUTPUT"
+            echo "label=production" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push source to the Apps Script project
+        working-directory: gas
+        run: clasp push --force
+
+      - name: Update the target deployment in place
+        working-directory: gas
+        run: clasp deploy -i "${{ steps.target.outputs.deployment_id }}" -d "Deployed from ${{ github.sha }} (${{ steps.target.outputs.label }})"
+
+      - name: Smoke test the deployment
+        # No expected-commit check here, unlike deploy-vercel.yml - Apps
+        # Script's health response has no commit field to compare against
+        # (see gas/Code.js's renderHealthResponse comment), and
+        # smoke-test.js already treats that as a real, disclosed platform
+        # difference rather than a mismatch.
+        run: node scripts/smoke-test.js "${{ steps.target.outputs.web_app_url }}?endpoint=health"
+
+      - name: Comment the staging URL on the PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = `${{ steps.target.outputs.web_app_url }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `**Apps Script staging deployment updated and smoke-tested:** ${url}?endpoint=health\n\nThis is a persistent staging deployment (stable URL, unlike a fresh Vercel preview) updated in place by this PR.`
+            });
+
+      # Only wired for the production path - same reasoning as
+      # deploy-vercel.yml: a staging-deploy failure is already visible to
+      # whoever opened the PR as a failing check.
+      - name: Notify on failure
+        if: failure() && github.event_name != 'pull_request'
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Deploy to Google Apps Script (production)'

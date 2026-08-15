@@ -217,6 +217,16 @@ async function findExistingReportIssue(octokit) {
 // disaster this whole system exists to avoid repeating. Always uses the
 // hub's own credential (never a tenant-scoped one) - this issue lives on
 // the hub repo itself.
+// A per-spoke `.error` (set in buildFullReport's catch block) means a real
+// fetch/API failure happened for that spoke - distinct from a spoke that's
+// just quiet (0 issues, 0 decisions, both legitimate report values, not
+// errors). Exported and tested directly, per this project's
+// testable-core/thin-CLI-shell convention, rather than inlined only in the
+// CLI guard block below.
+export function hasSpokeErrors(report) {
+  return report.spokes.some((s) => s && s.error);
+}
+
 export async function publishReport(octokit, body) {
   const existing = await findExistingReportIssue(octokit);
   if (existing) {
@@ -246,6 +256,18 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       console.log(body);
       const result = await publishReport(octokit, body);
       console.log(JSON.stringify(result));
+
+      // The report itself still gets published either way (best-effort,
+      // matching this project's "a failing spoke's read shouldn't block
+      // reporting on the rest" design) - but the job must exit non-zero when
+      // hasSpokeErrors is true, so the notify-on-failure step in
+      // health-report.yml actually fires for this class of problem, instead
+      // of a genuine per-spoke failure silently reading as a successful run.
+      if (hasSpokeErrors(report)) {
+        const erroredSpokes = report.spokes.filter((s) => s && s.error);
+        console.error(`${erroredSpokes.length} spoke(s) failed to report: ${erroredSpokes.map((s) => `${s.owner}/${s.repo}`).join(', ')}`);
+        process.exitCode = 1;
+      }
     })
     .catch((err) => {
       console.error(err);

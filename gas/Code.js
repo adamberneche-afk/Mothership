@@ -29,9 +29,26 @@ function doGet(e) {
   if (endpoint === 'settings') {
     return renderSettingsPage((e && e.parameter && e.parameter.token) || '');
   }
+  if (endpoint === 'health') {
+    return renderHealthResponse();
+  }
   return HtmlService.createHtmlOutput(
     '<!doctype html><html><body><p>Mothership hub webhook endpoint. POST requests only.</p></body></html>'
   );
+}
+
+// Minimal liveness endpoint - the Apps Script-side counterpart to
+// api/health.js (see that file's header comment for the full rationale).
+// Zero PropertiesService/UrlFetchApp/GitHub/AI calls, deliberately, so it
+// can't itself be the thing that's broken. Doesn't carry a deployed-
+// commit identifier the way api/health.js's VERCEL_GIT_COMMIT_SHA does -
+// clasp/Apps Script has no equivalent automatic value to read. A real
+// platform difference, not an oversight; the smoke test that hits this
+// only ever checks `status === 'ok'`, never `commit`, on either platform.
+function renderHealthResponse() {
+  return ContentService
+    .createTextOutput(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 function doPost(e) {

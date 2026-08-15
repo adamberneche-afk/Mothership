@@ -156,6 +156,14 @@ No backend of its own: `manifest.json`/`sw.js` make it installable (add-to-home-
 
 **Hub Health:** a second panel, above the per-spoke one, answering a different question - not "are the spokes okay," but "is the swarm's own machinery actually running." Reads this repo's own Actions run history for its four scheduled workflows (`self-reflect`, `health-report`, `recursive-learning`, `prune-logs` - `ci.yml` is left out on purpose, it's a PR/push code-quality gate, not a scheduled operational signal) via the same unauthenticated `api.github.com` access as everything else here, with the same caching/offline-fallback treatment. Statuses: `healthy` (last run succeeded), `failing` (completed with any other outcome), `never run`, `in progress`, plus the same `rate-limited`/`couldn't load`/`timed out` states the spoke panel already has - worst-first, same as the spoke table.
 
+### Failure Alerting (`.github/actions/notify-on-failure/`)
+
+The class of gap `doctor.js` and the dashboard's Hub Health panel both exist to close - a scheduled workflow failing silently with nobody watching (`health-report.yml`'s 401 sat undetected for 5 straight runs; `recursive-learning.yml` never ran once) - is still only caught by someone actually opening the Actions tab or the dashboard. A shared composite action (referenced by path, not published separately) posts a Slack-compatible webhook message the moment a job it's wired into actually fails, as that job's last step with `if: failure()`: `self-reflect.yml`, `recursive-learning.yml`, `prune-logs.yml`, `collect-issue-feedback.yml`, and `health-report.yml` all call it today.
+
+Opt-in and silent by design: an unset `ALERT_WEBHOOK_URL` repository secret is a no-op (the step logs that alerting isn't configured and exits 0) - it never turns a missing secret into a second failure on top of whatever actually went wrong. Set `ALERT_WEBHOOK_URL` under this repository's own Settings → Secrets and variables → Actions to a Slack incoming webhook URL to enable it (a Discord webhook also works if you append `/slack` to its URL - Discord's own compatibility mode for this exact payload shape). The notification itself failing to send (e.g. a bad/expired webhook URL) only logs a warning - it never masks or replaces the real job failure that triggered it.
+
+`scripts/health-report.js`'s CLI wrapper additionally treats a genuine per-spoke read failure (a real GitHub API error, not just a quiet "no findings this window") as a job failure via its exit code, specifically so this alerting actually fires for that class of problem instead of silently succeeding with a partial report.
+
 ### Pre-Flight Doctor Check (`scripts/doctor.js`)
 
 Checks exactly the class of bug found live in this repo's own history: a `GLOBAL_GITHUB_TOKEN` that's invalid or expired (`health-report.yml`'s 401, undetected through 5 straight runs before anyone noticed), and a spoke whose `call-hub.yml` has no hub-URL secret set at all (`thinkos-server`/`tais` failing 100+ scheduled runs on an unset `VERCEL_URL`) - both checkable in under a second per repo.
@@ -165,6 +173,18 @@ Validates: `GLOBAL_GITHUB_TOKEN` against `GET /rate_limit`, `AI_API_KEY`/`AI_BAS
 **Known, disclosed limitation:** GitHub never exposes a secret's *value* via any API, only its name and timestamps - the secret check above can only confirm something with the right name exists. It would have caught a fully-unset `VERCEL_URL`, but not one set to an empty string or a wrong value. That's a narrower net than "the exact incident," stated as such rather than papered over.
 
 **Deliberately `workflow_dispatch`-only, no schedule** - this project's own investigation into its health started because scheduled workflows were failing silently with nobody watching; adding another scheduled job here would risk the identical failure mode this tool exists to catch. Run it manually when setting up a new spoke, rotating a credential, or troubleshooting.
+
+### Continuous Deployment (`.github/workflows/deploy-vercel.yml`)
+
+Before this workflow, nothing in this repo ever auto-deployed anywhere - `api/` only ran if a human clicked "Deploy" in the Vercel dashboard. A push to `main` now deploys to production automatically; a pull request targeting `main` deploys a preview instead - which **is** this project's staging environment for the Vercel backend (a real, isolated deployment scoped to that PR, replaced on every push, rather than a separate long-lived environment to provision and keep in sync). Both paths run the same steps: `vercel pull` → `vercel build` → `vercel deploy --prebuilt`, then a smoke test (`scripts/smoke-test.js`) against a dedicated, credential-free `/api/health` route (`api/health.js` - deliberately never one of the AI-calling endpoints, which need real credentials and could have side effects) - checking both a healthy response and that the deployed response's `commit` field (Vercel auto-populates `VERCEL_GIT_COMMIT_SHA`) matches the commit that was actually pushed, so a stale/failed deploy can't silently pass as successful. A preview deploy's URL is posted back as a PR comment.
+
+Needs three new repository secrets beyond the ones in step 2 below - see [Setup Instructions](#setup-instructions) step 8.
+
+**Not live-verified end-to-end:** no Vercel account/token is reachable from this environment, so the `vercel` CLI sequence above has never actually run for real here. It follows Vercel's own documented CI recipe, but is flagged honestly as "should work per the documented interface," not "confirmed working" - the same disclosure standard applied to every other integration this project can't reach directly (e.g. the Stripe webhook's own smoke-test flag in `api/stripe_webhook.js`).
+
+**Known, disclosed limitation:** a pull request from a fork doesn't receive repository secrets (a GitHub security restriction, not a bug here), so preview deploys only work for PRs from branches within this same repository - fine for this project's current single-operator model.
+
+**Failure alerting is wired in for the production path only** - a failing preview deploy is already visible to whoever opened the PR, directly as a failing check; the silent-failure risk `ALERT_WEBHOOK_URL` (see [Failure Alerting](#failure-alerting-githubactionsnotify-on-failure) above) exists to close is specifically the unattended, post-merge production path.
 
 ## Setup Instructions
 
@@ -230,6 +250,18 @@ Set this under this repository's own Settings → Secrets and variables → Acti
 
 Unlike self-analysis, `.github/workflows/health-report.yml` doesn't call the Vercel deployment at all either - it's a plain Actions script that talks to GitHub directly, and needs the exact same `GLOBAL_GITHUB_TOKEN` secret as step 6 above. If you've already set that up for log pruning, health reporting works with no further setup.
 
+### 8. Enable Continuous Deployment (Vercel)
+
+`.github/workflows/deploy-vercel.yml` (see [Continuous Deployment](#continuous-deployment-githubworkflowsdeploy-vercelyml) above) needs three repository secrets beyond step 2's Vercel env vars - these authenticate the Vercel CLI itself, not the running application:
+
+| Secret | Value |
+|--------|-------|
+| `VERCEL_TOKEN` | A personal access token from Vercel's Account Settings → Tokens |
+| `VERCEL_ORG_ID` | Found in the linked project's `.vercel/project.json` after running `vercel link` locally once, or in Vercel Project Settings → General |
+| `VERCEL_PROJECT_ID` | Same source as `VERCEL_ORG_ID` |
+
+`VERCEL_BYPASS_TOKEN` (step 5 above) is reused automatically by the smoke-test step if the deployment has Deployment Protection enabled - no separate secret needed for that. Once these three are set, a push to `main` deploys to production and a pull request targeting `main` gets its own preview deploy - no further action needed.
+
 ### Alternative: Deploy Without Vercel (Google Apps Script)
 
 Everything in steps 1-2 above (the two AI-calling endpoints and their config) can run on Google Apps Script instead of Vercel, using the `gas/` directory instead of `api/`. The two most common reasons to prefer this: you don't have (or don't want) a Vercel account, or your Vercel deployment sits behind Deployment Protection and you can't get a bypass token - Apps Script Web Apps have no equivalent forced auth wall, so there's nothing to bypass.
@@ -250,6 +282,19 @@ Everything in steps 1-2 above (the two AI-calling endpoints and their config) ca
 **Live diagnostics, not just a form:** the page also validates `GLOBAL_GITHUB_TOKEN` and `AI_API_KEY` against the real APIs the moment it loads (a real, cheap call - `GET /rate_limit` for GitHub, `GET /models` for the AI provider) and shows a green "✓ valid" or red "✗ <reason>" next to each field. This exists because a bad `GLOBAL_GITHUB_TOKEN` sat undetected through 5 straight failed `health-report.yml` runs before anyone noticed - opening this page now catches that the moment you open it, instead of after N silent failures.
 
 **Verified locally, not yet live:** `scripts/dev-test-gas-*.mjs` cover the ported decision logic, the GitHub REST mapping, `Code.js`'s request routing, and the settings page's token gate/masking/allowlist behavior against hand-rolled fakes - the same testing discipline as everything else in this repo, and they already caught one real defect (`autonomous_agent.js`/`recursive_learning.js` both declaring the same constant, a silent `SyntaxError` the moment both files shared one real Apps Script project's scope) before any real deployment existed. What hasn't happened yet is an actual `clasp push` + live dispatch against a real Apps Script project - do that and confirm `dryRun: true` responses before pointing any spoke's schedule at it.
+
+**Continuous deployment (optional):** `.github/workflows/deploy-apps-script.yml` mirrors `deploy-vercel.yml` above for this backend - a push to `main` updates a production deployment, a pull request targeting `main` updates a separate, persistent staging deployment, both smoke-tested against `?endpoint=health` before being considered successful. Unlike Vercel, Apps Script has no concept of "redeploy the same URL automatically" - `clasp deploy -i <deploymentId>` updates a *specific, already-existing* deployment's code in place, which is what keeps its Web App URL stable across every CD run. That means two deployments need to exist up front (repeat step 5 above twice - once for production, once for staging - and note each one's deployment ID, visible in the Apps Script IDE's Deploy → Manage deployments screen, or via `clasp deployments`), plus these secrets on this repository:
+
+| Secret | Value |
+|--------|-------|
+| `CLASPRC_JSON` | Base64-encoded contents of `clasp login`'s own credential file (run `clasp login` once locally, then `base64 -i ~/.clasprc.json` or `base64 -i ~/.config/clasp/.clasprc.json` depending on your clasp version - see the workflow file's header comment for why it's written to both paths) |
+| `GAS_SCRIPT_ID` | The same scriptId as `gas/.clasp.json` (step 2 above) |
+| `GAS_PROD_DEPLOYMENT_ID` | The production deployment's ID from step 5 |
+| `GAS_STAGING_DEPLOYMENT_ID` | A second, separate deployment's ID (create it the same way as step 5, once, by hand) |
+| `GAS_WEB_APP_URL` | The production deployment's Web App URL |
+| `GAS_STAGING_WEB_APP_URL` | The staging deployment's Web App URL |
+
+**Not live-verified end-to-end** - no Google account/clasp credential is reachable from this environment, same disclosure as `deploy-vercel.yml`. A pull_request from a fork doesn't receive repository secrets either, so staging deploys only work for PRs from branches within this same repository.
 
 **Not removed:** `api/*.js` and the Vercel path stay in this repo untouched. Dropping Vercel entirely - deleting `api/`, `setup_hub.py`'s Vercel-flavored generation, the Vercel-specific docs above - is a deliberate follow-up once the Apps Script path has actually been verified live, not bundled into adding it.
 

@@ -26,3 +26,10 @@ jobs:
           # as a repo secret, with cross-repo write access to every spoke.
           GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
         run: node scripts/collect-issue-feedback.js
+
+      - name: Notify on failure
+        if: failure()
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Collect Issue Feedback'

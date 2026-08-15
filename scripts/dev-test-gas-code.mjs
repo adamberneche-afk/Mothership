@@ -1,9 +1,17 @@
-// Local verification harness for gas/Code.js's doPost() - the routing and
-// config-loading layer no other test covers. Since Code.js references
-// Apps Script-only globals (UrlFetchApp, PropertiesService, ContentService,
-// Utilities) that don't exist outside a real deployment, this seeds fakes
-// for all four into the same vm sandbox the harness uses to load the real
-// gas/*.js files, then drives doPost() exactly as the platform would.
+// Local verification harness for gas/Code.js's doPost()/doGet() - the
+// routing and config-loading layer no other test covers. Since Code.js
+// references Apps Script-only globals (UrlFetchApp, PropertiesService,
+// ContentService, HtmlService, Utilities) that don't exist outside a real
+// deployment, this seeds fakes for all five into the same vm sandbox the
+// harness uses to load the real gas/*.js files, then drives doPost()/
+// doGet() exactly as the platform would.
+//
+// doGet's ?endpoint=settings branch delegates to renderSettingsPage
+// (defined in settings.js, not loaded here) - a plain spy function is
+// seeded directly into the vm context instead of loading the real
+// settings.js, since that file's own logic already has dedicated coverage
+// in dev-test-gas-settings.mjs; this file only needs to prove doGet
+// delegates to it correctly, not re-test what it does.
 //
 // Usage: node scripts/dev-test-gas-code.mjs
 
@@ -100,14 +108,22 @@ const NO_FINDING_JSON = JSON.stringify({
 
 function loadCodeWithFakes({ props = {}, aiJsonContent = NO_FINDING_JSON, githubResponses = {} } = {}) {
   const urlFetchApp = makeFakeUrlFetchApp({ aiJsonContent, githubResponses });
+  let renderSettingsPageCalledWith = null;
   const seed = {
     UrlFetchApp: urlFetchApp,
     PropertiesService: makeFakePropertiesService(props),
     ContentService: makeFakeContentService(),
-    Utilities: makeFakeUtilities()
+    Utilities: makeFakeUtilities(),
+    // doGet's default/settings branches only - never touched by any
+    // existing doPost test above, so these fakes are inert for them.
+    HtmlService: { createHtmlOutput: (html) => ({ getContent: () => html }) },
+    renderSettingsPage: (token) => {
+      renderSettingsPageCalledWith = token;
+      return { getContent: () => 'fake settings page' };
+    }
   };
   const context = loadGasGlobals('constants.js', 'github.js', 'autonomous_agent.js', 'recursive_learning.js', 'Code.js', seed);
-  return { context, urlFetchApp };
+  return { context, urlFetchApp, getRenderSettingsPageCalledWith: () => renderSettingsPageCalledWith };
 }
 
 // A 404 for any GitHub content/commit lookup, and the AI returning
@@ -175,12 +191,51 @@ function testConfigIsReadFromScriptPropertiesNotHardcoded() {
   check('the Authorization header used the AI_API_KEY from Script Properties', aiCall?.options?.headers?.Authorization === 'Bearer secret-key');
 }
 
+function testHealthEndpointReturnsStatusOk() {
+  console.log('doGet(?endpoint=health) returns {status: "ok", timestamp} as JSON, with zero PropertiesService/UrlFetchApp calls - the Apps Script side of the new deploy-apps-script.yml smoke test target');
+  const { context, urlFetchApp } = loadCodeWithFakes();
+  const output = context.doGet({ parameter: { endpoint: 'health' } });
+  const body = JSON.parse(output._text);
+  check('status is ok', body.status === 'ok');
+  check('a real timestamp is present', typeof body.timestamp === 'string' && !isNaN(Date.parse(body.timestamp)));
+  check('served as JSON', output._mimeType === 'JSON');
+  check('zero network calls - a liveness check with no external dependency', urlFetchApp.calls.length === 0);
+}
+
+function testHealthEndpointNeverCallsSettingsLogic() {
+  console.log('the health endpoint never delegates to renderSettingsPage - it has no dependency on it at all');
+  const { context, getRenderSettingsPageCalledWith } = loadCodeWithFakes();
+  context.doGet({ parameter: { endpoint: 'health' } });
+  check('renderSettingsPage was never called', getRenderSettingsPageCalledWith() === null);
+}
+
+function testSettingsEndpointStillDelegatesCorrectly() {
+  console.log('doGet(?endpoint=settings) still delegates to renderSettingsPage with the given token - unaffected by adding the health route');
+  const { context, getRenderSettingsPageCalledWith } = loadCodeWithFakes();
+  const output = context.doGet({ parameter: { endpoint: 'settings', token: 'abc123' } });
+  check('delegated with the right token', getRenderSettingsPageCalledWith() === 'abc123');
+  check('returned settings content', output.getContent() === 'fake settings page');
+}
+
+function testUnknownEndpointFallsThroughToTheStaticMessage() {
+  console.log('an unknown/absent endpoint still falls through to the static "POST requests only" message, unaffected by adding the health route');
+  const { context } = loadCodeWithFakes();
+  const noParam = context.doGet({});
+  const unknownEndpoint = context.doGet({ parameter: { endpoint: 'something-else' } });
+  check('no endpoint at all', /POST requests only/.test(noParam.getContent()));
+  check('an unrecognized endpoint', /POST requests only/.test(unknownEndpoint.getContent()));
+}
+
 function main() {
   testDefaultsToAutonomousAgentWhenNoEndpointGiven();
   testExplicitEndpointRoutesToRecursiveLearning();
   testResponseBodyCarriesHttpStatusSinceApsScriptCannotSetARealOne();
   testMissingPostDataDoesNotThrow();
   testConfigIsReadFromScriptPropertiesNotHardcoded();
+  testHealthEndpointReturnsStatusOk();
+  testHealthEndpointNeverCallsSettingsLogic();
+  testSettingsEndpointStillDelegatesCorrectly();
+  testUnknownEndpointFallsThroughToTheStaticMessage();
 
   console.log('');
   if (failures > 0) {

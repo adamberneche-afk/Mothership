@@ -5,7 +5,7 @@
 //
 // Usage: node scripts/dev-test-health-report.mjs
 
-import { buildFullReport, buildReportForSpoke, renderReportMarkdown, publishReport } from './health-report.js';
+import { buildFullReport, buildReportForSpoke, renderReportMarkdown, publishReport, hasSpokeErrors } from './health-report.js';
 
 let failures = 0;
 
@@ -178,6 +178,42 @@ async function testEachSpokeIsReadWithItsOwnTenantCredentialWhenFactoryIsSupplie
   delete process.env.ACME_TEST_TOKEN;
 }
 
+async function testBuildFullReportRecordsAGenuineSpokeErrorWithoutAbortingTheRest() {
+  console.log('a spoke whose read genuinely fails (real API error, not just quiet) gets an .error entry, other spokes still report');
+  const brokenOctokit = {
+    issues: { listForRepo: async () => { throw new Error('ECONNRESET'); } },
+    repos: { getContent: async () => { throw new Error('should not be reached'); } }
+  };
+  const healthyOctokit = makeFakeOctokit({ issuesByRepo: { 'o/healthy': [] }, decisionLogByRepo: { 'o/healthy': [] } });
+  // octokitFactory routes the 'broken' spoke's own resolved tenant token to
+  // a fake octokit whose calls always throw - a real per-spoke read failure,
+  // not just an empty response - while 'healthy' resolves to a normal fake.
+  process.env.BROKEN_TEST_TOKEN = 'broken';
+  const octokitFactory = (token) => (token === 'broken' ? brokenOctokit : healthyOctokit);
+  const spokesOverride = [
+    { tenantId: 'broken-tenant', owner: 'o', repo: 'broken', addedAt: '2026-08-13T00:00:00Z', status: 'active' },
+    { tenantId: 'default', owner: 'o', repo: 'healthy', addedAt: '2026-08-13T00:00:00Z', status: 'active' }
+  ];
+  const tenantsOverride = [{ tenantId: 'broken-tenant', name: 'Broken', status: 'active', plan: 'trial', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:BROKEN_TEST_TOKEN', createdAt: '2026-08-13T00:00:00Z' }];
+  const report = await buildFullReport(healthyOctokit, { now: NOW, octokitFactory, spokesOverride, tenantsOverride });
+  const brokenReport = report.spokes.find((s) => s.repo === 'broken');
+  const healthyReport = report.spokes.find((s) => s.repo === 'healthy');
+  check('the broken spoke carries a real .error, not a silently-empty report', brokenReport && typeof brokenReport.error === 'string');
+  check('the healthy spoke still reports normally despite the other one failing', healthyReport && !healthyReport.error);
+  check('hasSpokeErrors is true for this report', hasSpokeErrors(report) === true);
+  delete process.env.BROKEN_TEST_TOKEN;
+}
+
+async function testHasSpokeErrorsIsFalseWhenEverySpokeIsJustQuiet() {
+  console.log('hasSpokeErrors is false when every spoke reported successfully, even with zero activity (quiet is not an error)');
+  const report = await buildFullReport(makeFakeOctokit({ issuesByRepo: { 'o/r': [] }, decisionLogByRepo: { 'o/r': [] } }), {
+    now: NOW,
+    spokesOverride: [{ tenantId: 'default', owner: 'o', repo: 'r', addedAt: '2026-08-13T00:00:00Z', status: 'active' }]
+  });
+  check('no spoke has an .error field', report.spokes.every((s) => !s.error));
+  check('hasSpokeErrors is false', hasSpokeErrors(report) === false);
+}
+
 async function main() {
   await testSpokeReportCountsAndStatusAreCorrect();
   await testDryRunOnlySpokeReportsDryRunStatus();
@@ -188,6 +224,8 @@ async function main() {
   await testPublishReportDoesNotTouchStateWhenAlreadyOpen();
   await testBuildFullReportUsesRealRegistryWithoutCrashing();
   await testEachSpokeIsReadWithItsOwnTenantCredentialWhenFactoryIsSupplied();
+  await testBuildFullReportRecordsAGenuineSpokeErrorWithoutAbortingTheRest();
+  await testHasSpokeErrorsIsFalseWhenEverySpokeIsJustQuiet();
 
   console.log('');
   if (failures > 0) {
