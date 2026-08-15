@@ -70,9 +70,10 @@ jobs:
             fi
           done
 
-          # spokes.json, universal_lessons.md, and north_star_framework.md are
-          # deliberately NOT checked above: setup_hub.py seeds those with
-          # fresh-install defaults, not a mirror of this repo's own live,
+          # spokes.json, tenants.json, plans.json, universal_lessons.md, and
+          # north_star_framework.md are deliberately NOT checked above:
+          # setup_hub.py seeds those with fresh-install defaults ([] for the
+          # three registries), not a mirror of this repo's own live,
           # accumulated state, so they're expected to diverge from this repo's
           # real copies - that's not drift, it's the installer doing its job.
           exit $drift

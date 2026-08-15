@@ -67,6 +67,40 @@ function testBuildInstallRedirectFailsClosedWithoutAppSlugConfigured() {
   delete process.env.ONBOARDING_STATE_SECRET;
 }
 
+const TEST_PLANS = [
+  { planId: 'starter', name: 'Starter', stripePriceId: 'price_starter', stripePaymentLinkUrl: 'https://buy.stripe.com/starter', reviewsPerMonth: 50 },
+  { planId: 'pro', name: 'Pro', stripePriceId: 'price_pro', stripePaymentLinkUrl: 'https://buy.stripe.com/pro', reviewsPerMonth: null }
+];
+
+function testBuildInstallRedirectCarriesAKnownPlanIdIntoTheStateToken() {
+  console.log('buildInstallRedirect encodes a valid ?plan= into the signed state token');
+  process.env.ONBOARDING_STATE_SECRET = 'onboard-start-plan-test';
+  const result = buildInstallRedirect({ generateId: () => 'fixed-id', env: { GITHUB_APP_SLUG: 'mothership-test-app' }, query: { plan: 'pro' }, plans: TEST_PLANS });
+  check('returns a 302', result.httpStatus === 302);
+  const stateParam = new URL(result.redirectUrl).searchParams.get('state');
+  const claims = verifyOnboardingToken(stateParam);
+  check('the state token carries the requested planId', claims && claims.planId === 'pro');
+  delete process.env.ONBOARDING_STATE_SECRET;
+}
+
+function testBuildInstallRedirectRejectsAnUnknownPlan() {
+  console.log('buildInstallRedirect rejects an unrecognized ?plan= rather than silently ignoring or defaulting it');
+  process.env.ONBOARDING_STATE_SECRET = 'onboard-start-unknown-plan-test';
+  const result = buildInstallRedirect({ env: { GITHUB_APP_SLUG: 'mothership-test-app' }, query: { plan: 'not-a-real-plan' }, plans: TEST_PLANS });
+  check('returns a 400, not a redirect', result.httpStatus === 400);
+  delete process.env.ONBOARDING_STATE_SECRET;
+}
+
+function testBuildInstallRedirectWithNoPlanOmitsPlanIdEntirely() {
+  console.log('buildInstallRedirect with no ?plan= at all carries no planId (backward-compatible, single-Payment-Link path)');
+  process.env.ONBOARDING_STATE_SECRET = 'onboard-start-no-plan-test';
+  const result = buildInstallRedirect({ env: { GITHUB_APP_SLUG: 'mothership-test-app' }, plans: TEST_PLANS });
+  const stateParam = new URL(result.redirectUrl).searchParams.get('state');
+  const claims = verifyOnboardingToken(stateParam);
+  check('no planId is present on the claims', !('planId' in claims));
+  delete process.env.ONBOARDING_STATE_SECRET;
+}
+
 // --- Tests: api/github_app_callback.js --------------------------------------
 
 async function testRejectsACraftedInstallationIdWithAForgedOrAbsentState() {
@@ -133,6 +167,27 @@ async function testValidInstallProceedsToStripeWithASignedCheckoutToken() {
   delete process.env.ONBOARDING_STATE_SECRET;
 }
 
+async function testValidInstallWithAPlanRedirectsToThatPlansOwnPaymentLink() {
+  console.log('a state token carrying a planId redirects to THAT plan\'s own Stripe Payment Link, re-validated against the current plans.json (not just trusted from the token)');
+  process.env.ONBOARDING_STATE_SECRET = 'callback-test-plan-redirect';
+  const fetchImpl = makeFakeFetch({ installationsById: { '555': { account: { login: 'plan-org' } } } });
+  const env = { GITHUB_APP_ID: 1, GITHUB_APP_PRIVATE_KEY: privateKey, STRIPE_PAYMENT_LINK_URL: 'https://buy.stripe.com/default-fallback' };
+  const state = signOnboardingToken({ onboardingId: 'ob-plan', planId: 'starter' });
+  const result = await handleInstallCallback({ installation_id: '555', setup_action: 'install', state }, { fetchImpl, env, plans: TEST_PLANS });
+  check("redirects to the starter plan's own Payment Link, not the default env var", result.redirectUrl.startsWith('https://buy.stripe.com/starter?client_reference_id='));
+  delete process.env.ONBOARDING_STATE_SECRET;
+}
+
+async function testPlanRemovedBetweenHopsFailsClosed() {
+  console.log('a planId carried in the state token that no longer matches any plan in plans.json (removed/renamed between the two hops) fails closed to the failure page, never falls back to a default');
+  process.env.ONBOARDING_STATE_SECRET = 'callback-test-plan-removed';
+  const fetchImpl = makeFakeFetch({ installationsById: { '666': { account: { login: 'stale-plan-org' } } } });
+  const env = { GITHUB_APP_ID: 1, GITHUB_APP_PRIVATE_KEY: privateKey, STRIPE_PAYMENT_LINK_URL: 'https://buy.stripe.com/default-fallback', ONBOARDING_FAILURE_URL: '/failed' };
+  const state = signOnboardingToken({ onboardingId: 'ob-stale', planId: 'plan-that-no-longer-exists' });
+  const result = await handleInstallCallback({ installation_id: '666', setup_action: 'install', state }, { fetchImpl, env, plans: TEST_PLANS });
+  check('rejected, never falls back to the default Payment Link', result.redirectUrl === '/failed');
+}
+
 async function testEveryRejectionPathReturnsTheIdenticalGenericFailureRedirect() {
   console.log('every rejection path returns the same generic redirect target regardless of which check failed (anti-fingerprinting)');
   process.env.ONBOARDING_STATE_SECRET = 'callback-test-generic-failure';
@@ -150,11 +205,16 @@ async function testEveryRejectionPathReturnsTheIdenticalGenericFailureRedirect()
 async function main() {
   testBuildInstallRedirectProducesAValidSignedStateToken();
   testBuildInstallRedirectFailsClosedWithoutAppSlugConfigured();
+  testBuildInstallRedirectCarriesAKnownPlanIdIntoTheStateToken();
+  testBuildInstallRedirectRejectsAnUnknownPlan();
+  testBuildInstallRedirectWithNoPlanOmitsPlanIdEntirely();
   await testRejectsACraftedInstallationIdWithAForgedOrAbsentState();
   await testRejectsAWellFormedButExpiredStateEvenWithARealInstallationId();
   await testFailsClosedWhenGithubReConfirmationErrors();
   await testSetupActionRequestIsPendingApprovalNotAFailure();
   await testValidInstallProceedsToStripeWithASignedCheckoutToken();
+  await testValidInstallWithAPlanRedirectsToThatPlansOwnPaymentLink();
+  await testPlanRemovedBetweenHopsFailsClosed();
   await testEveryRejectionPathReturnsTheIdenticalGenericFailureRedirect();
 
   console.log('');

@@ -42,6 +42,19 @@
     outline: 2px solid var(--teal); outline-offset: 2px; border-radius: 4px;
   }
   .footnote { margin: 16px 0 0; font-size: 0.8rem; text-align: center; }
+  /* Real multi-tier pricing: one row per plan, replacing the single fixed
+     CTA once plans.json loads client-side (same fetch pattern
+     dashboard/app.js already uses against api.github.com). Stacked rows,
+     not a side-by-side grid - stays legible at this card's narrow width
+     without a separate mobile layout. */
+  .plan-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 14px 0; border-bottom: 1px solid var(--line);
+  }
+  .plan-row:last-child { border-bottom: none; }
+  .plan-name { font-weight: 600; }
+  .plan-quota { font-size: 0.85rem; color: var(--ink-soft); }
+  .btn-compact { display: inline-block; width: auto; padding: 8px 16px; flex-shrink: 0; }
 </style>
 </head>
 <body>
@@ -53,8 +66,60 @@
       <li>Complete a short checkout to activate your subscription.</li>
       <li>You're done - Mothership starts covering your connected repos automatically.</li>
     </ol>
-    <a class="btn" href="/api/onboard_start">Install &amp; get started</a>
+    <!--
+      Fallback-first: the plain single CTA below renders immediately and
+      stays if the plans.json fetch below fails for any reason (network,
+      rate-limited, JS disabled) - a real tier comparison replaces it only
+      once real plan data actually loads, never leaving this page with
+      nothing to click.
+    -->
+    <div id="plans-container">
+      <a class="btn" href="/api/onboard_start">Install &amp; get started</a>
+    </div>
     <p class="footnote">No shared token - Mothership only ever gets access to what you install it on.</p>
   </div>
+  <script>
+    (async function () {
+      const container = document.getElementById('plans-container');
+      try {
+        const res = await fetch('https://api.github.com/repos/adamberneche-afk/Mothership/contents/plans.json', {
+          headers: { Accept: 'application/vnd.github.v3+json' }
+        });
+        if (!res.ok) return; // fail-soft - the fallback single CTA above stays as-is
+        const data = await res.json();
+        const plans = JSON.parse(atob(data.content.replace(/\n/g, '')));
+        if (!Array.isArray(plans) || plans.length === 0) return;
+
+        container.innerHTML = '';
+        for (const plan of plans) {
+          if (!plan || typeof plan.planId !== 'string' || typeof plan.name !== 'string') continue;
+          const row = document.createElement('div');
+          row.className = 'plan-row';
+
+          const info = document.createElement('div');
+          const name = document.createElement('div');
+          name.className = 'plan-name';
+          name.textContent = plan.name;
+          const quota = document.createElement('div');
+          quota.className = 'plan-quota';
+          quota.textContent = plan.reviewsPerMonth ? `${plan.reviewsPerMonth} reviews / month` : 'Unlimited reviews';
+          info.appendChild(name);
+          info.appendChild(quota);
+
+          const btn = document.createElement('a');
+          btn.className = 'btn btn-compact';
+          btn.href = `/api/onboard_start?plan=${encodeURIComponent(plan.planId)}`;
+          btn.textContent = `Choose ${plan.name}`;
+
+          row.appendChild(info);
+          row.appendChild(btn);
+          container.appendChild(row);
+        }
+      } catch (e) {
+        // Fail-soft, same as a non-2xx response above - the fallback single
+        // CTA already rendered stays exactly as it was.
+      }
+    })();
+  </script>
 </body>
 </html>

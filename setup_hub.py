@@ -30,6 +30,18 @@ def setup_hub():
             "path": "tenants.json",
             "content": "[]"
         },
+        {
+            # Real multi-tier pricing registry (see lib/secrets.js's
+            # loadPlansRegistry/findPlan/findPlanByStripePriceId). Starts
+            # empty - a fresh hub has no Stripe Prices/Payment Links
+            # created yet. The operator creates the real Stripe Prices/
+            # Payment Links by hand (a manual, business-side step, same
+            # pattern as GitHub App registration) and fills this file in to
+            # match before self-service onboarding can complete a checkout -
+            # see README's setup steps.
+            "path": "plans.json",
+            "content": "[]"
+        },
 
         # Canonical tenant-registry + credential-resolution helpers (see
         # lib/secrets.js's own header comment) - lives outside api/ and
@@ -65,6 +77,7 @@ import { mintInstallationToken } from './github_app.js';
 
 export const SPOKES_REGISTRY_PATH = 'spokes.json';
 export const TENANTS_REGISTRY_PATH = 'tenants.json';
+export const PLANS_REGISTRY_PATH = 'plans.json';
 export const DEFAULT_TENANT_ID = 'default';
 
 // Reads a hub-root JSON file straight off local disk (every Node caller of
@@ -90,6 +103,25 @@ export function loadSpokesRegistry() {
 
 export function loadTenantsRegistry() {
   return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
+}
+
+// plans.json (hub root, git-committed, non-secret - Stripe price IDs and
+// Payment Link URLs aren't sensitive, same reasoning tenants.json/
+// spokes.json already establish for config-as-committed-data) is the
+// source of truth for real multi-tier pricing: one entry per tier,
+// {planId, name, stripePriceId, stripePaymentLinkUrl, reviewsPerMonth}. The
+// operator creates the actual Stripe Prices/Payment Links by hand and fills
+// this in to match - see README's setup steps.
+export function loadPlansRegistry() {
+  return loadJsonArrayFromDisk(PLANS_REGISTRY_PATH);
+}
+
+export function findPlan(planId, plans) {
+  return plans.find(p => p && p.planId === planId) || null;
+}
+
+export function findPlanByStripePriceId(stripePriceId, plans) {
+  return plans.find(p => p && p.stripePriceId === stripePriceId) || null;
 }
 
 // Finds which tenant a given owner/repo belongs to. Falls back to
@@ -1613,17 +1645,36 @@ export default async function handler(req, res) {
 // GitHub, not just trusted from the query string) and a real payment are
 // confirmed - see api/github_app_callback.js's header comment for the
 // full sequencing rationale.
+//
+// Accepts an optional ?plan=<planId>, validated against plans.json and
+// carried forward inside the signed state token so
+// api/github_app_callback.js can redirect to that tier's own Stripe
+// Payment Link. This is a UX convenience only, never a trust boundary: a
+// client-chosen planId just selects WHICH Payment Link the browser is
+// redirected to next - Stripe's own hosted checkout page enforces the real
+// price for whichever link that is, so tampering with ?plan= can't get a
+// cheaper tier. api/stripe_webhook.js never trusts this value either; it
+// independently re-derives the actual purchased plan from the Stripe price
+// the customer really paid for.
 
 import { randomUUID } from 'crypto';
 import { signOnboardingToken } from '../lib/onboarding_token.js';
+import { loadPlansRegistry, findPlan } from '../lib/secrets.js';
 
-export function buildInstallRedirect({ now = Date.now(), generateId = randomUUID, env = process.env } = {}) {
+export function buildInstallRedirect({ now = Date.now(), generateId = randomUUID, env = process.env, query = {}, plans = loadPlansRegistry() } = {}) {
   const appSlug = env.GITHUB_APP_SLUG;
   if (!appSlug) {
     return { httpStatus: 500, body: { error: 'GITHUB_APP_SLUG is not configured' } };
   }
+  const requestedPlanId = query.plan;
+  let planId;
+  if (requestedPlanId) {
+    const plan = findPlan(requestedPlanId, plans);
+    if (!plan) return { httpStatus: 400, body: { error: `unknown plan '${requestedPlanId}'` } };
+    planId = plan.planId;
+  }
   const onboardingId = generateId();
-  const state = signOnboardingToken({ onboardingId }, { now });
+  const state = signOnboardingToken({ onboardingId, ...(planId ? { planId } : {}) }, { now });
   const redirectUrl = `https://github.com/apps/${appSlug}/installations/new?state=${encodeURIComponent(state)}`;
   return { httpStatus: 302, redirectUrl };
 }
@@ -1633,7 +1684,7 @@ export default async function handler(req, res) {
     res.status(405).json({ error: 'Method not allowed' });
     return;
   }
-  const result = buildInstallRedirect({});
+  const result = buildInstallRedirect({ query: req.query || {} });
   if (result.httpStatus === 302) {
     res.writeHead(302, { Location: result.redirectUrl });
     res.end();
@@ -1675,9 +1726,19 @@ export default async function handler(req, res) {
 // regardless of WHICH check failed (bad state vs malformed id vs GitHub
 // unreachable all look the same from outside) - so probing this URL can't
 // be used to fingerprint which defense exists or tripped.
+//
+// Real multi-tier pricing: an optional planId carried in the verified
+// state claims (chosen back at api/onboard_start.js) selects which of
+// plans.json's Payment Links to redirect to next - re-validated against
+// the CURRENT plans.json here, not just trusted as a bare string. This is
+// a UX convenience only, never a trust boundary: it picks which link the
+// browser visits, not what price is actually charged - Stripe's own
+// hosted checkout enforces that, and api/stripe_webhook.js independently
+// re-derives the real purchased plan from the real Stripe price.
 
 import { verifyOnboardingToken, signOnboardingToken } from '../lib/onboarding_token.js';
 import { confirmInstallationExists } from '../lib/github_app.js';
+import { loadPlansRegistry, findPlan } from '../lib/secrets.js';
 
 const INSTALLATION_ID_PATTERN = /^[1-9][0-9]{0,15}$/;
 
@@ -1689,7 +1750,7 @@ function pendingApprovalResult(env) {
   return { httpStatus: 302, redirectUrl: env.ONBOARDING_PENDING_APPROVAL_URL || '/onboarding-pending-approval.html' };
 }
 
-export async function handleInstallCallback(query, { now = Date.now(), fetchImpl = fetch, env = process.env } = {}) {
+export async function handleInstallCallback(query, { now = Date.now(), fetchImpl = fetch, env = process.env, plans = loadPlansRegistry() } = {}) {
   const { installation_id: installationId, setup_action: setupAction, state } = query || {};
 
   // GitHub sends setup_action: 'request' (no installation_id at all) when
@@ -1711,7 +1772,23 @@ export async function handleInstallCallback(query, { now = Date.now(), fetchImpl
   });
   if (!account) return failureResult(env); // revoked, App suspended, GitHub down, malformed config - fail closed, never proceed to payment
 
-  const paymentLinkUrl = env.STRIPE_PAYMENT_LINK_URL;
+  // The plan chosen back at api/onboard_start.js (if any) travels forward
+  // in the verified state claims - re-looked-up against the CURRENT
+  // plans.json (not just trusted as a bare string) so a plan removed/
+  // renamed between the two hops fails closed rather than redirecting
+  // somewhere stale. No planId at all (a pre-multi-tier link, or a client
+  // that skipped ?plan=) falls back to STRIPE_PAYMENT_LINK_URL for
+  // backward compatibility. Either way, this only ever selects WHICH
+  // Payment Link the browser is sent to next - Stripe's own hosted
+  // checkout enforces the real price for that link, and
+  // api/stripe_webhook.js independently re-derives the actual purchased
+  // plan from the real Stripe price, never from this choice.
+  let paymentLinkUrl = env.STRIPE_PAYMENT_LINK_URL;
+  if (claims.planId) {
+    const plan = findPlan(claims.planId, plans);
+    if (!plan || !plan.stripePaymentLinkUrl) return failureResult(env);
+    paymentLinkUrl = plan.stripePaymentLinkUrl;
+  }
   if (!paymentLinkUrl) return failureResult(env);
 
   // Carries the CONFIRMED installation identity forward - never re-derived
@@ -1764,6 +1841,15 @@ export default async function handler(req, res) {
 // intentionally avoids new dependencies; this is the one deliberate
 // exception.
 //
+// Real multi-tier pricing: the actual purchased plan is re-derived from
+// what Stripe says was really paid for (stripe.checkout.sessions.
+// listLineItems, matched against plans.json by Stripe price ID) - never
+// trusted from anything client-supplied. An unrecognized price (e.g. the
+// operator added a new Payment Link but forgot to update plans.json) does
+// NOT silently default to any plan - it's surfaced as 'UnrecognizedPrice'
+// for manual reconciliation, the same "disclosed gap over silent one"
+// treatment as the 'Unlinked' case below.
+//
 // Idempotency: Stripe can and does redeliver the same event (retries on
 // any non-2xx, and can occasionally redeliver even after a 200). The new
 // tenant's tenantId is DETERMINISTIC (`ghapp-<installationId>`, never
@@ -1784,19 +1870,12 @@ export default async function handler(req, res) {
 import Stripe from 'stripe';
 import { verifyOnboardingToken } from '../lib/onboarding_token.js';
 import { mintInstallationToken } from '../lib/github_app.js';
-import { appendToJsonRegistryWithRetry } from '../lib/registry_writer.js';
+import { appendToJsonRegistryWithRetry, readJsonArrayFile } from '../lib/registry_writer.js';
+import { loadPlansRegistry, findPlanByStripePriceId } from '../lib/secrets.js';
 
 export const config = { api: { bodyParser: false } };
 
 const MAX_BODY_BYTES = 1_000_000;
-
-// v1 scope: exactly one plan tier, one Stripe Payment Link - matches this
-// sprint's deliberate "single Checkout gate, not a full billing platform"
-// scope. Extending to multiple plans needs a per-price lookup (e.g. via
-// stripe.checkout.sessions.listLineItems) and is real, disclosed follow-up
-// work, not built here.
-const DEFAULT_PLAN = 'standard';
-const DEFAULT_QUOTA = { reviewsPerMonth: null };
 
 export function readRawBody(req, { maxBytes = MAX_BODY_BYTES } = {}) {
   return new Promise((resolve, reject) => {
@@ -1820,10 +1899,29 @@ function tenantIdForInstallation(installationId) {
   return `ghapp-${installationId}`;
 }
 
-async function provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId, hubOctokit, hubOwner, hubRepo, now }) {
+// Looks up the real plan the customer actually paid for, from Stripe's own
+// record of the checkout session's line items - never from anything the
+// client supplied. Returns the matching plans.json entry, or null if the
+// session has no resolvable price or that price doesn't match any known
+// plan (a real, disclosed gap - see handleStripeWebhook's 'UnrecognizedPrice'
+// result - never silently defaulted).
+async function resolvePlanForSession(stripe, sessionId, plans) {
+  let lineItems;
+  try {
+    lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { expand: ['data.price'] });
+  } catch (e) {
+    return null;
+  }
+  const firstItem = lineItems && lineItems.data && lineItems.data[0];
+  const priceId = firstItem && firstItem.price && firstItem.price.id;
+  if (!priceId) return null;
+  return findPlanByStripePriceId(priceId, plans);
+}
+
+async function provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId, plan, hubOctokit, hubOwner, hubRepo, now }) {
   const tenantId = tenantIdForInstallation(installationId);
   return appendToJsonRegistryWithRetry(hubOctokit, hubOwner, hubRepo, 'tenants.json', {
-    message: `chore: provision tenant for GitHub App installation ${installationId} (self-service onboarding)`,
+    message: `chore: provision tenant for GitHub App installation ${installationId} (self-service onboarding, plan ${plan.planId})`,
     decide: (existingTenants) => {
       const existing = existingTenants.find((t) => t && t.tenantId === tenantId);
       if (existing) return { skip: true, result: { status: 'AlreadyProvisioned', tenantId } };
@@ -1831,8 +1929,8 @@ async function provisionTenantForInstallation({ installationId, accountLogin, st
         tenantId,
         name: accountLogin,
         status: 'active',
-        plan: DEFAULT_PLAN,
-        quota: DEFAULT_QUOTA,
+        plan: plan.planId,
+        quota: { reviewsPerMonth: plan.reviewsPerMonth ?? null },
         githubCredentialRef: `ghapp:${installationId}`,
         installationId: Number(installationId),
         // Recorded for operator support/reconciliation (looking a tenant up
@@ -1901,7 +1999,8 @@ export async function handleStripeWebhook(rawBody, signatureHeader, {
   stripeClient,
   githubAppId = process.env.GITHUB_APP_ID,
   githubAppPrivateKey = process.env.GITHUB_APP_PRIVATE_KEY,
-  githubAppRequest
+  githubAppRequest,
+  plans = loadPlansRegistry()
 } = {}) {
   if (!stripeWebhookSecret) {
     return { httpStatus: 500, body: { error: 'STRIPE_WEBHOOK_SECRET is not configured' } };
@@ -1935,7 +2034,35 @@ export async function handleStripeWebhook(rawBody, signatureHeader, {
   }
 
   const { installationId, accountLogin } = claims;
-  const provisionResult = await provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId: session.customer, hubOctokit, hubOwner, hubRepo, now });
+  const tenantId = tenantIdForInstallation(installationId);
+
+  // Cheap, best-effort idempotency pre-check BEFORE spending a Stripe API
+  // call to resolve the plan: a redelivered/duplicate event for a tenant
+  // that's already provisioned must report AlreadyProvisioned regardless
+  // of whether the plan lookup below would succeed right now (a session's
+  // line items are not guaranteed to stay resolvable forever) - the actual
+  // write-path idempotency check inside provisionTenantForInstallation
+  // still re-verifies this atomically against a fresh read, so a race
+  // landing between this check and that one is still handled correctly,
+  // just possibly with one redundant plan lookup.
+  const { entries: existingTenants } = await readJsonArrayFile(hubOctokit, hubOwner, hubRepo, 'tenants.json');
+  if (existingTenants.some((t) => t && t.tenantId === tenantId)) {
+    return { httpStatus: 200, body: { status: 'AlreadyProvisioned', tenantId } };
+  }
+
+  const plan = await resolvePlanForSession(stripe, session.id, plans);
+  if (!plan) {
+    // A payment Stripe genuinely confirmed, but for a price that doesn't
+    // match any entry in plans.json - most likely the operator added a new
+    // Payment Link/Price without updating plans.json to match. Acked (not
+    // retried by Stripe) but never provisioned under a guessed/default
+    // plan - surfaced for manual reconciliation instead, same treatment as
+    // the 'Unlinked' case above.
+    console.warn(`stripe_webhook: checkout.session.completed (session ${session.id}) has no price matching any plan in plans.json - needs manual reconciliation`);
+    return { httpStatus: 200, body: { status: 'UnrecognizedPrice', reason: 'no plan in plans.json matches this session\\'s Stripe price' } };
+  }
+
+  const provisionResult = await provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId: session.customer, plan, hubOctokit, hubOwner, hubRepo, now });
 
   if (provisionResult.status === 'Provisioned') {
     const spokeResult = await autoRegisterSpokesForInstallation({
@@ -2919,7 +3046,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 // added safety.
 
 import { writeFileSync } from 'fs';
-import { loadTenantsRegistry, loadSpokesRegistry, resolveSecretRef } from '../lib/secrets.js';
+import { loadTenantsRegistry, loadSpokesRegistry, loadPlansRegistry, findPlan } from '../lib/secrets.js';
 
 const TENANT_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const CREDENTIAL_SCHEME_PATTERN = /^(env|ghapp|kv):(.*)$/;
@@ -2972,7 +3099,7 @@ function validateCredentialRefShape(ref, fieldName, errors) {
 
 // Pure validation, no I/O - takes the caller's already-loaded registries
 // so it's trivially testable and reusable from a dry-run.
-export function validateTenantInput(input, { existingTenants = [], existingSpokes = [] } = {}) {
+export function validateTenantInput(input, { existingTenants = [], existingSpokes = [], plans = [] } = {}) {
   const errors = [];
 
   if (!input.tenantId || !TENANT_ID_PATTERN.test(input.tenantId)) {
@@ -3000,14 +3127,30 @@ export function validateTenantInput(input, { existingTenants = [], existingSpoke
     errors.push('plan is required');
   }
 
+  // plan is validated against plans.json when it matches a known planId -
+  // its reviewsPerMonth auto-fills --quota unless explicitly overridden.
+  // An unrecognized plan name still isn't rejected outright - this CLI's
+  // whole design is "the operator is the trusted human," and a genuine
+  // custom/one-off deal is a real, supported use case - but with no known
+  // plan to inherit a quota from, --quota becomes required, so a typo'd
+  // plan name can't silently produce an unlimited-quota tenant nobody
+  // intended.
+  const planName = typeof input.plan === 'string' ? input.plan.trim() : '';
+  const matchedPlan = planName ? findPlan(planName, plans) : null;
+
+  const quotaExplicitlyProvided = input.quota !== undefined && input.quota !== null && input.quota !== '';
   let reviewsPerMonth = null;
-  if (input.quota !== undefined && input.quota !== null && input.quota !== '') {
+  if (quotaExplicitlyProvided) {
     const n = Number(input.quota);
     if (!Number.isInteger(n) || n < 1) {
       errors.push(`quota must be a positive integer or omitted for unlimited (got '${input.quota}')`);
     } else {
       reviewsPerMonth = n;
     }
+  } else if (matchedPlan) {
+    reviewsPerMonth = matchedPlan.reviewsPerMonth ?? null;
+  } else if (planName) {
+    errors.push(`plan '${planName}' is not a known plan in plans.json - pass --quota explicitly for a custom/one-off plan`);
   }
 
   validateCredentialRefShape(input.credentialRef, 'credential-ref', errors);
@@ -3048,7 +3191,7 @@ export function validateTenantInput(input, { existingTenants = [], existingSpoke
       tenantId: input.tenantId,
       name: input.name.trim(),
       status,
-      plan: input.plan.trim(),
+      plan: planName,
       quota: { reviewsPerMonth },
       githubCredentialRef: input.credentialRef,
       ...(input.callerKeyRef ? { callerKeyRef: input.callerKeyRef } : {}),
@@ -3060,8 +3203,8 @@ export function validateTenantInput(input, { existingTenants = [], existingSpoke
 
 // Pure - takes/returns data, never touches fs. The CLI block below does
 // the actual read-from-disk/write-to-disk.
-export function provisionTenant(input, { existingTenants = [], existingSpokes = [] } = {}) {
-  const validation = validateTenantInput(input, { existingTenants, existingSpokes });
+export function provisionTenant(input, { existingTenants = [], existingSpokes = [], plans = [] } = {}) {
+  const validation = validateTenantInput(input, { existingTenants, existingSpokes, plans });
   if (!validation.valid) return { status: 'Invalid', errors: validation.errors };
 
   const spokeEntries = validation.spokesToAdd.map((s) => ({
@@ -3116,7 +3259,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   if (input) {
     const existingTenants = loadTenantsRegistry();
     const existingSpokes = loadSpokesRegistry();
-    const result = provisionTenant(input, { existingTenants, existingSpokes });
+    const plans = loadPlansRegistry();
+    const result = provisionTenant(input, { existingTenants, existingSpokes, plans });
 
     if (result.status === 'Invalid') {
       console.error('Validation failed:');
