@@ -485,6 +485,59 @@ export async function updateJsonRegistryEntryWithRetry(octokit, owner, repo, pat
 }"""
         },
 
+        # Transactional email (suspension notice, portal-link requests) -
+        # see lib/email.js's own header comment for the fail-soft contract.
+        {
+            "path": "lib/email.js",
+            "content": """// Transactional email, used for two things: notifying a customer when
+// api/github_app_webhook.js suspends their tenant (they'd otherwise only
+// discover it when Mothership silently stops working), and delivering a
+// fresh Customer Portal link on request (see api/request_portal_link.js).
+//
+// resend (official npm package, simple HTTP API, generous free tier) is
+// the one deliberate new dependency for this - flagged as swappable if the
+// operator already has a preferred provider, since the actual integration
+// surface is one API call (`resend.emails.send`).
+//
+// Fail-soft by design, matching this project's existing "decision-log
+// writes are best-effort" convention (ai_decision_log.json,
+// usage/{tenantId}.json): a failed or misconfigured send is logged and
+// swallowed here - it must NEVER fail the webhook/request it's attached
+// to. A suspended tenant not getting an email is a real, but lesser, gap
+// than a webhook 500ing because a third-party mail API had a bad day.
+
+import { Resend } from 'resend';
+
+// Returns { sent: true } on success, or { sent: false, reason } on any
+// failure - missing config, a Resend API error, a network error - never
+// throws.
+export async function sendEmail({ to, subject, html }, {
+  apiKey = process.env.RESEND_API_KEY,
+  fromEmail = process.env.NOTIFICATION_FROM_EMAIL,
+  resendClient
+} = {}) {
+  if (!to || !subject || !html) {
+    return { sent: false, reason: 'to/subject/html are all required' };
+  }
+  if (!apiKey || !fromEmail) {
+    console.warn(`lib/email.js: RESEND_API_KEY/NOTIFICATION_FROM_EMAIL not configured - email to ${to} ("${subject}") was not sent`);
+    return { sent: false, reason: 'not configured' };
+  }
+  const client = resendClient || new Resend(apiKey);
+  try {
+    const result = await client.emails.send({ from: fromEmail, to, subject, html });
+    if (result && result.error) {
+      console.warn(`lib/email.js: Resend rejected the send to ${to}: ${result.error.message || result.error}`);
+      return { sent: false, reason: result.error.message || String(result.error) };
+    }
+    return { sent: true };
+  } catch (e) {
+    console.warn(`lib/email.js: failed to send email to ${to}: ${e.message}`);
+    return { sent: false, reason: e.message };
+  }
+}"""
+        },
+
         # 2. THE CENTRAL INTELLIGENCE (Vercel Worker)
         {
             "path": "api/autonomous_agent.js",
@@ -2122,9 +2175,23 @@ export default async function handler(req, res) {
 // (`github_app_uninstalled`) - never silently undoes a status an operator
 // set manually for an unrelated reason (e.g. non-payment, abuse). An
 // operator's manual suspension always wins.
+//
+// A suspended tenant otherwise gets zero notification of any kind - they'd
+// only discover it when Mothership silently stops working. On a genuinely
+// new suspension (never on AlreadySuspended - no point re-notifying), this
+// resolves the tenant's email via Stripe (their stripeCustomerId is
+// already recorded on the tenant record from api/stripe_webhook.js's
+// provisioning) and sends a calm, specific, actionable notice via
+// lib/email.js. Fail-soft throughout, matching that module's own
+// contract: a Stripe lookup failure or an email-send failure is logged and
+// swallowed, never turned into a failure of this webhook's own response -
+// a customer not getting an email is a real, but lesser, gap than this
+// webhook 500ing over a third-party API having a bad day.
 
 import { createHmac, timingSafeEqual } from 'crypto';
+import Stripe from 'stripe';
 import { updateJsonRegistryEntryWithRetry } from '../lib/registry_writer.js';
+import { sendEmail } from '../lib/email.js';
 
 export const config = { api: { bodyParser: false } };
 
@@ -2158,11 +2225,48 @@ export function verifyGithubWebhookSignature(rawBody, signatureHeader, secret) {
   return timingSafeEqual(provided, expectedBuf);
 }
 
+// Pure - the actual email content, built as its own function so it's
+// testable without a real Stripe client or mail send.
+export function buildSuspensionEmail(tenant, { dashboardBaseUrl = process.env.DASHBOARD_BASE_URL } = {}) {
+  const reinstallLine = dashboardBaseUrl
+    ? `Reinstall the GitHub App from <a href="${dashboardBaseUrl}/install.html">the install page</a> to restore access.`
+    : 'Reinstall the GitHub App on your GitHub organization to restore access.';
+  return {
+    subject: 'Your Mothership access has been suspended',
+    html: `<p>Hi${tenant.name ? ` ${tenant.name}` : ''},</p>
+<p>Mothership's access to your repositories was suspended because the GitHub App was uninstalled or suspended on GitHub's side.</p>
+<p>${reinstallLine} If this wasn't you, or you have questions, just reply to this email.</p>`
+  };
+}
+
+// Best-effort, never throws - see this file's header comment for the
+// fail-soft contract. Returns the same {sent, reason?} shape
+// lib/email.js's sendEmail already uses, plus a distinguishable
+// 'no stripeCustomerId'/'no email on file' reason for the cases that never
+// even reach sendEmail.
+async function notifySuspendedTenant(tenant, { stripeClient, sendEmailImpl = sendEmail, dashboardBaseUrl } = {}) {
+  if (!tenant.stripeCustomerId) return { sent: false, reason: 'tenant has no stripeCustomerId on record' };
+  try {
+    const customer = await stripeClient.customers.retrieve(tenant.stripeCustomerId);
+    if (!customer || customer.deleted || !customer.email) {
+      return { sent: false, reason: 'no email on file for this Stripe customer' };
+    }
+    const { subject, html } = buildSuspensionEmail(tenant, { dashboardBaseUrl });
+    return await sendEmailImpl({ to: customer.email, subject, html });
+  } catch (e) {
+    return { sent: false, reason: e.message };
+  }
+}
+
 export async function handleGithubAppWebhook(rawBody, signatureHeader, {
   webhookSecret = process.env.GITHUB_APP_WEBHOOK_SECRET,
   hubOctokit,
   hubOwner = process.env.HUB_GITHUB_OWNER || 'adamberneche-afk',
-  hubRepo = process.env.HUB_GITHUB_REPO || 'Mothership'
+  hubRepo = process.env.HUB_GITHUB_REPO || 'Mothership',
+  stripeClient,
+  stripeSecretKey = process.env.STRIPE_SECRET_KEY,
+  sendEmailImpl = sendEmail,
+  dashboardBaseUrl = process.env.DASHBOARD_BASE_URL
 } = {}) {
   if (!verifyGithubWebhookSignature(rawBody, signatureHeader, webhookSecret)) {
     return { httpStatus: 400, body: { error: 'invalid signature' } };
@@ -2193,7 +2297,15 @@ export async function handleGithubAppWebhook(rawBody, signatureHeader, {
       }
     });
     if (!result.found) return { httpStatus: 200, body: { status: 'Ignored', reason: `no tenant found for installation ${installationId}` } };
-    return { httpStatus: 200, body: { status: result.changed ? 'Suspended' : 'AlreadySuspended', tenantId } };
+    let notification;
+    if (result.changed) {
+      // Only on a genuinely NEW suspension - never re-notify on
+      // AlreadySuspended, and never let this delay or fail the response
+      // above (the tenants.json write already succeeded).
+      const stripe = stripeClient || new Stripe(stripeSecretKey || 'sk_missing');
+      notification = await notifySuspendedTenant(result.entry, { stripeClient: stripe, sendEmailImpl, dashboardBaseUrl });
+    }
+    return { httpStatus: 200, body: { status: result.changed ? 'Suspended' : 'AlreadySuspended', tenantId, ...(notification ? { notification } : {}) } };
   }
 
   // event.action === 'unsuspend'
@@ -3589,7 +3701,7 @@ jobs:
         # 5. INFRASTRUCTURE
         {
             "path": "package.json",
-            "content": "{\n  \"name\": \"ai-cto-hub\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"test\": \"for f in scripts/dev-test-*.mjs; do node \\\"$f\\\" || exit 1; done\"\n  },\n  \"dependencies\": {\n    \"@octokit/auth-app\": \"^6.1.4\",\n    \"@octokit/rest\": \"^19.0.0\",\n    \"stripe\": \"^17.7.0\"\n  }\n}",
+            "content": "{\n  \"name\": \"ai-cto-hub\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"test\": \"for f in scripts/dev-test-*.mjs; do node \\\"$f\\\" || exit 1; done\"\n  },\n  \"dependencies\": {\n    \"@octokit/auth-app\": \"^6.1.4\",\n    \"@octokit/rest\": \"^19.0.0\",\n    \"resend\": \"^4.8.0\",\n    \"stripe\": \"^17.7.0\"\n  }\n}",
         },
         {
             "path": ".gitignore",

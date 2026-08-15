@@ -53,7 +53,7 @@ jobs:
 
           drift=0
           for f in \
-            lib/secrets.js lib/github_app.js lib/onboarding_token.js lib/registry_writer.js \
+            lib/secrets.js lib/github_app.js lib/onboarding_token.js lib/registry_writer.js lib/email.js \
             api/autonomous_agent.js api/recursive_learning.js \
             api/onboard_start.js api/github_app_callback.js api/stripe_webhook.js api/github_app_webhook.js \
             scripts/prune-logs.js scripts/health-report.js scripts/collect-issue-feedback.js \

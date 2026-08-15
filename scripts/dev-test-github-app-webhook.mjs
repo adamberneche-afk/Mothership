@@ -4,7 +4,7 @@
 // Usage: node scripts/dev-test-github-app-webhook.mjs
 
 import { createHmac } from 'crypto';
-import { handleGithubAppWebhook, verifyGithubWebhookSignature, readRawBody } from './../api/github_app_webhook.js';
+import { handleGithubAppWebhook, verifyGithubWebhookSignature, readRawBody, buildSuspensionEmail } from './../api/github_app_webhook.js';
 
 let failures = 0;
 
@@ -137,6 +137,92 @@ async function testTamperedRequestNeverReachesTheRegistry() {
   check('no registry access happened at all', hubOctokit.calls.getContent.length === 0 && hubOctokit.calls.createOrUpdateFileContents.length === 0);
 }
 
+function makeFakeStripeClient({ email, deleted = false, throwError } = {}) {
+  const calls = [];
+  return {
+    calls,
+    customers: {
+      retrieve: async (customerId) => {
+        calls.push(customerId);
+        if (throwError) throw throwError;
+        if (!email) return { id: customerId, deleted: true };
+        return { id: customerId, deleted, email };
+      }
+    }
+  };
+}
+
+function makeFakeSendEmail(result = { sent: true }) {
+  const calls = [];
+  const impl = async (payload) => {
+    calls.push(payload);
+    return result;
+  };
+  impl.calls = calls;
+  return impl;
+}
+
+async function testNewSuspensionSendsANotificationEmailToTheStripeCustomer() {
+  console.log('a genuinely new suspension resolves the tenant\'s email via Stripe and sends a real notification email');
+  const { rawBody, signatureHeader } = signedEvent(installationEvent('deleted', 77777));
+  const hubOctokit = makeFakeHubOctokitWithTenants([{ tenantId: 'ghapp-77777', name: 'Acme Corp', status: 'active', plan: 'standard', quota: { reviewsPerMonth: null }, githubCredentialRef: 'ghapp:77777', installationId: 77777, stripeCustomerId: 'cus_acme', createdAt: '2026-08-13T00:00:00Z' }]);
+  const stripeClient = makeFakeStripeClient({ email: 'billing@acme.example' });
+  const sendEmailImpl = makeFakeSendEmail({ sent: true });
+  const result = await handleGithubAppWebhook(rawBody, signatureHeader, { webhookSecret: WEBHOOK_SECRET, hubOctokit, stripeClient, sendEmailImpl });
+  check('reports Suspended', result.body.status === 'Suspended');
+  check('the tenant\'s stripeCustomerId was looked up', stripeClient.calls[0] === 'cus_acme');
+  check('an email was sent to the customer\'s address on file', sendEmailImpl.calls.length === 1 && sendEmailImpl.calls[0].to === 'billing@acme.example');
+  check('the notification result is surfaced in the response', result.body.notification && result.body.notification.sent === true);
+}
+
+async function testAlreadySuspendedNeverReNotifies() {
+  console.log('a redelivered/duplicate suspend event for an ALREADY-suspended tenant never sends a second email');
+  const { rawBody, signatureHeader } = signedEvent(installationEvent('suspend', 88888));
+  const hubOctokit = makeFakeHubOctokitWithTenants([{ tenantId: 'ghapp-88888', name: 'Acme', status: 'suspended', suspendedReason: 'github_app_uninstalled', plan: 'standard', quota: { reviewsPerMonth: null }, githubCredentialRef: 'ghapp:88888', installationId: 88888, stripeCustomerId: 'cus_already', createdAt: '2026-08-13T00:00:00Z' }]);
+  const stripeClient = makeFakeStripeClient({ email: 'billing@acme.example' });
+  const sendEmailImpl = makeFakeSendEmail();
+  const result = await handleGithubAppWebhook(rawBody, signatureHeader, { webhookSecret: WEBHOOK_SECRET, hubOctokit, stripeClient, sendEmailImpl });
+  check('reports AlreadySuspended', result.body.status === 'AlreadySuspended');
+  check('Stripe was never even queried', stripeClient.calls.length === 0);
+  check('no email was sent', sendEmailImpl.calls.length === 0);
+  check('no notification field on the response for a no-op', result.body.notification === undefined);
+}
+
+async function testMissingStripeCustomerIdNeverCallsStripeOrEmail() {
+  console.log('a tenant with no stripeCustomerId on record (e.g. provisioned by scripts/provision-tenant.js, not self-service) skips notification cleanly, never calling Stripe or the mail client');
+  const { rawBody, signatureHeader } = signedEvent(installationEvent('deleted', 99999));
+  const hubOctokit = makeFakeHubOctokitWithTenants([{ tenantId: 'ghapp-99999', name: 'Manual Tenant', status: 'active', plan: 'standard', quota: { reviewsPerMonth: null }, githubCredentialRef: 'ghapp:99999', installationId: 99999, createdAt: '2026-08-13T00:00:00Z' }]);
+  const stripeClient = makeFakeStripeClient({ email: 'unused@example.com' });
+  const sendEmailImpl = makeFakeSendEmail();
+  const result = await handleGithubAppWebhook(rawBody, signatureHeader, { webhookSecret: WEBHOOK_SECRET, hubOctokit, stripeClient, sendEmailImpl });
+  check('reports Suspended (the tenant write itself is unaffected)', result.body.status === 'Suspended');
+  check('Stripe was never queried', stripeClient.calls.length === 0);
+  check('no email was sent', sendEmailImpl.calls.length === 0);
+  check('the notification result names the reason', result.body.notification.sent === false && /stripeCustomerId/.test(result.body.notification.reason));
+}
+
+async function testStripeLookupFailureNeverFailsTheWebhookResponse() {
+  console.log('a Stripe API error while resolving the customer email is swallowed - the suspend response itself still succeeds');
+  const { rawBody, signatureHeader } = signedEvent(installationEvent('deleted', 11111));
+  const hubOctokit = makeFakeHubOctokitWithTenants([{ tenantId: 'ghapp-11111', name: 'Flaky Stripe Org', status: 'active', plan: 'standard', quota: { reviewsPerMonth: null }, githubCredentialRef: 'ghapp:11111', installationId: 11111, stripeCustomerId: 'cus_flaky', createdAt: '2026-08-13T00:00:00Z' }]);
+  const stripeClient = makeFakeStripeClient({ throwError: new Error('Stripe API is down') });
+  const sendEmailImpl = makeFakeSendEmail();
+  const result = await handleGithubAppWebhook(rawBody, signatureHeader, { webhookSecret: WEBHOOK_SECRET, hubOctokit, stripeClient, sendEmailImpl });
+  check('the tenant write and response still succeed despite the Stripe failure', result.httpStatus === 200 && result.body.status === 'Suspended');
+  check('the tenant really is suspended in the registry', hubOctokit.files['tenants.json'].content.find(t => t.tenantId === 'ghapp-11111').status === 'suspended');
+  check('the notification failure is surfaced, not thrown', result.body.notification.sent === false && /Stripe API is down/.test(result.body.notification.reason));
+  check('no email was attempted', sendEmailImpl.calls.length === 0);
+}
+
+function testBuildSuspensionEmailMentionsTheTenantAndAReinstallPath() {
+  console.log('buildSuspensionEmail produces calm, specific, actionable copy naming the tenant and a way to fix it');
+  const withDashboard = buildSuspensionEmail({ name: 'Acme Corp' }, { dashboardBaseUrl: 'https://mothership.example.com' });
+  check('greets the tenant by name', withDashboard.html.includes('Acme Corp'));
+  check('links to the real install page when a dashboard URL is configured', withDashboard.html.includes('https://mothership.example.com/install.html'));
+  const withoutDashboard = buildSuspensionEmail({ name: 'Acme Corp' }, { dashboardBaseUrl: undefined });
+  check('falls back to plain-text reinstall guidance without a broken/guessed link when no dashboard URL is configured', !withoutDashboard.html.includes('<a href') && /reinstall/i.test(withoutDashboard.html));
+}
+
 async function testReadRawBodyRejectsOversizedPayload() {
   console.log('readRawBody rejects a body over the max-byte cap');
   const { Readable } = await import('stream');
@@ -161,6 +247,11 @@ async function main() {
   await testUnsuspendNeverOverridesAManualSuspension();
   await testUnrecognizedActionAcksWithoutWriting();
   await testTamperedRequestNeverReachesTheRegistry();
+  await testNewSuspensionSendsANotificationEmailToTheStripeCustomer();
+  await testAlreadySuspendedNeverReNotifies();
+  await testMissingStripeCustomerIdNeverCallsStripeOrEmail();
+  await testStripeLookupFailureNeverFailsTheWebhookResponse();
+  testBuildSuspensionEmailMentionsTheTenantAndAReinstallPath();
   await testReadRawBodyRejectsOversizedPayload();
 
   console.log('');
