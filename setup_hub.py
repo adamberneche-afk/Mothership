@@ -1191,6 +1191,44 @@ export default async function handler(req, res) {
   }
 }"""
         },
+        {
+            # Dedicated, credential-free liveness route for the CD pipelines'
+            # post-deploy smoke test (scripts/smoke-test.js) - deliberately
+            # never one of the AI-calling endpoints above, which need real
+            # credentials and could have side effects.
+            "path": "api/health.js",
+            "content": """// Minimal liveness endpoint - confirms the deployment is up and responding
+// to real HTTP requests, with zero external dependencies (no GitHub call,
+// no AI call, no credentials needed at all, no side effects). This is
+// what .github/workflows/deploy-vercel.yml's post-deploy smoke test
+// (scripts/smoke-test.js) hits before considering a deploy successful -
+// deliberately NOT smoke-testing api/autonomous_agent.js/
+// api/recursive_learning.js directly, since those need real GitHub/AI
+// credentials to do anything meaningful and could have side effects; a
+// dedicated liveness endpoint is the standard, safe pattern instead.
+//
+// Includes the deployed commit SHA - Vercel sets VERCEL_GIT_COMMIT_SHA
+// automatically on every deployment - so a smoke test (or a human) can
+// confirm a deploy actually shipped the EXPECTED commit, not just that
+// something is listening on the URL.
+
+export function buildHealthResponse({ now = Date.now(), env = process.env } = {}) {
+  return {
+    status: 'ok',
+    timestamp: new Date(now).toISOString(),
+    commit: env.VERCEL_GIT_COMMIT_SHA || null
+  };
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  res.status(200).json(buildHealthResponse({}));
+}
+"""
+        },
 
         # 3. MEMORY MANAGEMENT
         {
@@ -1613,6 +1651,16 @@ async function findExistingReportIssue(octokit) {
 // disaster this whole system exists to avoid repeating. Always uses the
 // hub's own credential (never a tenant-scoped one) - this issue lives on
 // the hub repo itself.
+// A per-spoke `.error` (set in buildFullReport's catch block) means a real
+// fetch/API failure happened for that spoke - distinct from a spoke that's
+// just quiet (0 issues, 0 decisions, both legitimate report values, not
+// errors). Exported and tested directly, per this project's
+// testable-core/thin-CLI-shell convention, rather than inlined only in the
+// CLI guard block below.
+export function hasSpokeErrors(report) {
+  return report.spokes.some((s) => s && s.error);
+}
+
 export async function publishReport(octokit, body) {
   const existing = await findExistingReportIssue(octokit);
   if (existing) {
@@ -1642,12 +1690,25 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       console.log(body);
       const result = await publishReport(octokit, body);
       console.log(JSON.stringify(result));
+
+      // The report itself still gets published either way (best-effort,
+      // matching this project's "a failing spoke's read shouldn't block
+      // reporting on the rest" design) - but the job must exit non-zero when
+      // hasSpokeErrors is true, so the notify-on-failure step in
+      // health-report.yml actually fires for this class of problem, instead
+      // of a genuine per-spoke failure silently reading as a successful run.
+      if (hasSpokeErrors(report)) {
+        const erroredSpokes = report.spokes.filter((s) => s && s.error);
+        console.error(`${erroredSpokes.length} spoke(s) failed to report: ${erroredSpokes.map((s) => `${s.owner}/${s.repo}`).join(', ')}`);
+        process.exitCode = 1;
+      }
     })
     .catch((err) => {
       console.error(err);
       process.exitCode = 1;
     });
-}"""
+}
+"""
         },
 
         {
@@ -2065,11 +2126,180 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 }"""
         },
 
+        {
+            "path": "scripts/smoke-test.js",
+            "content": """// Post-deploy smoke test - confirms a freshly-deployed hub endpoint is
+// actually alive and responding before a CD pipeline (deploy-vercel.yml/
+// deploy-apps-script.yml) considers the deploy successful. Hits the
+// dedicated /health (Vercel) or ?endpoint=health (Apps Script) liveness
+// route - see api/health.js/gas/Code.js's renderHealthResponse for what
+// it's checking - never the AI-calling endpoints, which need real
+// credentials to do anything meaningful and could have side effects.
+//
+// Retries a few times with a short delay before giving up, rather than
+// failing on the first non-2xx/mismatch: a brief propagation lag right
+// after a deploy completes (edge-cache warmup, DNS, an Apps Script
+// deployment version taking a moment to become the active one) is normal,
+// expected behavior, not a real problem - treating a single transient
+// blip as a hard CI failure would create exactly the kind of noisy
+// false-failure this project has been careful to avoid elsewhere (see
+// doctor.js's deliberately narrow, honestly-scoped checks).
+//
+// Usage: node scripts/smoke-test.js <url> [expectedCommit]
+//   node scripts/smoke-test.js https://mothership.example.com/api/health abc1234
+//   node scripts/smoke-test.js "https://script.google.com/macros/s/.../exec?endpoint=health"
+
+const TIMEOUT_MS = 15000;
+const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_RETRY_DELAY_MS = 3000;
+
+// Single attempt - no retry logic here, so tests can assert exact
+// pass/fail behavior for one call without needing to reason about timing.
+export async function checkHealth(url, { fetchImpl = fetch, timeoutMs = TIMEOUT_MS, expectedCommit, headers } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetchImpl(url, { signal: controller.signal, headers });
+  } catch (e) {
+    return { ok: false, reason: e.name === 'AbortError' ? `timed out after ${timeoutMs}ms` : e.message };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!res.ok) {
+    return { ok: false, reason: `HTTP ${res.status}` };
+  }
+
+  let body;
+  try {
+    body = await res.json();
+  } catch (e) {
+    return { ok: false, reason: 'response was not valid JSON' };
+  }
+
+  if (body.status !== 'ok') {
+    return { ok: false, reason: `unexpected response body: ${JSON.stringify(body)}` };
+  }
+
+  // Apps Script's health response has no `commit` field at all (a real,
+  // disclosed platform difference - see gas/Code.js's renderHealthResponse
+  // comment) - only compared when both an expectation and a real value
+  // exist to compare against.
+  if (expectedCommit && body.commit && body.commit !== expectedCommit) {
+    return { ok: false, reason: `deployed commit ${body.commit} does not match expected ${expectedCommit}` };
+  }
+
+  return { ok: true, body };
+}
+
+// Retries checkHealth up to maxAttempts times, returning as soon as one
+// attempt succeeds - the actual entry point the CLI/CD pipeline uses.
+export async function checkHealthWithRetry(url, {
+  fetchImpl = fetch,
+  timeoutMs = TIMEOUT_MS,
+  expectedCommit,
+  headers,
+  maxAttempts = DEFAULT_MAX_ATTEMPTS,
+  delayMs = DEFAULT_RETRY_DELAY_MS,
+  sleepImpl = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+} = {}) {
+  let lastResult;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    lastResult = await checkHealth(url, { fetchImpl, timeoutMs, expectedCommit, headers });
+    if (lastResult.ok) return lastResult;
+    if (attempt < maxAttempts - 1) await sleepImpl(delayMs);
+  }
+  return lastResult;
+}
+
+// --- CLI-only from here down ------------------------------------------------
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const [url, expectedCommit] = process.argv.slice(2);
+  if (!url) {
+    console.error('Usage: node scripts/smoke-test.js <url> [expectedCommit]');
+    process.exitCode = 1;
+  } else {
+    // Generic (not Vercel-specific) escape hatch for a platform that needs
+    // one extra header to reach its own health route - e.g. Vercel
+    // Deployment Protection's bypass header, set by deploy-vercel.yml via
+    // SMOKE_TEST_HEADER_NAME/VALUE. Both must be non-empty, or no header is
+    // sent at all - matches every other caller of VERCEL_BYPASS_TOKEN in
+    // this repo, where an unset value means "no protection, nothing to add."
+    const headers = (process.env.SMOKE_TEST_HEADER_NAME && process.env.SMOKE_TEST_HEADER_VALUE)
+      ? { [process.env.SMOKE_TEST_HEADER_NAME]: process.env.SMOKE_TEST_HEADER_VALUE }
+      : undefined;
+    checkHealthWithRetry(url, { expectedCommit, headers })
+      .then((result) => {
+        if (result.ok) {
+          console.log(`OK - ${url} is healthy: ${JSON.stringify(result.body)}`);
+        } else {
+          console.error(`FAIL - ${url} did not become healthy: ${result.reason}`);
+          process.exitCode = 1;
+        }
+      })
+      .catch((err) => {
+        console.error(err);
+        process.exitCode = 1;
+      });
+  }
+}
+"""
+        },
+
         # 4. AUTOMATION (GitHub Actions workflows - self-reflect, maintenance,
         # health reporting, recursive learning). Without these, api/*.js and
         # scripts/*.js above are never actually invoked on any schedule - a
         # freshly-scaffolded hub would otherwise deploy successfully to Vercel
         # and sit there completely inert.
+        {
+            # Composite action referenced by path (uses: ./.github/actions/...)
+            # from every scheduled workflow below that opts into failure
+            # alerting - avoids duplicating the same alert-webhook logic six
+            # times over.
+            "path": ".github/actions/notify-on-failure/action.yml",
+            "content": """name: 'Notify on Failure'
+description: >-
+  Posts a Slack-compatible webhook message when the calling job has
+  failed. Opt-in and silent by design: a missing/empty webhook-url is a
+  no-op, never a job failure of its own - alerting is a real, disclosed
+  gap when unconfigured, not a hard requirement. Add as the LAST step in
+  a job, with `if: failure()`, so it only ever fires once something has
+  already actually gone wrong.
+inputs:
+  webhook-url:
+    description: >-
+      Slack-compatible incoming webhook URL (the ALERT_WEBHOOK_URL
+      secret). A Discord webhook also works if you append /slack to its
+      URL - Discord's own compatibility mode for this exact payload
+      shape. Empty/unset = no-op.
+    required: false
+    default: ''
+  workflow-name:
+    description: 'Human-readable label for which workflow/job failed, shown in the alert.'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      run: |
+        if [ -z "${{ inputs.webhook-url }}" ]; then
+          echo "ALERT_WEBHOOK_URL not configured - skipping failure notification (see README's Deployment & Maintenance section)."
+          exit 0
+        fi
+        RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        PAYLOAD=$(printf '{"text":":rotating_light: Mothership workflow *%s* failed - %s"}' "${{ inputs.workflow-name }}" "$RUN_URL")
+        # Never fails this step (and so never adds a second, confusing
+        # failure on top of the real one that triggered it) if the
+        # notification itself can't be delivered - the underlying
+        # workflow failure is still the real signal either way; check the
+        # Actions tab directly if this warning appears.
+        curl -sf -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "${{ inputs.webhook-url }}" \\
+          || echo "::warning::Failed to deliver the failure notification itself - the workflow failure that triggered it is still real, see the Actions tab."
+"""
+        },
+
         {
             "path": ".github/workflows/self-reflect.yml",
             "content": """name: Hub Self-Reflection
@@ -2082,6 +2312,11 @@ jobs:
   self-check:
     runs-on: ubuntu-latest
     steps:
+      # Only needed so the notify-on-failure composite action below (a
+      # local action, referenced by path) is present on the runner - this
+      # job itself reads no repo files.
+      - uses: actions/checkout@v4
+
       - name: Ping Hub for self-analysis
         env:
           # Note: GLOBAL_GITHUB_TOKEN is not needed here - the hub authenticates
@@ -2095,14 +2330,22 @@ jobs:
           # Deployment Protection) and store it as VERCEL_BYPASS_TOKEN.
           VERCEL_BYPASS_TOKEN: ${{ secrets.VERCEL_BYPASS_TOKEN }}
         run: |
-          curl -X POST "${HUB_VERCEL_URL}/api/autonomous_agent" \\
+          curl -sf -X POST "${HUB_VERCEL_URL}/api/autonomous_agent" \\
             -H "Content-Type: application/json" \\
             -H "x-vercel-protection-bypass: ${VERCEL_BYPASS_TOKEN}" \\
             -d '{
               "owner": "${{ github.repository_owner }}",
               "repo": "${{ github.event.repository.name }}",
               "mode": "refactor"
-            }'"""
+            }'
+
+      - name: Notify on failure
+        if: failure()
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Hub Self-Reflection'
+"""
         },
         {
             "path": ".github/workflows/prune-logs.yml",
@@ -2139,7 +2382,15 @@ jobs:
           # as a repo secret, with cross-repo write access to every spoke.
           GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
           DRY_RUN: ${{ inputs.dry_run }}
-        run: node scripts/prune-logs.js"""
+        run: node scripts/prune-logs.js
+
+      - name: Notify on failure
+        if: failure()
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Prune Decision Logs'
+"""
         },
         {
             "path": ".github/workflows/health-report.yml",
@@ -2180,7 +2431,15 @@ jobs:
           # secret, with read access to every registered spoke plus write
           # access to this repo (to update the pinned report issue).
           GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
-        run: node scripts/health-report.js"""
+        run: node scripts/health-report.js
+
+      - name: Notify on failure
+        if: failure()
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Health Report'
+"""
         },
         {
             "path": ".github/workflows/collect-issue-feedback.yml",
@@ -2211,7 +2470,15 @@ jobs:
           # can't read Vercel's env, so this needs its own copy of the token
           # as a repo secret, with cross-repo write access to every spoke.
           GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
-        run: node scripts/collect-issue-feedback.js"""
+        run: node scripts/collect-issue-feedback.js
+
+      - name: Notify on failure
+        if: failure()
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Collect Issue Feedback'
+"""
         },
 
         {
@@ -2272,6 +2539,11 @@ jobs:
   aggregate:
     runs-on: ubuntu-latest
     steps:
+      # Only needed so the notify-on-failure composite action below (a
+      # local action, referenced by path) is present on the runner - this
+      # job itself reads no repo files.
+      - uses: actions/checkout@v4
+
       - name: Ping Hub for cross-spoke aggregation
         env:
           HUB_VERCEL_URL: ${{ secrets.HUB_VERCEL_URL }}
@@ -2279,10 +2551,268 @@ jobs:
           # Deployment Protection enabled.
           VERCEL_BYPASS_TOKEN: ${{ secrets.VERCEL_BYPASS_TOKEN }}
         run: |
-          curl -X POST "${HUB_VERCEL_URL}/api/recursive_learning" \\
+          curl -sf -X POST "${HUB_VERCEL_URL}/api/recursive_learning" \\
             -H "Content-Type: application/json" \\
             -H "x-vercel-protection-bypass: ${VERCEL_BYPASS_TOKEN}" \\
-            -d '{}'"""
+            -d '{}'
+
+      - name: Notify on failure
+        if: failure()
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Recursive Learning'
+"""
+        },
+        {
+            "path": ".github/workflows/deploy-vercel.yml",
+            "content": """name: Deploy to Vercel
+
+# Real CD for the Vercel backend, closing the gap this whole
+# deployment-pipeline sprint exists to close: nothing in this repo has ever
+# auto-deployed anywhere before this workflow. A push to main deploys to
+# production; a pull request targeting main deploys a preview - which IS
+# this project's staging environment for the Vercel backend (a real,
+# isolated deployment per PR, not a separate long-lived environment to
+# maintain). Both paths are smoke-tested against Phase 1's /api/health
+# route before being considered successful.
+#
+# NOT live-verified end-to-end: no Vercel account/token is reachable from
+# this environment, so this workflow's actual `vercel` CLI behavior has
+# never been run for real. The `pull`/`build`/`deploy --prebuilt` sequence
+# below is Vercel's own documented CI recipe - flagged here, honestly, as
+# "should work per the documented interface," not "confirmed working,"
+# the same disclosure discipline this project applies to every other
+# untestable-from-here integration (see README's Stripe webhook note).
+#
+# Known, disclosed limitation: a pull_request from a fork does not receive
+# repository secrets (a GitHub Actions security restriction, not a bug
+# here) - so a preview deploy only works for PRs from branches within this
+# same repository. Fine for this project's current single-operator model;
+# would need re-architecting (e.g. a separate workflow_run-triggered job)
+# if external contributions are ever accepted.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vercel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # only used to comment the preview URL back onto the PR
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      # Step output, not an inline ternary expression repeated in every
+      # later step - this project's own established preference (see
+      # lessons.md's Sprint 4 entry on `setup_spoke.py`'s cron/mode wiring).
+      - name: Determine deploy target
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "environment=preview" >> "$GITHUB_OUTPUT"
+            echo "prod_flag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=production" >> "$GITHUB_OUTPUT"
+            echo "prod_flag=--prod" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pull Vercel project configuration
+        run: vercel pull --yes --environment=${{ steps.target.outputs.environment }} --token="$VERCEL_TOKEN"
+
+      - name: Build project artifacts
+        run: vercel build ${{ steps.target.outputs.prod_flag }} --token="$VERCEL_TOKEN"
+
+      - name: Deploy the prebuilt output
+        id: deploy
+        run: |
+          url=$(vercel deploy --prebuilt ${{ steps.target.outputs.prod_flag }} --token="$VERCEL_TOKEN")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test the deployment
+        env:
+          # Only needed if the deployment has Vercel Deployment Protection
+          # enabled (see README's "Enable Hub Self-Analysis" section for
+          # where this token comes from) - empty/unset means no header is
+          # sent at all, matching every other caller of this same secret.
+          SMOKE_TEST_HEADER_NAME: x-vercel-protection-bypass
+          SMOKE_TEST_HEADER_VALUE: ${{ secrets.VERCEL_BYPASS_TOKEN }}
+        run: node scripts/smoke-test.js "${{ steps.deploy.outputs.url }}/api/health" "${{ github.sha }}"
+
+      - name: Comment the preview URL on the PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = `${{ steps.deploy.outputs.url }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `**Vercel preview deployed and smoke-tested:** ${url}\\n\\nThis is the staging deployment for this PR - it's automatically replaced on every new push.`
+            });
+
+      # Only wired for the production path. A preview-deploy failure is
+      # already visible to whoever opened the PR, directly as a failing
+      # check - the silent-failure risk this whole sprint exists to close
+      # is specifically the unattended, post-merge production path.
+      - name: Notify on failure
+        if: failure() && github.event_name != 'pull_request'
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Deploy to Vercel (production)'
+"""
+        },
+        {
+            "path": ".github/workflows/deploy-apps-script.yml",
+            "content": """name: Deploy to Google Apps Script
+
+# Real CD for the Apps Script backend, matching deploy-vercel.yml's shape:
+# push to main -> production (GAS_PROD_DEPLOYMENT_ID); a pull request
+# targeting main -> a separate, persistent staging deployment
+# (GAS_STAGING_DEPLOYMENT_ID) - Apps Script's equivalent of a PR preview.
+# Both are existing Apps Script deployments, created once by hand via the
+# IDE (see README's "Alternative: Deploy Without Vercel" section) -
+# `clasp deploy -i <id>` updates a specific deployment's code in place
+# rather than minting a new one, which is what keeps each deployment's Web
+# App URL stable across every CD run instead of changing on every deploy
+# the way a plain `clasp deploy` (no `-i`) would.
+#
+# NOT live-verified end-to-end: no Google account/clasp credential is
+# reachable from this environment. clasp's own OAuth credential file has
+# moved location across versions (~/.clasprc.json in older releases,
+# ~/.config/clasp/.clasprc.json from clasp 2.4+) - this workflow writes the
+# decoded CLASPRC_JSON secret to both paths to hedge against that, but
+# which one a real `clasp push`/`clasp deploy` actually reads has never
+# been confirmed from this session. Flagged honestly, same disclosure
+# standard as deploy-vercel.yml.
+#
+# Known, disclosed limitation: same as deploy-vercel.yml - a pull_request
+# from a fork doesn't receive repository secrets, so a staging deploy only
+# works for PRs from branches within this same repository.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-apps-script-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # only used to comment the staging URL back onto the PR
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install clasp
+        run: npm install --global @google/clasp@latest
+
+      - name: Restore clasp credentials
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+        run: |
+          mkdir -p "$HOME/.config/clasp"
+          echo "$CLASPRC_JSON" | base64 -d > "$HOME/.clasprc.json"
+          echo "$CLASPRC_JSON" | base64 -d > "$HOME/.config/clasp/.clasprc.json"
+
+      - name: Write .clasp.json for this run
+        env:
+          GAS_SCRIPT_ID: ${{ secrets.GAS_SCRIPT_ID }}
+        run: |
+          cat > gas/.clasp.json <<CLASPJSON
+          { "scriptId": "$GAS_SCRIPT_ID", "rootDir": "." }
+          CLASPJSON
+
+      # Step output, not an inline ternary expression repeated in every
+      # later step - matches deploy-vercel.yml and this project's own
+      # established preference (see lessons.md's Sprint 4 entry).
+      - name: Determine deploy target
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "deployment_id=${{ secrets.GAS_STAGING_DEPLOYMENT_ID }}" >> "$GITHUB_OUTPUT"
+            echo "web_app_url=${{ secrets.GAS_STAGING_WEB_APP_URL }}" >> "$GITHUB_OUTPUT"
+            echo "label=staging" >> "$GITHUB_OUTPUT"
+          else
+            echo "deployment_id=${{ secrets.GAS_PROD_DEPLOYMENT_ID }}" >> "$GITHUB_OUTPUT"
+            echo "web_app_url=${{ secrets.GAS_WEB_APP_URL }}" >> "$GITHUB_OUTPUT"
+            echo "label=production" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push source to the Apps Script project
+        working-directory: gas
+        run: clasp push --force
+
+      - name: Update the target deployment in place
+        working-directory: gas
+        run: clasp deploy -i "${{ steps.target.outputs.deployment_id }}" -d "Deployed from ${{ github.sha }} (${{ steps.target.outputs.label }})"
+
+      - name: Smoke test the deployment
+        # No expected-commit check here, unlike deploy-vercel.yml - Apps
+        # Script's health response has no commit field to compare against
+        # (see gas/Code.js's renderHealthResponse comment), and
+        # smoke-test.js already treats that as a real, disclosed platform
+        # difference rather than a mismatch.
+        run: node scripts/smoke-test.js "${{ steps.target.outputs.web_app_url }}?endpoint=health"
+
+      - name: Comment the staging URL on the PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = `${{ steps.target.outputs.web_app_url }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `**Apps Script staging deployment updated and smoke-tested:** ${url}?endpoint=health\\n\\nThis is a persistent staging deployment (stable URL, unlike a fresh Vercel preview) updated in place by this PR.`
+            });
+
+      # Only wired for the production path - same reasoning as
+      # deploy-vercel.yml: a staging-deploy failure is already visible to
+      # whoever opened the PR as a failing check.
+      - name: Notify on failure
+        if: failure() && github.event_name != 'pull_request'
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Deploy to Google Apps Script (production)'
+"""
         },
 
         # 5. INFRASTRUCTURE

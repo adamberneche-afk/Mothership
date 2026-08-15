@@ -53,12 +53,14 @@ jobs:
 
           drift=0
           for f in \
-            api/autonomous_agent.js api/recursive_learning.js \
+            api/autonomous_agent.js api/recursive_learning.js api/health.js \
             scripts/prune-logs.js scripts/health-report.js scripts/collect-issue-feedback.js \
-            scripts/doctor.js \
+            scripts/doctor.js scripts/smoke-test.js \
+            .github/actions/notify-on-failure/action.yml \
             .github/workflows/self-reflect.yml .github/workflows/prune-logs.yml \
             .github/workflows/health-report.yml .github/workflows/recursive-learning.yml \
             .github/workflows/collect-issue-feedback.yml .github/workflows/doctor.yml \
+            .github/workflows/deploy-vercel.yml .github/workflows/deploy-apps-script.yml \
             package.json .gitignore; do
             if ! diff -u <(norm "$f") <(norm "/tmp/hub-scratch/$f") > /tmp/hub-scratch-diff.txt; then
               echo "::error::setup_hub.py's embedded copy of $f has drifted from the real file"
@@ -104,7 +106,7 @@ jobs:
 
           added_files=$(git diff --diff-filter=A --name-only "$BASE_SHA" "$HEAD_SHA")
           changed_files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
-          watched_new_files=$(echo "$added_files" | grep -E '^(api/|gas/|dashboard/|\.github/workflows/)' || true)
+          watched_new_files=$(echo "$added_files" | grep -E '^(api/|gas/|dashboard/|\.github/workflows/|\.github/actions/)' || true)
 
           if [ -z "$watched_new_files" ]; then
             echo "No new files under api/, gas/, dashboard/, or .github/workflows/ - nothing to check."
