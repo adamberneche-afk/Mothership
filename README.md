@@ -283,6 +283,19 @@ Everything in steps 1-2 above (the two AI-calling endpoints and their config) ca
 
 **Verified locally, not yet live:** `scripts/dev-test-gas-*.mjs` cover the ported decision logic, the GitHub REST mapping, `Code.js`'s request routing, and the settings page's token gate/masking/allowlist behavior against hand-rolled fakes - the same testing discipline as everything else in this repo, and they already caught one real defect (`autonomous_agent.js`/`recursive_learning.js` both declaring the same constant, a silent `SyntaxError` the moment both files shared one real Apps Script project's scope) before any real deployment existed. What hasn't happened yet is an actual `clasp push` + live dispatch against a real Apps Script project - do that and confirm `dryRun: true` responses before pointing any spoke's schedule at it.
 
+**Continuous deployment (optional):** `.github/workflows/deploy-apps-script.yml` mirrors `deploy-vercel.yml` above for this backend - a push to `main` updates a production deployment, a pull request targeting `main` updates a separate, persistent staging deployment, both smoke-tested against `?endpoint=health` before being considered successful. Unlike Vercel, Apps Script has no concept of "redeploy the same URL automatically" - `clasp deploy -i <deploymentId>` updates a *specific, already-existing* deployment's code in place, which is what keeps its Web App URL stable across every CD run. That means two deployments need to exist up front (repeat step 5 above twice - once for production, once for staging - and note each one's deployment ID, visible in the Apps Script IDE's Deploy → Manage deployments screen, or via `clasp deployments`), plus these secrets on this repository:
+
+| Secret | Value |
+|--------|-------|
+| `CLASPRC_JSON` | Base64-encoded contents of `clasp login`'s own credential file (run `clasp login` once locally, then `base64 -i ~/.clasprc.json` or `base64 -i ~/.config/clasp/.clasprc.json` depending on your clasp version - see the workflow file's header comment for why it's written to both paths) |
+| `GAS_SCRIPT_ID` | The same scriptId as `gas/.clasp.json` (step 2 above) |
+| `GAS_PROD_DEPLOYMENT_ID` | The production deployment's ID from step 5 |
+| `GAS_STAGING_DEPLOYMENT_ID` | A second, separate deployment's ID (create it the same way as step 5, once, by hand) |
+| `GAS_WEB_APP_URL` | The production deployment's Web App URL |
+| `GAS_STAGING_WEB_APP_URL` | The staging deployment's Web App URL |
+
+**Not live-verified end-to-end** - no Google account/clasp credential is reachable from this environment, same disclosure as `deploy-vercel.yml`. A pull_request from a fork doesn't receive repository secrets either, so staging deploys only work for PRs from branches within this same repository.
+
 **Not removed:** `api/*.js` and the Vercel path stay in this repo untouched. Dropping Vercel entirely - deleting `api/`, `setup_hub.py`'s Vercel-flavored generation, the Vercel-specific docs above - is a deliberate follow-up once the Apps Script path has actually been verified live, not bundled into adding it.
 
 ## How It Works
