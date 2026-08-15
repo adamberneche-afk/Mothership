@@ -2344,6 +2344,187 @@ export default async function handler(req, res) {
 }"""
         },
 
+        # Stripe Customer Portal - immediate post-checkout access via a
+        # session_id, plus ongoing access via email lookup.
+        {
+            "path": "api/customer_portal_link.js",
+            "content": """// Immediate post-checkout access to the Stripe Customer Portal. The
+// operator configures each Payment Link's after-payment redirect (in the
+// Stripe Dashboard) to
+// `https://<host>/onboarding-success.html?session_id={CHECKOUT_SESSION_ID}`
+// - Stripe's own documented templating for exactly this use case.
+// dashboard/onboarding-success.html's inline script calls this endpoint
+// with that session_id and, if it returns a portal link, redirects there.
+//
+// A session_id is a bearer credential for portal access once known - it's
+// only ever delivered via the success redirect URL itself, the same trust
+// model Stripe's own official Customer Portal integration guide uses. This
+// endpoint bounds that exposure explicitly: a portal link is only ever
+// minted for a session within ~24h of its own `created` timestamp (a
+// forwarded/bookmarked/logged old success URL stops working on its own,
+// the same "leaked-but-expired" defense lib/onboarding_token.js already
+// uses for the onboarding state token).
+//
+// Verifies real payment before minting anything - payment_status must be
+// 'paid', never just "the browser reached this URL" (the exact mistake
+// api/stripe_webhook.js's own header comment already warns against for
+// onboarding-success.html itself).
+
+export async function getPortalLinkForSession(sessionId, {
+  stripeClient,
+  now = Date.now(),
+  dashboardBaseUrl = process.env.DASHBOARD_BASE_URL,
+  maxAgeMs = 24 * 60 * 60 * 1000
+} = {}) {
+  if (!sessionId || typeof sessionId !== 'string') {
+    return { ok: false, reason: 'missing session_id' };
+  }
+  if (!dashboardBaseUrl) {
+    // A portal session requires a return_url - refusing loudly (via the
+    // caller's error response) rather than guessing one is the same
+    // "disclosed gap over silent one" choice as buildSuspensionEmail's
+    // fallback in api/github_app_webhook.js.
+    return { ok: false, reason: 'DASHBOARD_BASE_URL is not configured' };
+  }
+
+  let session;
+  try {
+    session = await stripeClient.checkout.sessions.retrieve(sessionId);
+  } catch (e) {
+    return { ok: false, reason: 'could not retrieve session' };
+  }
+  if (!session || session.payment_status !== 'paid') {
+    return { ok: false, reason: 'session is not a paid checkout' };
+  }
+  if (!session.customer) {
+    return { ok: false, reason: 'session has no associated customer' };
+  }
+
+  const createdMs = (session.created || 0) * 1000; // Stripe timestamps are in seconds
+  if (now - createdMs > maxAgeMs) {
+    return { ok: false, reason: 'session_id has expired for portal access' };
+  }
+
+  try {
+    const portalSession = await stripeClient.billingPortal.sessions.create({
+      customer: session.customer,
+      return_url: `${dashboardBaseUrl}/install.html`
+    });
+    return { ok: true, url: portalSession.url };
+  } catch (e) {
+    return { ok: false, reason: 'could not create a portal session' };
+  }
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  const sessionId = req.query && req.query.session_id;
+  const { default: Stripe } = await import('stripe');
+  const stripeClient = new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_missing');
+  const result = await getPortalLinkForSession(sessionId, { stripeClient });
+  if (!result.ok) {
+    res.status(400).json({ error: result.reason });
+    return;
+  }
+  res.status(200).json({ url: result.url });
+}"""
+        },
+        {
+            "path": "api/request_portal_link.js",
+            "content": """// Ongoing Customer Portal access for a returning customer who no longer
+// has their original success-redirect link (see
+// api/customer_portal_link.js's header comment for that immediate path).
+// dashboard/manage.html posts a plain email address here.
+//
+// The core anti-enumeration property, stated explicitly: this ALWAYS
+// returns the identical response regardless of whether the email matches
+// a real Stripe customer - never turning "check if this address has an
+// account" into a working customer-existence oracle. A match silently
+// gets a fresh portal link emailed to them (reusing lib/email.js, the same
+// fail-soft capability api/github_app_webhook.js's suspension notice
+// already uses); a non-match gets nothing, and neither case is
+// distinguishable from the response alone.
+//
+// Rate-limited by email, best-effort only - an in-memory Map keyed by
+// normalized email, scoped to a single warm serverless instance. Disclosed
+// limitation, not overclaimed: this does NOT protect against a burst
+// spread across multiple cold-started instances or multiple IPs. A real,
+// distributed rate limiter is real follow-up work if abuse is observed;
+// this is a cheap first layer, not a promise of one.
+
+import { sendEmail } from '../lib/email.js';
+
+const DEFAULT_RATE_LIMIT_STATE = new Map();
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 request per email per minute, best-effort
+
+const GENERIC_RESPONSE = {
+  status: 'Requested',
+  message: "If that email has an account, we've sent a link to manage your subscription."
+};
+
+export async function handleRequestPortalLink({ email }, {
+  stripeClient,
+  sendEmailImpl = sendEmail,
+  dashboardBaseUrl = process.env.DASHBOARD_BASE_URL,
+  now = Date.now(),
+  rateLimitState = DEFAULT_RATE_LIMIT_STATE,
+  rateLimitWindowMs = RATE_LIMIT_WINDOW_MS
+} = {}) {
+  // Malformed/missing input still gets the identical generic response -
+  // there's nothing more specific to leak here either, and it keeps the
+  // "one response, always" property simple to reason about.
+  if (!email || typeof email !== 'string' || !email.includes('@')) {
+    return GENERIC_RESPONSE;
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const lastRequestAt = rateLimitState.get(normalizedEmail);
+  if (lastRequestAt !== undefined && now - lastRequestAt < rateLimitWindowMs) {
+    return GENERIC_RESPONSE; // rate-limited - still the identical response, nothing leaked
+  }
+  rateLimitState.set(normalizedEmail, now);
+
+  if (!dashboardBaseUrl) return GENERIC_RESPONSE; // nothing to build a return_url from - fail soft
+
+  try {
+    const customers = await stripeClient.customers.list({ email: normalizedEmail, limit: 1 });
+    const customer = customers && customers.data && customers.data[0];
+    if (customer) {
+      const portalSession = await stripeClient.billingPortal.sessions.create({
+        customer: customer.id,
+        return_url: `${dashboardBaseUrl}/install.html`
+      });
+      await sendEmailImpl({
+        to: normalizedEmail,
+        subject: 'Manage your Mothership subscription',
+        html: `<p>Here's your link to manage your Mothership subscription:</p><p><a href="${portalSession.url}">Manage subscription</a></p><p>This link is personal and time-limited - don't share it. If you didn't request this, you can ignore this email.</p>`
+      });
+    }
+  } catch (e) {
+    // Fail-soft, and deliberately no different a response than "not found"
+    // - a Stripe/email failure must not be distinguishable from a genuine
+    // non-match either.
+  }
+
+  return GENERIC_RESPONSE;
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  const { default: Stripe } = await import('stripe');
+  const stripeClient = new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_missing');
+  const result = await handleRequestPortalLink(req.body || {}, { stripeClient });
+  res.status(200).json(result);
+}"""
+        },
+
         # 3. MEMORY MANAGEMENT
         {
             "path": "scripts/prune-logs.js",
