@@ -1,0 +1,119 @@
+name: Deploy to Vercel
+
+# Real CD for the Vercel backend, closing the gap this whole
+# deployment-pipeline sprint exists to close: nothing in this repo has ever
+# auto-deployed anywhere before this workflow. A push to main deploys to
+# production; a pull request targeting main deploys a preview - which IS
+# this project's staging environment for the Vercel backend (a real,
+# isolated deployment per PR, not a separate long-lived environment to
+# maintain). Both paths are smoke-tested against Phase 1's /api/health
+# route before being considered successful.
+#
+# NOT live-verified end-to-end: no Vercel account/token is reachable from
+# this environment, so this workflow's actual `vercel` CLI behavior has
+# never been run for real. The `pull`/`build`/`deploy --prebuilt` sequence
+# below is Vercel's own documented CI recipe - flagged here, honestly, as
+# "should work per the documented interface," not "confirmed working,"
+# the same disclosure discipline this project applies to every other
+# untestable-from-here integration (see README's Stripe webhook note).
+#
+# Known, disclosed limitation: a pull_request from a fork does not receive
+# repository secrets (a GitHub Actions security restriction, not a bug
+# here) - so a preview deploy only works for PRs from branches within this
+# same repository. Fine for this project's current single-operator model;
+# would need re-architecting (e.g. a separate workflow_run-triggered job)
+# if external contributions are ever accepted.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vercel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # only used to comment the preview URL back onto the PR
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      # Step output, not an inline ternary expression repeated in every
+      # later step - this project's own established preference (see
+      # lessons.md's Sprint 4 entry on `setup_spoke.py`'s cron/mode wiring).
+      - name: Determine deploy target
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "environment=preview" >> "$GITHUB_OUTPUT"
+            echo "prod_flag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=production" >> "$GITHUB_OUTPUT"
+            echo "prod_flag=--prod" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pull Vercel project configuration
+        run: vercel pull --yes --environment=${{ steps.target.outputs.environment }} --token="$VERCEL_TOKEN"
+
+      - name: Build project artifacts
+        run: vercel build ${{ steps.target.outputs.prod_flag }} --token="$VERCEL_TOKEN"
+
+      - name: Deploy the prebuilt output
+        id: deploy
+        run: |
+          url=$(vercel deploy --prebuilt ${{ steps.target.outputs.prod_flag }} --token="$VERCEL_TOKEN")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test the deployment
+        env:
+          # Only needed if the deployment has Vercel Deployment Protection
+          # enabled (see README's "Enable Hub Self-Analysis" section for
+          # where this token comes from) - empty/unset means no header is
+          # sent at all, matching every other caller of this same secret.
+          SMOKE_TEST_HEADER_NAME: x-vercel-protection-bypass
+          SMOKE_TEST_HEADER_VALUE: ${{ secrets.VERCEL_BYPASS_TOKEN }}
+        run: node scripts/smoke-test.js "${{ steps.deploy.outputs.url }}/api/health" "${{ github.sha }}"
+
+      - name: Comment the preview URL on the PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = `${{ steps.deploy.outputs.url }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `**Vercel preview deployed and smoke-tested:** ${url}\n\nThis is the staging deployment for this PR - it's automatically replaced on every new push.`
+            });
+
+      # Only wired for the production path. A preview-deploy failure is
+      # already visible to whoever opened the PR, directly as a failing
+      # check - the silent-failure risk this whole sprint exists to close
+      # is specifically the unattended, post-merge production path.
+      - name: Notify on failure
+        if: failure() && github.event_name != 'pull_request'
+        uses: ./.github/actions/notify-on-failure
+        with:
+          webhook-url: ${{ secrets.ALERT_WEBHOOK_URL }}
+          workflow-name: 'Deploy to Vercel (production)'

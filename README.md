@@ -174,6 +174,18 @@ Validates: `GLOBAL_GITHUB_TOKEN` against `GET /rate_limit`, `AI_API_KEY`/`AI_BAS
 
 **Deliberately `workflow_dispatch`-only, no schedule** - this project's own investigation into its health started because scheduled workflows were failing silently with nobody watching; adding another scheduled job here would risk the identical failure mode this tool exists to catch. Run it manually when setting up a new spoke, rotating a credential, or troubleshooting.
 
+### Continuous Deployment (`.github/workflows/deploy-vercel.yml`)
+
+Before this workflow, nothing in this repo ever auto-deployed anywhere - `api/` only ran if a human clicked "Deploy" in the Vercel dashboard. A push to `main` now deploys to production automatically; a pull request targeting `main` deploys a preview instead - which **is** this project's staging environment for the Vercel backend (a real, isolated deployment scoped to that PR, replaced on every push, rather than a separate long-lived environment to provision and keep in sync). Both paths run the same steps: `vercel pull` → `vercel build` → `vercel deploy --prebuilt`, then a smoke test (`scripts/smoke-test.js`) against a dedicated, credential-free `/api/health` route (`api/health.js` - deliberately never one of the AI-calling endpoints, which need real credentials and could have side effects) - checking both a healthy response and that the deployed response's `commit` field (Vercel auto-populates `VERCEL_GIT_COMMIT_SHA`) matches the commit that was actually pushed, so a stale/failed deploy can't silently pass as successful. A preview deploy's URL is posted back as a PR comment.
+
+Needs three new repository secrets beyond the ones in step 2 below - see [Setup Instructions](#setup-instructions) step 8.
+
+**Not live-verified end-to-end:** no Vercel account/token is reachable from this environment, so the `vercel` CLI sequence above has never actually run for real here. It follows Vercel's own documented CI recipe, but is flagged honestly as "should work per the documented interface," not "confirmed working" - the same disclosure standard applied to every other integration this project can't reach directly (e.g. the Stripe webhook's own smoke-test flag in `api/stripe_webhook.js`).
+
+**Known, disclosed limitation:** a pull request from a fork doesn't receive repository secrets (a GitHub security restriction, not a bug here), so preview deploys only work for PRs from branches within this same repository - fine for this project's current single-operator model.
+
+**Failure alerting is wired in for the production path only** - a failing preview deploy is already visible to whoever opened the PR, directly as a failing check; the silent-failure risk `ALERT_WEBHOOK_URL` (see [Failure Alerting](#failure-alerting-githubactionsnotify-on-failure) above) exists to close is specifically the unattended, post-merge production path.
+
 ## Setup Instructions
 
 ### 1. Deploy to Vercel
@@ -237,6 +249,18 @@ Set this under this repository's own Settings → Secrets and variables → Acti
 ### 7. Enable Health Reporting
 
 Unlike self-analysis, `.github/workflows/health-report.yml` doesn't call the Vercel deployment at all either - it's a plain Actions script that talks to GitHub directly, and needs the exact same `GLOBAL_GITHUB_TOKEN` secret as step 6 above. If you've already set that up for log pruning, health reporting works with no further setup.
+
+### 8. Enable Continuous Deployment (Vercel)
+
+`.github/workflows/deploy-vercel.yml` (see [Continuous Deployment](#continuous-deployment-githubworkflowsdeploy-vercelyml) above) needs three repository secrets beyond step 2's Vercel env vars - these authenticate the Vercel CLI itself, not the running application:
+
+| Secret | Value |
+|--------|-------|
+| `VERCEL_TOKEN` | A personal access token from Vercel's Account Settings → Tokens |
+| `VERCEL_ORG_ID` | Found in the linked project's `.vercel/project.json` after running `vercel link` locally once, or in Vercel Project Settings → General |
+| `VERCEL_PROJECT_ID` | Same source as `VERCEL_ORG_ID` |
+
+`VERCEL_BYPASS_TOKEN` (step 5 above) is reused automatically by the smoke-test step if the deployment has Deployment Protection enabled - no separate secret needed for that. Once these three are set, a push to `main` deploys to production and a pull request targeting `main` gets its own preview deploy - no further action needed.
 
 ### Alternative: Deploy Without Vercel (Google Apps Script)
 

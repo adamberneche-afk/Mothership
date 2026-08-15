@@ -114,6 +114,20 @@ async function testNoCommitFieldIsIgnoredWhenNotApplicable() {
   check('still ok - no commit field to compare against', result.ok === true);
 }
 
+async function testHeadersAreForwardedWhenSupplied() {
+  console.log('an optional headers object (e.g. the Vercel Deployment Protection bypass header) is forwarded to fetchImpl');
+  const fetchImpl = makeFakeFetch(() => jsonResponse(200, { status: 'ok' }));
+  await checkHealth('https://example.com/api/health', { fetchImpl, headers: { 'x-vercel-protection-bypass': 'secret-token' } });
+  check('fetch received the header', fetchImpl.calls[0].options.headers?.['x-vercel-protection-bypass'] === 'secret-token');
+}
+
+async function testNoHeadersOptionMeansNoHeadersSent() {
+  console.log('omitting headers entirely does not inject an empty object where a caller might not expect one');
+  const fetchImpl = makeFakeFetch(() => jsonResponse(200, { status: 'ok' }));
+  await checkHealth('https://example.com/api/health', { fetchImpl });
+  check('headers is undefined, not an empty object', fetchImpl.calls[0].options.headers === undefined);
+}
+
 // --- checkHealthWithRetry ----------------------------------------------------
 
 async function testRetrySucceedsOnFirstAttemptWithoutSleeping() {
@@ -154,6 +168,8 @@ async function main() {
   await testCommitMatchIsOk();
   await testCommitMismatchIsUnhealthy();
   await testNoCommitFieldIsIgnoredWhenNotApplicable();
+  await testHeadersAreForwardedWhenSupplied();
+  await testNoHeadersOptionMeansNoHeadersSent();
   await testRetrySucceedsOnFirstAttemptWithoutSleeping();
   await testRetryRecoversAfterTransientFailures();
   await testRetryGivesUpAfterMaxAttempts();
