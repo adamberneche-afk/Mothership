@@ -26,6 +26,14 @@
 // stale (expired) cache entry is still shown instantly as a placeholder
 // while the real fetch runs in the background (stale-while-revalidate),
 // rather than going blank while waiting.
+//
+// Also fetches tenants.json (multi-tenancy's registry) alongside
+// spokes.json, purely to detect a suspended tenant (api/github_app_webhook.js
+// flips this on GitHub App uninstall/suspend) - a suspended tenant's own
+// spoke report can otherwise look perfectly calm ("no decisions logged this
+// window"), which is the opposite of what a health dashboard is for.
+// Suspension is treated as ground truth and overrides the decision-log-
+// derived status/severity - see tenantStatusMap/effectiveStatusRank below.
 
 const HUB_OWNER = 'adamberneche-afk';
 const HUB_REPO = 'Mothership';
@@ -133,6 +141,15 @@ function lastKnownSpokeKey(owner, repo) {
 }
 
 const SPOKES_LAST_KNOWN_KEY = `${LAST_KNOWN_PREFIX}spokes.json`;
+
+// Resolved fresh on every successful tenants.json fetch in loadSpokeSection
+// (Map<tenantId, {status, suspendedReason}>) - deliberately not cached
+// alongside each spoke's report, so a tenant's suspension (or its later
+// lifting) is reflected the moment it's re-fetched rather than only once
+// that spoke's own report happens to be re-fetched too. Fail-soft: a failed
+// tenants.json fetch just leaves this at whatever it already was (empty on
+// a genuine first load) - never blocks spoke rendering.
+let tenantStatusMap = new Map();
 
 function hubWorkflowCacheKey(file) {
   return `${CACHE_PREFIX}hub-workflow:${file}`;
@@ -292,6 +309,7 @@ async function buildReportForSpoke(spoke, windowStart) {
     return {
       owner: spoke.owner,
       repo: spoke.repo,
+      tenantId: spoke.tenantId || null,
       issuesFiled: null,
       entriesInWindow: null,
       byOutcome: {},
@@ -322,7 +340,16 @@ async function buildReportForSpoke(spoke, windowStart) {
     capabilityStatus = 'active, no findings';
   }
 
-  return { owner: spoke.owner, repo: spoke.repo, issuesFiled: issuesResult.count, entriesInWindow: total, byOutcome, skipRate, capabilityStatus };
+  return {
+    owner: spoke.owner,
+    repo: spoke.repo,
+    tenantId: spoke.tenantId || null,
+    issuesFiled: issuesResult.count,
+    entriesInWindow: total,
+    byOutcome,
+    skipRate,
+    capabilityStatus,
+  };
 }
 
 // Defense in depth: even after validSpokes filters the obviously-malformed
@@ -337,6 +364,7 @@ async function safeBuildReport(spoke, windowStart) {
     return {
       owner: spoke.owner,
       repo: spoke.repo,
+      tenantId: spoke.tenantId || null,
       issuesFiled: null,
       entriesInWindow: null,
       byOutcome: {},
@@ -449,6 +477,22 @@ function statusRank(status) {
   return status in STATUS_SEVERITY ? STATUS_SEVERITY[status] : 99;
 }
 
+// A tenant suspended via api/github_app_webhook.js only ever touches
+// tenants.json - never spokes.json or that spoke's own decision log - so a
+// suspended spoke's capabilityStatus can look perfectly calm (often 'no
+// decisions logged this window', rank 4, just below 'live') while the tenant
+// serving it is fully cut off. Suspension is ground truth, fetched fresh on
+// every load (see tenantStatusMap below) - it always outranks whatever the
+// decision-log-derived capabilityStatus happens to read, tied with the
+// worst rank ('couldn't load'/'timed out') rather than encoded as its own
+// static STATUS_SEVERITY entry, since the reason text is per-tenant and
+// dynamic, not one of the fixed enum values that object otherwise holds.
+function effectiveStatusRank(report) {
+  const tenant = report.tenantId ? tenantStatusMap.get(report.tenantId) : null;
+  if (tenant && tenant.status === 'suspended') return 0;
+  return statusRank(report.capabilityStatus);
+}
+
 function statusClass(status) {
   if (status === 'live') return 'good';
   if (status === 'dry-run') return 'warn';
@@ -531,12 +575,24 @@ function updateRow(row, report) {
   cells[3].textContent = report.skipRate === null ? 'n/a' : `${Math.round(report.skipRate * 100)}%`;
 
   const chip = cells[4].querySelector('.chip');
-  // A stale offline fallback always renders neutral regardless of its
-  // historical status - a days-old "live" shouldn't paint green at a
-  // glance and read as "currently fine," when what's actually known is
-  // only "was fine as of however long ago the label says."
-  chip.className = `chip chip-${report.offlineAsOf ? 'neutral' : statusClass(report.capabilityStatus)}`;
-  chip.textContent = statusLabel(report);
+  const tenant = report.tenantId ? tenantStatusMap.get(report.tenantId) : null;
+  if (tenant && tenant.status === 'suspended') {
+    // Suspension is ground truth, resolved fresh against tenants.json on
+    // every load - it overrides the decision-log-derived reading
+    // unconditionally, including the offline-fallback neutral-paint rule
+    // below (tenant status isn't part of the cached/offline spoke report,
+    // so it's never itself stale in the way that fallback is guarding
+    // against).
+    chip.className = 'chip chip-critical';
+    chip.textContent = `suspended${tenant.suspendedReason ? `: ${tenant.suspendedReason}` : ''}`;
+  } else {
+    // A stale offline fallback always renders neutral regardless of its
+    // historical status - a days-old "live" shouldn't paint green at a
+    // glance and read as "currently fine," when what's actually known is
+    // only "was fine as of however long ago the label says."
+    chip.className = `chip chip-${report.offlineAsOf ? 'neutral' : statusClass(report.capabilityStatus)}`;
+    chip.textContent = statusLabel(report);
+  }
 
   const outcomes = Object.entries(report.byOutcome).map(([k, v]) => `${outcomeLabel(k)}: ${v}`).join(', ') || 'none';
   cells[5].textContent = outcomes;
@@ -558,7 +614,7 @@ function findRowByKey(tbody, key) {
 }
 
 function renderRows(tbody, reports) {
-  const sorted = [...reports].sort((a, b) => statusRank(a.capabilityStatus) - statusRank(b.capabilityStatus));
+  const sorted = [...reports].sort((a, b) => effectiveStatusRank(a) - effectiveStatusRank(b));
   const seen = new Set();
   let cursor = tbody.firstElementChild;
 
@@ -673,7 +729,7 @@ function upsertHubReport(reports, report) {
 // two arrays through every call site added nothing but noise.
 
 function updateDocumentTitle() {
-  const hasSpokeProblem = liveReports.some((r) => STATUS_SEVERITY[r.capabilityStatus] === 0);
+  const hasSpokeProblem = liveReports.some((r) => effectiveStatusRank(r) === 0);
   const hasHubProblem = liveHubReports.some((r) => HUB_STATUS_SEVERITY[r.hubStatus] === 0);
   document.title = hasSpokeProblem || hasHubProblem ? `⚠ ${BASE_TITLE}` : BASE_TITLE;
 }
@@ -734,7 +790,20 @@ async function loadSpokeSection(force) {
   const emptyEl = document.getElementById('empty-state');
   const windowStart = new Date(Date.now() - REPORT_WINDOW_DAYS * 24 * 60 * 60 * 1000);
 
-  const spokesResult = await fetchDecodedFile(HUB_OWNER, HUB_REPO, 'spokes.json');
+  // tenants.json is fetched alongside spokes.json (same helper, same
+  // fail-soft posture) purely to keep tenantStatusMap current - a failure
+  // here never blocks spoke rendering, it just leaves the map at whatever
+  // it already held (empty on a genuine first load).
+  const [spokesResult, tenantsResult] = await Promise.all([
+    fetchDecodedFile(HUB_OWNER, HUB_REPO, 'spokes.json'),
+    fetchDecodedFile(HUB_OWNER, HUB_REPO, 'tenants.json'),
+  ]);
+  if (tenantsResult.ok) {
+    const tenants = safeParseJsonArray(tenantsResult.text).filter(
+      (t) => t && typeof t === 'object' && typeof t.tenantId === 'string' && t.tenantId
+    );
+    tenantStatusMap = new Map(tenants.map((t) => [t.tenantId, { status: t.status, suspendedReason: t.suspendedReason }]));
+  }
   let spokes;
   if (spokesResult.ok) {
     spokes = validSpokes(safeParseJsonArray(spokesResult.text));

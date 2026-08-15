@@ -20,6 +20,15 @@
 // intentionally avoids new dependencies; this is the one deliberate
 // exception.
 //
+// Real multi-tier pricing: the actual purchased plan is re-derived from
+// what Stripe says was really paid for (stripe.checkout.sessions.
+// listLineItems, matched against plans.json by Stripe price ID) - never
+// trusted from anything client-supplied. An unrecognized price (e.g. the
+// operator added a new Payment Link but forgot to update plans.json) does
+// NOT silently default to any plan - it's surfaced as 'UnrecognizedPrice'
+// for manual reconciliation, the same "disclosed gap over silent one"
+// treatment as the 'Unlinked' case below.
+//
 // Idempotency: Stripe can and does redeliver the same event (retries on
 // any non-2xx, and can occasionally redeliver even after a 200). The new
 // tenant's tenantId is DETERMINISTIC (`ghapp-<installationId>`, never
@@ -40,19 +49,12 @@
 import Stripe from 'stripe';
 import { verifyOnboardingToken } from '../lib/onboarding_token.js';
 import { mintInstallationToken } from '../lib/github_app.js';
-import { appendToJsonRegistryWithRetry } from '../lib/registry_writer.js';
+import { appendToJsonRegistryWithRetry, readJsonArrayFile } from '../lib/registry_writer.js';
+import { loadPlansRegistry, findPlanByStripePriceId } from '../lib/secrets.js';
 
 export const config = { api: { bodyParser: false } };
 
 const MAX_BODY_BYTES = 1_000_000;
-
-// v1 scope: exactly one plan tier, one Stripe Payment Link - matches this
-// sprint's deliberate "single Checkout gate, not a full billing platform"
-// scope. Extending to multiple plans needs a per-price lookup (e.g. via
-// stripe.checkout.sessions.listLineItems) and is real, disclosed follow-up
-// work, not built here.
-const DEFAULT_PLAN = 'standard';
-const DEFAULT_QUOTA = { reviewsPerMonth: null };
 
 export function readRawBody(req, { maxBytes = MAX_BODY_BYTES } = {}) {
   return new Promise((resolve, reject) => {
@@ -76,10 +78,29 @@ function tenantIdForInstallation(installationId) {
   return `ghapp-${installationId}`;
 }
 
-async function provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId, hubOctokit, hubOwner, hubRepo, now }) {
+// Looks up the real plan the customer actually paid for, from Stripe's own
+// record of the checkout session's line items - never from anything the
+// client supplied. Returns the matching plans.json entry, or null if the
+// session has no resolvable price or that price doesn't match any known
+// plan (a real, disclosed gap - see handleStripeWebhook's 'UnrecognizedPrice'
+// result - never silently defaulted).
+async function resolvePlanForSession(stripe, sessionId, plans) {
+  let lineItems;
+  try {
+    lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { expand: ['data.price'] });
+  } catch (e) {
+    return null;
+  }
+  const firstItem = lineItems && lineItems.data && lineItems.data[0];
+  const priceId = firstItem && firstItem.price && firstItem.price.id;
+  if (!priceId) return null;
+  return findPlanByStripePriceId(priceId, plans);
+}
+
+async function provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId, plan, hubOctokit, hubOwner, hubRepo, now }) {
   const tenantId = tenantIdForInstallation(installationId);
   return appendToJsonRegistryWithRetry(hubOctokit, hubOwner, hubRepo, 'tenants.json', {
-    message: `chore: provision tenant for GitHub App installation ${installationId} (self-service onboarding)`,
+    message: `chore: provision tenant for GitHub App installation ${installationId} (self-service onboarding, plan ${plan.planId})`,
     decide: (existingTenants) => {
       const existing = existingTenants.find((t) => t && t.tenantId === tenantId);
       if (existing) return { skip: true, result: { status: 'AlreadyProvisioned', tenantId } };
@@ -87,8 +108,8 @@ async function provisionTenantForInstallation({ installationId, accountLogin, st
         tenantId,
         name: accountLogin,
         status: 'active',
-        plan: DEFAULT_PLAN,
-        quota: DEFAULT_QUOTA,
+        plan: plan.planId,
+        quota: { reviewsPerMonth: plan.reviewsPerMonth ?? null },
         githubCredentialRef: `ghapp:${installationId}`,
         installationId: Number(installationId),
         // Recorded for operator support/reconciliation (looking a tenant up
@@ -157,7 +178,8 @@ export async function handleStripeWebhook(rawBody, signatureHeader, {
   stripeClient,
   githubAppId = process.env.GITHUB_APP_ID,
   githubAppPrivateKey = process.env.GITHUB_APP_PRIVATE_KEY,
-  githubAppRequest
+  githubAppRequest,
+  plans = loadPlansRegistry()
 } = {}) {
   if (!stripeWebhookSecret) {
     return { httpStatus: 500, body: { error: 'STRIPE_WEBHOOK_SECRET is not configured' } };
@@ -191,7 +213,35 @@ export async function handleStripeWebhook(rawBody, signatureHeader, {
   }
 
   const { installationId, accountLogin } = claims;
-  const provisionResult = await provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId: session.customer, hubOctokit, hubOwner, hubRepo, now });
+  const tenantId = tenantIdForInstallation(installationId);
+
+  // Cheap, best-effort idempotency pre-check BEFORE spending a Stripe API
+  // call to resolve the plan: a redelivered/duplicate event for a tenant
+  // that's already provisioned must report AlreadyProvisioned regardless
+  // of whether the plan lookup below would succeed right now (a session's
+  // line items are not guaranteed to stay resolvable forever) - the actual
+  // write-path idempotency check inside provisionTenantForInstallation
+  // still re-verifies this atomically against a fresh read, so a race
+  // landing between this check and that one is still handled correctly,
+  // just possibly with one redundant plan lookup.
+  const { entries: existingTenants } = await readJsonArrayFile(hubOctokit, hubOwner, hubRepo, 'tenants.json');
+  if (existingTenants.some((t) => t && t.tenantId === tenantId)) {
+    return { httpStatus: 200, body: { status: 'AlreadyProvisioned', tenantId } };
+  }
+
+  const plan = await resolvePlanForSession(stripe, session.id, plans);
+  if (!plan) {
+    // A payment Stripe genuinely confirmed, but for a price that doesn't
+    // match any entry in plans.json - most likely the operator added a new
+    // Payment Link/Price without updating plans.json to match. Acked (not
+    // retried by Stripe) but never provisioned under a guessed/default
+    // plan - surfaced for manual reconciliation instead, same treatment as
+    // the 'Unlinked' case above.
+    console.warn(`stripe_webhook: checkout.session.completed (session ${session.id}) has no price matching any plan in plans.json - needs manual reconciliation`);
+    return { httpStatus: 200, body: { status: 'UnrecognizedPrice', reason: 'no plan in plans.json matches this session\'s Stripe price' } };
+  }
+
+  const provisionResult = await provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId: session.customer, plan, hubOctokit, hubOwner, hubRepo, now });
 
   if (provisionResult.status === 'Provisioned') {
     const spokeResult = await autoRegisterSpokesForInstallation({

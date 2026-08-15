@@ -30,6 +30,9 @@
   }
   h1 { font-size: 1.4rem; margin: 0 0 12px; color: var(--teal); }
   p { color: var(--ink-soft); margin: 0; }
+  a:focus-visible {
+    outline: 2px solid var(--teal); outline-offset: 2px; border-radius: 4px;
+  }
 </style>
 </head>
 <body>
@@ -43,7 +46,30 @@
   -->
   <div class="card">
     <h1>Payment received</h1>
-    <p>Thanks - we're activating your account now. This usually takes under a minute. You'll be able to use your connected repositories shortly; no further action is needed from you.</p>
+    <p>Thanks - we're verifying your payment now. This usually takes under a minute. Once verified, Mothership automatically begins covering your connected repositories - no further setup, and nothing to check on.</p>
   </div>
+  <script>
+    // If the operator has configured this Payment Link's success redirect
+    // with Stripe's own {CHECKOUT_SESSION_ID} templating, this session_id
+    // resolves to a real Customer Portal link (api/customer_portal_link.js
+    // independently re-verifies payment before minting anything - reaching
+    // this page proves nothing on its own, same reasoning as the comment
+    // above). No session_id at all (an operator who hasn't set this up
+    // yet, or a bare Payment Link hit directly) leaves this page exactly
+    // as it already was - fail-soft, never a broken page.
+    (async function () {
+      const params = new URLSearchParams(window.location.search);
+      const sessionId = params.get('session_id');
+      if (!sessionId) return;
+      try {
+        const res = await fetch(`/api/customer_portal_link?session_id=${encodeURIComponent(sessionId)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.url) window.location.href = data.url;
+      } catch (e) {
+        // fail-soft - stay on this page exactly as rendered
+      }
+    })();
+  </script>
 </body>
 </html>

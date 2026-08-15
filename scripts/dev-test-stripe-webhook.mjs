@@ -33,6 +33,26 @@ function signedPayload(eventBody) {
   return { rawBody: Buffer.from(payload), signatureHeader: header };
 }
 
+// A real Stripe instance (so webhooks.constructEvent still does genuine
+// HMAC verification, keeping this harness's "real signatures, fully
+// offline" property) with checkout.sessions.listLineItems monkey-patched
+// to a fake, network-free lookup - this is the one Stripe API call this
+// file's plan-resolution logic depends on.
+function makeStripeClientWithFakeLineItems(priceId) {
+  const client = new Stripe('sk_test_fake_for_signing_only');
+  client.checkout = {
+    sessions: {
+      listLineItems: async () => ({ data: priceId ? [{ price: { id: priceId } }] : [] })
+    }
+  };
+  return client;
+}
+
+const TEST_PLANS = [
+  { planId: 'standard', name: 'Standard', stripePriceId: 'price_test_standard', stripePaymentLinkUrl: 'https://buy.stripe.com/test-standard', reviewsPerMonth: 200 },
+  { planId: 'pro', name: 'Pro', stripePriceId: 'price_test_pro', stripePaymentLinkUrl: 'https://buy.stripe.com/test-pro', reviewsPerMonth: null }
+];
+
 function checkoutCompletedEvent({ id = 'evt_1', sessionId = 'cs_1', clientReferenceId, customer = 'cus_1' } = {}) {
   return {
     id,
@@ -209,6 +229,7 @@ async function testValidPaymentProvisionsATenantWithTheDeterministicId() {
   const fetchImpl = makeFakeFetchForInstallationRepos(['acme-org/widget-service', 'acme-org/gadget-api']);
   const result = await handleStripeWebhook(rawBody, signatureHeader, {
     stripeWebhookSecret: WEBHOOK_SECRET, hubOctokit, fetchImpl,
+    stripeClient: makeStripeClientWithFakeLineItems('price_test_pro'), plans: TEST_PLANS,
     githubAppId: 1, githubAppPrivateKey: privateKey, githubAppRequest: makeFakeGithubAppRequest()
   });
   check('returns 200', result.httpStatus === 200);
@@ -219,8 +240,46 @@ async function testValidPaymentProvisionsATenantWithTheDeterministicId() {
   check('the new tenant record exists with the right credential ref', !!newTenant && newTenant.githubCredentialRef === 'ghapp:12345');
   check("the new tenant's name is the confirmed account login", newTenant.name === 'acme-org');
   check("the new tenant's stripeCustomerId is recorded from the session", newTenant.stripeCustomerId === 'cus_1');
+  check('the new tenant is provisioned on the plan actually purchased (price_test_pro -> pro), not a hardcoded default', newTenant.plan === 'pro');
+  check("the new tenant's quota comes from that plan's reviewsPerMonth", newTenant.quota.reviewsPerMonth === null);
   check('both installation repos got registered as spokes', hubOctokit.files['spokes.json'].content.some(s => s.owner === 'acme-org' && s.repo === 'widget-service') && hubOctokit.files['spokes.json'].content.some(s => s.owner === 'acme-org' && s.repo === 'gadget-api'));
   check('both new spokes are attributed to the new tenant', hubOctokit.files['spokes.json'].content.every(s => s.tenantId === 'ghapp-12345'));
+  delete process.env.ONBOARDING_STATE_SECRET;
+}
+
+async function testUnrecognizedPriceIsNeverSilentlyDefaulted() {
+  console.log('handleStripeWebhook records an UnrecognizedPrice result (no tenant write, no default plan) when the session\'s Stripe price matches nothing in plans.json');
+  _clearAppAuthCacheForTests();
+  process.env.ONBOARDING_STATE_SECRET = 'stripe-webhook-unrecognized-price-test';
+  const clientReferenceId = signOnboardingToken({ onboardingId: 'ob-price', installationId: '55555', accountLogin: 'mystery-org' });
+  const { rawBody, signatureHeader } = signedPayload(checkoutCompletedEvent({ id: 'evt_price', sessionId: 'cs_price', clientReferenceId }));
+  const hubOctokit = makeFakeHubOctokitWithRegistry();
+  const result = await handleStripeWebhook(rawBody, signatureHeader, {
+    stripeWebhookSecret: WEBHOOK_SECRET, hubOctokit,
+    stripeClient: makeStripeClientWithFakeLineItems('price_never_configured_in_plans_json'), plans: TEST_PLANS
+  });
+  check('returns 200 (acked, not an error Stripe should retry)', result.httpStatus === 200);
+  check('status is UnrecognizedPrice', result.body.status === 'UnrecognizedPrice');
+  check('no tenant was written', hubOctokit.calls.createOrUpdateFileContents.length === 0);
+  delete process.env.ONBOARDING_STATE_SECRET;
+}
+
+async function testUnrecognizedPriceNeverOverridesAnAlreadyProvisionedTenant() {
+  console.log('a redelivered event for an already-provisioned tenant reports AlreadyProvisioned even if the plan lookup would now fail (idempotency pre-check runs first)');
+  _clearAppAuthCacheForTests();
+  process.env.ONBOARDING_STATE_SECRET = 'stripe-webhook-already-provisioned-price-test';
+  const clientReferenceId = signOnboardingToken({ onboardingId: 'ob-already', installationId: '66666', accountLogin: 'already-org' });
+  const { rawBody, signatureHeader } = signedPayload(checkoutCompletedEvent({ id: 'evt_already', sessionId: 'cs_already', clientReferenceId }));
+  const existingTenant = { tenantId: 'ghapp-66666', name: 'already-org', status: 'active', plan: 'standard', quota: { reviewsPerMonth: 200 }, githubCredentialRef: 'ghapp:66666', installationId: 66666, createdAt: new Date().toISOString() };
+  const hubOctokit = makeFakeHubOctokitWithRegistry({ tenants: [existingTenant] });
+  // Deliberately an unrecognized price - proves the idempotency pre-check
+  // wins over the plan lookup, not the other way around.
+  const result = await handleStripeWebhook(rawBody, signatureHeader, {
+    stripeWebhookSecret: WEBHOOK_SECRET, hubOctokit,
+    stripeClient: makeStripeClientWithFakeLineItems('price_this_would_be_unrecognized'), plans: TEST_PLANS
+  });
+  check('status is AlreadyProvisioned, not UnrecognizedPrice', result.body.status === 'AlreadyProvisioned');
+  check('no additional write happened', hubOctokit.calls.createOrUpdateFileContents.length === 0);
   delete process.env.ONBOARDING_STATE_SECRET;
 }
 
@@ -232,7 +291,7 @@ async function testDuplicateDeliveryOfTheSameEventIsIdempotent() {
   const { rawBody, signatureHeader } = signedPayload(checkoutCompletedEvent({ id: 'evt_dup', sessionId: 'cs_dup', clientReferenceId }));
   const hubOctokit = makeFakeHubOctokitWithRegistry();
   const fetchImpl = makeFakeFetchForInstallationRepos([]);
-  const deps = { stripeWebhookSecret: WEBHOOK_SECRET, hubOctokit, fetchImpl, githubAppId: 1, githubAppPrivateKey: privateKey, githubAppRequest: makeFakeGithubAppRequest() };
+  const deps = { stripeWebhookSecret: WEBHOOK_SECRET, hubOctokit, fetchImpl, githubAppId: 1, githubAppPrivateKey: privateKey, githubAppRequest: makeFakeGithubAppRequest(), stripeClient: makeStripeClientWithFakeLineItems('price_test_standard'), plans: TEST_PLANS };
 
   const first = await handleStripeWebhook(rawBody, signatureHeader, deps);
   const second = await handleStripeWebhook(rawBody, signatureHeader, deps);
@@ -254,7 +313,7 @@ async function testSimulatedConcurrentRaceStillYieldsExactlyOneTenant() {
   const hubOctokit = makeFakeHubOctokitWithRegistry();
   hubOctokit.forceConflictOnce('tenants.json');
   const fetchImpl = makeFakeFetchForInstallationRepos([]);
-  const result = await handleStripeWebhook(rawBody, signatureHeader, { stripeWebhookSecret: WEBHOOK_SECRET, hubOctokit, fetchImpl, githubAppId: 1, githubAppPrivateKey: privateKey, githubAppRequest: makeFakeGithubAppRequest() });
+  const result = await handleStripeWebhook(rawBody, signatureHeader, { stripeWebhookSecret: WEBHOOK_SECRET, hubOctokit, fetchImpl, githubAppId: 1, githubAppPrivateKey: privateKey, githubAppRequest: makeFakeGithubAppRequest(), stripeClient: makeStripeClientWithFakeLineItems('price_test_standard'), plans: TEST_PLANS });
   check('the retry detects the now-present entry and reports AlreadyProvisioned rather than erroring or duplicating', result.body.status === 'AlreadyProvisioned');
   check('exactly one tenant with this id exists after the race', hubOctokit.files['tenants.json'].content.filter(t => t.tenantId === 'ghapp-999999').length === 1);
   delete process.env.ONBOARDING_STATE_SECRET;
@@ -268,7 +327,7 @@ async function testProvisionedTenantAlwaysUsesGhappSchemeNeverEnv() {
   const { rawBody, signatureHeader } = signedPayload(checkoutCompletedEvent({ id: 'evt_scheme', sessionId: 'cs_scheme', clientReferenceId }));
   const hubOctokit = makeFakeHubOctokitWithRegistry();
   const fetchImpl = makeFakeFetchForInstallationRepos([]);
-  await handleStripeWebhook(rawBody, signatureHeader, { stripeWebhookSecret: WEBHOOK_SECRET, hubOctokit, fetchImpl, githubAppId: 1, githubAppPrivateKey: privateKey, githubAppRequest: makeFakeGithubAppRequest() });
+  await handleStripeWebhook(rawBody, signatureHeader, { stripeWebhookSecret: WEBHOOK_SECRET, hubOctokit, fetchImpl, githubAppId: 1, githubAppPrivateKey: privateKey, githubAppRequest: makeFakeGithubAppRequest(), stripeClient: makeStripeClientWithFakeLineItems('price_test_standard'), plans: TEST_PLANS });
   const newTenant = hubOctokit.files['tenants.json'].content.find(t => t.tenantId === 'ghapp-777');
   check('githubCredentialRef starts with ghapp:', !!newTenant && newTenant.githubCredentialRef.startsWith('ghapp:'));
   delete process.env.ONBOARDING_STATE_SECRET;
@@ -303,6 +362,8 @@ async function main() {
   await testMissingClientReferenceIdIsRecordedAsUnlinkedNotProvisioned();
   await testInvalidOnboardingTokenIsRecordedAsUnlinked();
   await testValidPaymentProvisionsATenantWithTheDeterministicId();
+  await testUnrecognizedPriceIsNeverSilentlyDefaulted();
+  await testUnrecognizedPriceNeverOverridesAnAlreadyProvisionedTenant();
   await testDuplicateDeliveryOfTheSameEventIsIdempotent();
   await testSimulatedConcurrentRaceStillYieldsExactlyOneTenant();
   await testProvisionedTenantAlwaysUsesGhappSchemeNeverEnv();

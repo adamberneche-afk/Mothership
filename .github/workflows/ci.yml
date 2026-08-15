@@ -53,9 +53,10 @@ jobs:
 
           drift=0
           for f in \
-            lib/secrets.js lib/github_app.js lib/onboarding_token.js lib/registry_writer.js \
+            lib/secrets.js lib/github_app.js lib/onboarding_token.js lib/registry_writer.js lib/email.js \
             api/autonomous_agent.js api/recursive_learning.js \
             api/onboard_start.js api/github_app_callback.js api/stripe_webhook.js api/github_app_webhook.js \
+            api/customer_portal_link.js api/request_portal_link.js \
             scripts/prune-logs.js scripts/health-report.js scripts/collect-issue-feedback.js \
             scripts/doctor.js scripts/provision-tenant.js \
             .github/workflows/self-reflect.yml .github/workflows/prune-logs.yml \
@@ -70,9 +71,10 @@ jobs:
             fi
           done
 
-          # spokes.json, universal_lessons.md, and north_star_framework.md are
-          # deliberately NOT checked above: setup_hub.py seeds those with
-          # fresh-install defaults, not a mirror of this repo's own live,
+          # spokes.json, tenants.json, plans.json, universal_lessons.md, and
+          # north_star_framework.md are deliberately NOT checked above:
+          # setup_hub.py seeds those with fresh-install defaults ([] for the
+          # three registries), not a mirror of this repo's own live,
           # accumulated state, so they're expected to diverge from this repo's
           # real copies - that's not drift, it's the installer doing its job.
           exit $drift
