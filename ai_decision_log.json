@@ -1,1 +1,10 @@
-[]
+[
+  {
+    "timestamp": "2026-08-24T00:00:00.000Z",
+    "mode": "debug",
+    "commitSha": "1fad5bbf6922ae571e709440b3296f5f10e01144",
+    "outcome": "created",
+    "issueUrl": "https://github.com/adamberneche-afk/Mothership/issues/34",
+    "summary": "Same MAX_DIFF_CHARS truncation-by-file-order bug as argoloth's entry, independently confirmed here: this repo's own 97,334-char PR #30 merge diff cuts mid-function inside api/recursive_learning.js's citedEvidenceMeetsBar, never reaching gas/recursive_learning.js or either new dev-test script."
+  }
+]
