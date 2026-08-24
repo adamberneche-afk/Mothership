@@ -19,5 +19,26 @@
     "repo": "tais",
     "addedAt": "2026-08-06T00:00:00Z",
     "status": "active"
+  },
+  {
+    "tenantId": "default",
+    "owner": "adamberneche-afk",
+    "repo": "kos",
+    "addedAt": "2026-08-24T00:00:00Z",
+    "status": "active"
+  },
+  {
+    "tenantId": "default",
+    "owner": "adamberneche-afk",
+    "repo": "argoloth",
+    "addedAt": "2026-08-24T00:00:00Z",
+    "status": "active"
+  },
+  {
+    "tenantId": "default",
+    "owner": "adamberneche-afk",
+    "repo": "Mothership",
+    "addedAt": "2026-08-24T00:00:00Z",
+    "status": "active"
   }
 ]
