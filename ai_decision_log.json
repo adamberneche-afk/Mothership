@@ -6,5 +6,21 @@
     "outcome": "created",
     "issueUrl": "https://github.com/adamberneche-afk/Mothership/issues/34",
     "summary": "Same MAX_DIFF_CHARS truncation-by-file-order bug as argoloth's entry, independently confirmed here: this repo's own 97,334-char PR #30 merge diff cuts mid-function inside api/recursive_learning.js's citedEvidenceMeetsBar, never reaching gas/recursive_learning.js or either new dev-test script."
+  },
+  {
+    "timestamp": "2026-08-24T00:40:00.000Z",
+    "mode": "hunt",
+    "commitSha": "1fad5bbf6922ae571e709440b3296f5f10e01144",
+    "outcome": "no_findings",
+    "issueUrl": null,
+    "summary": "Re-run using the fixed (post-#34) diff builder - all 5 real code files now reach the prompt (api/recursive_learning.js, gas/recursive_learning.js, both new dev-test scripts, setup_hub.py); only README.md and lessons.md are omitted. No silent logic errors found in the shared-pool addition."
+  },
+  {
+    "timestamp": "2026-08-24T00:40:00.000Z",
+    "mode": "refactor",
+    "commitSha": "1fad5bbf6922ae571e709440b3296f5f10e01144",
+    "outcome": "no_findings",
+    "issueUrl": null,
+    "summary": "Considered whether setup_hub.py embedding a full copy of api/recursive_learning.js's source is a maintainability risk worth flagging - checked git history first rather than assuming: the prior commit in this same merge (9a4f0f1) already re-synced exactly this drift, caught by an existing, proven installer-drift check bundled into CI. Already covered; not filed as a new issue."
   }
 ]

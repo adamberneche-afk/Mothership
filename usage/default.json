@@ -57,5 +57,53 @@
     "owner": "adamberneche-afk",
     "repo": "Mothership",
     "issueUrl": "https://github.com/adamberneche-afk/Mothership/issues/34"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-08-24T00:40:00.000Z",
+    "eventType": "review_run",
+    "mode": "hunt",
+    "owner": "adamberneche-afk",
+    "repo": "kos"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-08-24T00:40:00.000Z",
+    "eventType": "review_run",
+    "mode": "refactor",
+    "owner": "adamberneche-afk",
+    "repo": "kos"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-08-24T00:40:00.000Z",
+    "eventType": "review_run",
+    "mode": "hunt",
+    "owner": "adamberneche-afk",
+    "repo": "argoloth"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-08-24T00:40:00.000Z",
+    "eventType": "review_run",
+    "mode": "refactor",
+    "owner": "adamberneche-afk",
+    "repo": "argoloth"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-08-24T00:40:00.000Z",
+    "eventType": "review_run",
+    "mode": "hunt",
+    "owner": "adamberneche-afk",
+    "repo": "Mothership"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-08-24T00:40:00.000Z",
+    "eventType": "review_run",
+    "mode": "refactor",
+    "owner": "adamberneche-afk",
+    "repo": "Mothership"
   }
 ]
