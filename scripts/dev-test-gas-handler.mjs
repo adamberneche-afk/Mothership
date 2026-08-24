@@ -39,7 +39,10 @@ function unb64(str) {
 // etc.), unlike the spoke-scoped ai_decision_log.json/lessons.md/
 // NORTH_STAR.md paths - autonomous_agent.js now fetches those from the hub
 // repo via the same client instead of reading local disk.
-function makeFakeGithub({ decisionLog = null, issuesCreatedToday = [], commitSha = 'abc123', diffFiles, hubOwner = 'adamberneche-afk', hubRepo = 'Mothership' } = {}) {
+function makeFakeGithub({
+  decisionLog = null, issuesCreatedToday = [], commitSha = 'abc123', diffFiles,
+  hubOwner = 'adamberneche-afk', hubRepo = 'Mothership', commitAuthorLogin, missingLocalFiles = []
+} = {}) {
   const calls = { issuesCreate: [], getContent: [], createOrUpdateFileContents: [] };
   let currentLog = decisionLog;
   let currentSha = decisionLog !== null ? 'fake-sha-0' : null;
@@ -58,7 +61,8 @@ function makeFakeGithub({ decisionLog = null, issuesCreatedToday = [], commitSha
           return { data: { content: b64(JSON.stringify(currentLog)), sha: currentSha } };
         }
         if (path === 'lessons.md' || path === 'NORTH_STAR.md') {
-          return { data: { content: b64('fake local context') } };
+          if (missingLocalFiles.includes(path)) throw new Error('404 not found');
+          return { data: { content: b64(`fake content of ${path}`) } };
         }
         if (owner === hubOwner && repo === hubRepo && hubFiles.has(path)) {
           return { data: { content: b64('fake hub context') } };
@@ -74,7 +78,12 @@ function makeFakeGithub({ decisionLog = null, issuesCreatedToday = [], commitSha
         return { data: {} };
       },
       listCommits: () => ({ data: commitSha ? [{ sha: commitSha }] : [] }),
-      getCommit: () => ({ data: { files } })
+      getCommit: () => ({
+        data: {
+          files,
+          ...(commitAuthorLogin ? { author: { login: commitAuthorLogin } } : {})
+        }
+      })
     },
     issues: {
       listForRepo: () => ({ data: issuesCreatedToday }),
@@ -138,6 +147,23 @@ function makeFakeAiFetch(aiJsonContent) {
     };
   };
   aiFetch.callCount = () => callCount;
+  return aiFetch;
+}
+
+// Same as makeFakeAiFetch, but also captures the actual payload sent to the
+// AI - needed to assert on which files/text made it into the prompt (issue
+// #34's ordering/truncation fix, issue #35's local-context fix).
+function makeFakeAiFetchCapturing(aiJsonContent) {
+  const calls = [];
+  const aiFetch = (url, options) => {
+    calls.push(JSON.parse(options.payload));
+    return {
+      getResponseCode: () => 200,
+      getContentText: () => JSON.stringify({ choices: [{ message: { content: aiJsonContent } }] })
+    };
+  };
+  aiFetch.callCount = () => calls.length;
+  aiFetch.lastPrompt = () => calls[calls.length - 1]?.messages?.[0]?.content ?? '';
   return aiFetch;
 }
 
@@ -462,6 +488,137 @@ function testNullQuotaMeansUnlimited() {
   check('the AI was still called despite 500 prior events - null quota is unlimited', aiFetch.callCount() === 1);
 }
 
+// --- Issue #34: diff ordering/truncation puts code before docs, and one -----
+// --- huge file can't starve everything after it -----------------------------
+
+function testDiffOrdersCodeFilesBeforeDocFilesWhenBothCantFit() {
+  console.log('Issue #34: when the diff is too big to fit, a doc file yields its slot to a code file');
+  const hugeDocPatch = '+line\n'.repeat(5000);
+  const diffFiles = [
+    { filename: 'DEPLOY_GUIDE.md', status: 'modified', patch: hugeDocPatch },
+    { filename: 'src/real_logic.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n-buggy\n+fixed' }
+  ];
+  const github = makeFakeGithub({ diffFiles });
+  const aiFetch = makeFakeAiFetchCapturing(NO_FINDING_JSON);
+  processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+  );
+  const prompt = aiFetch.lastPrompt();
+  check('the code file made it into the prompt', prompt.includes('src/real_logic.js'));
+  check('the code file\'s actual patch text is present', prompt.includes('buggy') && prompt.includes('fixed'));
+}
+
+function testDiffCapsAnySingleFileSoItCannotStarveTheRest() {
+  console.log("Issue #34: one file's patch is capped so it can't consume the whole budget alone");
+  const hugeCodePatch = '+line\n'.repeat(5000);
+  const diffFiles = [
+    { filename: 'src/huge_file.js', status: 'modified', patch: hugeCodePatch },
+    { filename: 'src/small_file.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n-old\n+distinctive_marker' }
+  ];
+  const github = makeFakeGithub({ diffFiles });
+  const aiFetch = makeFakeAiFetchCapturing(NO_FINDING_JSON);
+  processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+  );
+  const prompt = aiFetch.lastPrompt();
+  check('the huge file is present but truncated', prompt.includes('src/huge_file.js') && prompt.includes('truncated'));
+  check('the small file after it still made it in', prompt.includes('distinctive_marker'));
+}
+
+function testDiffNotesOmittedFilesWhenTheyDontFit() {
+  console.log('Issue #34: files that genuinely cannot fit are named in an omission note, not silently dropped');
+  const diffFiles = Array.from({ length: 7 }, (_, i) => ({
+    filename: `src/${String.fromCharCode(97 + i)}.js`,
+    status: 'modified',
+    patch: '+line\n'.repeat(3000)
+  }));
+  const github = makeFakeGithub({ diffFiles });
+  const aiFetch = makeFakeAiFetchCapturing(NO_FINDING_JSON);
+  processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+  );
+  const prompt = aiFetch.lastPrompt();
+  check('an omission note is present', prompt.includes('omitted'));
+  check('the omission note names a specific dropped file', /src\/[a-g]\.js/.test(prompt.slice(prompt.indexOf('omitted'))));
+}
+
+// --- Issue #35: bot-authored / generated-data-only commits are skipped -----
+// --- before spending an AI call, and local-context files are independent --
+
+function testBotAuthoredCommitIsSkippedBeforeTheAiCall() {
+  console.log('Issue #35: a github-actions[bot]-authored commit is skipped before the AI call');
+  const github = makeFakeGithub({ commitAuthorLogin: 'github-actions[bot]' });
+  const aiFetch = makeFakeAiFetch(FINDING_JSON);
+  const { body } = processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+  );
+  check('AI was never called', aiFetch.callCount() === 0);
+  check('status is Skipped', body.status === 'Skipped');
+  check('reason mentions bot/excluded', /bot|excluded/i.test(body.reason || ''));
+}
+
+function testHumanCommitTouchingOnlyExportsPathIsSkipped() {
+  console.log('Issue #35: a commit touching only exports/ paths is skipped even from a human author');
+  const diffFiles = [
+    { filename: 'exports/2026-08-17-issues.json', status: 'added', patch: '+huge json dump' },
+    { filename: 'exports/2026-08-17-issues.md', status: 'added', patch: '+huge md dump' }
+  ];
+  const github = makeFakeGithub({ diffFiles });
+  const aiFetch = makeFakeAiFetch(FINDING_JSON);
+  const { body } = processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+  );
+  check('AI was never called', aiFetch.callCount() === 0);
+  check('status is Skipped', body.status === 'Skipped');
+}
+
+function testNormalCommitFromABotIsNotSkippedIfPathsArentExcluded() {
+  console.log('Issue #35 (regression guard): a mixed path set is not treated as excluded unless ALL files match');
+  const diffFiles = [
+    { filename: 'src/real_logic.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n-old\n+new' },
+    { filename: 'exports/data.json', status: 'added', patch: '+data' }
+  ];
+  const github = makeFakeGithub({ diffFiles });
+  const aiFetch = makeFakeAiFetch(FINDING_JSON);
+  const { httpStatus } = processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+  );
+  check('AI was still called - not every file matched the excluded prefix', aiFetch.callCount() === 1);
+  check('httpStatus is 200', httpStatus === 200);
+}
+
+function testLocalContextSurvivesWhenOnlyOneFileIsMissing() {
+  console.log('Issue #35: a real lessons.md still reaches the prompt even when NORTH_STAR.md 404s');
+  const github = makeFakeGithub({ missingLocalFiles: ['NORTH_STAR.md'] });
+  const aiFetch = makeFakeAiFetchCapturing(NO_FINDING_JSON);
+  processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+  );
+  const prompt = aiFetch.lastPrompt();
+  check('the real lessons.md content reached the prompt', prompt.includes('fake content of lessons.md'));
+  check('NORTH_STAR is reported as not found, not silently dropped', prompt.includes('(none found)'));
+  check('the whole local context did NOT collapse to "No local context found."', !prompt.includes('No local context found.'));
+}
+
+function testLocalContextIsTheNoneFoundFallbackWhenBothFilesAreMissing() {
+  console.log('Issue #35 (regression guard): when BOTH local files are genuinely missing, the fallback text still applies');
+  const github = makeFakeGithub({ missingLocalFiles: ['lessons.md', 'NORTH_STAR.md'] });
+  const aiFetch = makeFakeAiFetchCapturing(NO_FINDING_JSON);
+  processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+  );
+  const prompt = aiFetch.lastPrompt();
+  check('falls back to "No local context found."', prompt.includes('No local context found.'));
+}
+
 function main() {
   testDryRunNeverCreatesIssue();
   testRateCapBlocksAtLimit();
@@ -482,6 +639,14 @@ function main() {
   testQuotaExceededBlocksBeforeTheAiCall();
   testQuotaUnderLimitProceedsNormally();
   testNullQuotaMeansUnlimited();
+  testDiffOrdersCodeFilesBeforeDocFilesWhenBothCantFit();
+  testDiffCapsAnySingleFileSoItCannotStarveTheRest();
+  testDiffNotesOmittedFilesWhenTheyDontFit();
+  testBotAuthoredCommitIsSkippedBeforeTheAiCall();
+  testHumanCommitTouchingOnlyExportsPathIsSkipped();
+  testNormalCommitFromABotIsNotSkippedIfPathsArentExcluded();
+  testLocalContextSurvivesWhenOnlyOneFileIsMissing();
+  testLocalContextIsTheNoneFoundFallbackWhenBothFilesAreMissing();
 
   console.log('');
   if (failures > 0) {

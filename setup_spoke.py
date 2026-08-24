@@ -110,27 +110,41 @@ def setup_spoke(hub_url=None, source_spoke=None, token=None):
         {
             # Not an f-string - the hub URL is a secret read at runtime, not
             # baked into this file, so nothing here needs interpolating.
+            #
+            # workflow_dispatch-only, deliberately - NOT the every-10-minutes-
+            # equivalent scheduled version this generator used to emit. That
+            # version is what produced ~1,974 hallucinated issues on tso over
+            # ~4 months (see the hub's lessons.md, 2026-08-05/06 entries) -
+            # firing on a schedule with no one watching it, before the diff-
+            # fetching/validation/dry-run/rate-cap fixes existed. Even with
+            # those fixes now live, re-adding a schedule to a NEW spoke by
+            # default would silently reintroduce the same failure shape this
+            # generator had already caused once - see GitHub issue on the hub
+            # repo for the specific fix. Trigger manually until a schedule is
+            # a deliberate, separate decision for this specific spoke.
             "path": ".github/workflows/call-hub.yml",
             "content": '''name: Ping CTO Hub
+# The automatic schedule is deliberately NOT enabled here - see the comment
+# in setup_spoke.py that generated this file. Trigger manually via
+# workflow_dispatch when you want a hub run; only add a schedule as its own
+# explicit decision, separate from this initial setup.
 on:
-  schedule:
-    - cron: '*/30 * * * *'   # -> debug
-    - cron: '0 0 * * 0'      # Sunday midnight -> refactor
-    - cron: '0 12 * * 3'     # Wednesday noon -> hunt
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Mode to send to the hub'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - hunt
+          - refactor
 
 jobs:
   call-central-brain:
     runs-on: ubuntu-latest
     steps:
-      - name: Determine Mode
-        id: mode
-        run: |
-          case "${{ github.event.schedule }}" in
-            '0 0 * * 0') echo "mode=refactor" >> $GITHUB_OUTPUT ;;
-            '0 12 * * 3') echo "mode=hunt" >> $GITHUB_OUTPUT ;;
-            *) echo "mode=debug" >> $GITHUB_OUTPUT ;;
-          esac
       - name: Send Payload to Hub
         env:
           VERCEL_URL: ${{ secrets.VERCEL_URL }}
@@ -151,7 +165,7 @@ jobs:
             -d '{
               "owner": "${{ github.repository_owner }}",
               "repo": "${{ github.event.repository.name }}",
-              "mode": "${{ steps.mode.outputs.mode }}",
+              "mode": "${{ inputs.mode }}",
               "callerKey": "${{ secrets.TENANT_CALLER_KEY }}"
             }'
 '''
@@ -178,9 +192,11 @@ jobs:
     print("     under a tenant with a callerKeyRef configured (multi-tenancy -")
     print("     see the hub's README). Leave unset for a single-tenant/default setup.")
     print("3. Ensure the Hub's GLOBAL_GITHUB_TOKEN (a GitHub PAT) has access to this repo.")
-    print("4. Trigger the 'Ping CTO Hub' workflow manually (workflow_dispatch) first -")
+    print("4. Trigger the 'Ping CTO Hub' workflow manually (workflow_dispatch) to test -")
     print("   the hub defaults to DRY_RUN_MODE, so a successful test reports what it")
-    print("   WOULD do without filing anything. Only then trust the schedule.")
+    print("   WOULD do without filing anything. There is no automatic schedule on")
+    print("   this workflow by design (see its own header comment) - every run is")
+    print("   manual until adding a schedule is its own deliberate decision.")
     print("5. Ask the hub's maintainer to add this repo to the hub's own spokes.json")
     print("   if you want it included in the monthly Recursive Learning Loop.")
     print("="*50)

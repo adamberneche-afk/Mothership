@@ -26,6 +26,30 @@
 //      just a workaround).
 
 const MAX_DIFF_CHARS = 12000;
+
+// Ported from api/autonomous_agent.js's issue #34/#35 fixes - see that
+// file's header comments on each constant for the full reasoning. Kept in
+// sync deliberately: this file is a platform port of the same decision
+// logic, not an independent implementation, so a fix here without the
+// matching fix there (or vice versa) is exactly the kind of two-copies
+// drift this project's own lessons.md already warns about elsewhere.
+const DOC_LIKE_EXTENSIONS = new Set(['.md', '.json', '.yml', '.yaml', '.txt']);
+
+function isDocLikeFile(filename) {
+  const idx = filename.lastIndexOf('.');
+  return idx !== -1 && DOC_LIKE_EXTENSIONS.has(filename.slice(idx).toLowerCase());
+}
+
+const PER_FILE_MAX_CHARS = 2000;
+
+function truncateFilePatch(patch, filename) {
+  if (patch.length <= PER_FILE_MAX_CHARS) return patch;
+  return patch.slice(0, PER_FILE_MAX_CHARS) + `\n[... ${filename} truncated at ${PER_FILE_MAX_CHARS} chars ...]`;
+}
+
+const BOT_AUTHOR_LOGINS = new Set(['github-actions[bot]', 'dependabot[bot]']);
+const EXCLUDED_DIFF_PATH_PREFIXES = ['exports/'];
+
 const HUB_ISSUE_LABEL = 'cto-hub-auto';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const DECISION_LOG_MAX_ENTRIES = 500;
@@ -259,17 +283,25 @@ function processRequest(reqBody, {
   const globalNorthStar = safeGetHubFile(hubGithub, base64Decode, hubOwner, hubRepo, 'north_star_framework.md');
   const hubLessons = safeGetHubFile(hubGithub, base64Decode, hubOwner, hubRepo, 'hub_lessons.md');
 
-  let localContext = 'No local context found.';
-  try {
-    const { data: lsData } = github.repos.getContent({ owner, repo, path: 'lessons.md' });
-    const { data: nsData } = github.repos.getContent({ owner, repo, path: 'NORTH_STAR.md' });
-    localContext = `
-      LOCAL LESSONS: ${base64Decode(lsData.content)}
-      LOCAL NORTH STAR: ${base64Decode(nsData.content)}
-    `;
-  } catch (e) {
-    localContext = 'No local context found.';
-  }
+  // lessons.md and NORTH_STAR.md are fetched independently (issue #35) - a
+  // spoke whose NORTH_STAR.md has moved off-root must not also lose an
+  // otherwise-valid lessons.md just because they used to share one try/catch.
+  const fetchOptionalRepoFile = (path) => {
+    try {
+      const { data } = github.repos.getContent({ owner, repo, path });
+      return base64Decode(data.content);
+    } catch (e) {
+      return null;
+    }
+  };
+  const localLessons = fetchOptionalRepoFile('lessons.md');
+  const localNorthStar = fetchOptionalRepoFile('NORTH_STAR.md');
+  const localContext = (localLessons !== null || localNorthStar !== null)
+    ? `
+      LOCAL LESSONS: ${localLessons !== null ? localLessons : '(none found)'}
+      LOCAL NORTH STAR: ${localNorthStar !== null ? localNorthStar : '(none found)'}
+    `
+    : 'No local context found.';
 
   let latestCommitSha = null;
   try {
@@ -305,21 +337,61 @@ function processRequest(reqBody, {
     recordUsageEvent(hubGithub, base64Encode, base64Decode, hubOwner, hubRepo, { tenantId, timestamp: new Date().toISOString(), eventType, mode, owner, repo, ...extra });
 
   let codeDiff = null;
+  let botOrGeneratedCommitSkip = false;
   if (latestCommitSha) {
     try {
       const { data: commitDetail } = github.repos.getCommit({ owner, repo, ref: latestCommitSha });
-      const patches = (commitDetail.files || [])
-        .filter(f => typeof f.patch === 'string' && f.patch.length > 0)
-        .map(f => `--- ${f.filename} (${f.status}) ---\n${f.patch}`)
-        .join('\n\n');
-      if (patches.length > 0) {
-        codeDiff = patches.length > MAX_DIFF_CHARS
-          ? patches.slice(0, MAX_DIFF_CHARS) + `\n\n[... diff truncated at ${MAX_DIFF_CHARS} chars ...]`
-          : patches;
+      const changedFiles = commitDetail.files || [];
+
+      // Skip bot-authored / generated-data-only commits before spending an
+      // AI call on them (issue #35).
+      const commitAuthorLogin = commitDetail.author && commitDetail.author.login;
+      const allFilesExcluded = changedFiles.length > 0 && changedFiles.every(
+        f => EXCLUDED_DIFF_PATH_PREFIXES.some(prefix => f.filename.startsWith(prefix))
+      );
+      if (BOT_AUTHOR_LOGINS.has(commitAuthorLogin) || allFilesExcluded) {
+        botOrGeneratedCommitSkip = true;
+      } else {
+        const patchableFiles = changedFiles.filter(f => typeof f.patch === 'string' && f.patch.length > 0);
+
+        // Code files first, doc/config-like files last (issue #34).
+        const ordered = patchableFiles.slice().sort((a, b) => {
+          const aDoc = isDocLikeFile(a.filename), bDoc = isDocLikeFile(b.filename);
+          return aDoc === bDoc ? 0 : (aDoc ? 1 : -1);
+        });
+
+        const pieces = [];
+        const omittedFiles = [];
+        let runningLength = 0;
+        for (const f of ordered) {
+          const piece = `--- ${f.filename} (${f.status}) ---\n${truncateFilePatch(f.patch, f.filename)}`;
+          if (runningLength + piece.length + 2 > MAX_DIFF_CHARS) {
+            omittedFiles.push(f.filename);
+            continue;
+          }
+          pieces.push(piece);
+          runningLength += piece.length + 2;
+        }
+
+        const patches = pieces.join('\n\n');
+        if (patches.length > 0) {
+          codeDiff = omittedFiles.length > 0
+            ? patches + `\n\n[... ${omittedFiles.length} file(s) omitted to stay under ${MAX_DIFF_CHARS} chars: ` +
+              `${omittedFiles.slice(0, 10).join(', ')}${omittedFiles.length > 10 ? ', ...' : ''} ...]`
+            : patches;
+        }
       }
     } catch (e) {
       codeDiff = null;
     }
+  }
+
+  if (botOrGeneratedCommitSkip) {
+    logOutcome('bot_or_generated_commit_skip');
+    return {
+      httpStatus: 200,
+      body: { status: 'Skipped', reason: 'Latest commit is bot-authored or touches only excluded paths', dryRun }
+    };
   }
 
   if (!codeDiff) {

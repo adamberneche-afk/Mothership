@@ -6,6 +6,44 @@ import { join } from 'path';
 // size and API cost bounded.
 const MAX_DIFF_CHARS = 12000;
 
+// File extensions treated as documentation/config rather than source logic,
+// for the code-first ordering below (issue #34) - sorted to the END of the
+// diff, never dropped outright, so MAX_DIFF_CHARS's limited budget is spent
+// on code before these. Found via a real 122,293-char merge diff that got
+// cut off inside a data-seed file while 19 of 26 changed files - including
+// every one a full manual audit had found real bugs in - never reached the
+// prompt at all, because file order (not relevance) decided what fit.
+const DOC_LIKE_EXTENSIONS = new Set(['.md', '.json', '.yml', '.yaml', '.txt']);
+
+function isDocLikeFile(filename) {
+  const idx = filename.lastIndexOf('.');
+  return idx !== -1 && DOC_LIKE_EXTENSIONS.has(filename.slice(idx).toLowerCase());
+}
+
+// Caps any SINGLE file's own patch text, so one huge file at the front of
+// the (now code-first) order can't still consume the whole MAX_DIFF_CHARS
+// budget and starve every file after it - the second half of issue #34's
+// finding: reordering alone isn't enough if the first file in the new order
+// is itself bigger than the whole budget.
+const PER_FILE_MAX_CHARS = 2000;
+
+function truncateFilePatch(patch, filename) {
+  if (patch.length <= PER_FILE_MAX_CHARS) return patch;
+  return patch.slice(0, PER_FILE_MAX_CHARS) + `\n[... ${filename} truncated at ${PER_FILE_MAX_CHARS} chars ...]`;
+}
+
+// A commit authored by one of these carries nothing a debug/hunt/refactor
+// review can meaningfully judge - a scheduled export, a dependency bump
+// commit. EXCLUDED_DIFF_PATH_PREFIXES catches the same class by content
+// instead of author, for a generated-data commit a human happened to push.
+// Both found via issue #35: a spoke's actual latest commit was a
+// `github-actions[bot]` weekly issue-export dump under exports/ - every
+// mode correctly said "no findings," but only because there was,
+// coincidentally, nothing unsafe in the JSON, not because this was ever
+// recognized as an unreviewable commit shape.
+const BOT_AUTHOR_LOGINS = new Set(['github-actions[bot]', 'dependabot[bot]']);
+const EXCLUDED_DIFF_PATH_PREFIXES = ['exports/'];
+
 // Every issue this handler files is tagged with this label. GitHub creates
 // the label automatically on first use. It's how the rate cap below counts
 // "issues the hub created" without confusing them with anything a human
@@ -330,18 +368,29 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
     ? readFileSync(hubLessonsPath, 'utf8')
     : "";
 
-  // Fetch Local Context from the Spoke repo
-  let localContext = "No local context found.";
-  try {
-    const { data: lsData } = await octokit.repos.getContent({ owner, repo, path: 'lessons.md' });
-    const { data: nsData } = await octokit.repos.getContent({ owner, repo, path: 'NORTH_STAR.md' });
-    localContext = `
-      LOCAL LESSONS: ${Buffer.from(lsData.content, 'base64').toString()}
-      LOCAL NORTH STAR: ${Buffer.from(nsData.content, 'base64').toString()}
-    `;
-  } catch (e) {
-    localContext = "No local context found.";
-  }
+  // Fetch Local Context from the Spoke repo. lessons.md and NORTH_STAR.md are
+  // fetched independently (issue #35) - this used to be one try/catch around
+  // both reads, so a spoke whose NORTH_STAR.md has moved off-root (confirmed
+  // on a real spoke that keeps a genuine, current lessons.md but only an
+  // archived NORTH_STAR.md) silently lost its otherwise-valid lessons.md too.
+  const fetchOptionalRepoFile = async (path) => {
+    try {
+      const { data } = await octokit.repos.getContent({ owner, repo, path });
+      return Buffer.from(data.content, 'base64').toString();
+    } catch (e) {
+      return null;
+    }
+  };
+  const [localLessons, localNorthStar] = await Promise.all([
+    fetchOptionalRepoFile('lessons.md'),
+    fetchOptionalRepoFile('NORTH_STAR.md'),
+  ]);
+  const localContext = (localLessons !== null || localNorthStar !== null)
+    ? `
+      LOCAL LESSONS: ${localLessons !== null ? localLessons : '(none found)'}
+      LOCAL NORTH STAR: ${localNorthStar !== null ? localNorthStar : '(none found)'}
+    `
+    : "No local context found.";
 
   // Find the spoke's latest commit sha up front - both the decision-log
   // dedup check below and the diff fetch further down need it, so fetch it
@@ -402,13 +451,54 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   if (latestCommitSha) {
     try {
       const { data: commitDetail } = await octokit.repos.getCommit({ owner, repo, ref: latestCommitSha });
-      const patches = (commitDetail.files || [])
-        .filter(f => typeof f.patch === 'string' && f.patch.length > 0)
-        .map(f => `--- ${f.filename} (${f.status}) ---\n${f.patch}`)
-        .join('\n\n');
+      const changedFiles = commitDetail.files || [];
+
+      // Skip bot-authored / generated-data-only commits before spending an
+      // AI call on them (issue #35) - see BOT_AUTHOR_LOGINS/
+      // EXCLUDED_DIFF_PATH_PREFIXES above.
+      const commitAuthorLogin = commitDetail.author && commitDetail.author.login;
+      const allFilesExcluded = changedFiles.length > 0 && changedFiles.every(
+        f => EXCLUDED_DIFF_PATH_PREFIXES.some(prefix => f.filename.startsWith(prefix))
+      );
+      if (BOT_AUTHOR_LOGINS.has(commitAuthorLogin) || allFilesExcluded) {
+        await logOutcome('bot_or_generated_commit_skip');
+        return {
+          httpStatus: 200,
+          body: { status: 'Skipped', reason: 'Latest commit is bot-authored or touches only excluded paths', dryRun }
+        };
+      }
+
+      const patchableFiles = changedFiles.filter(f => typeof f.patch === 'string' && f.patch.length > 0);
+
+      // Code files first, doc/config-like files last (issue #34) - a stable
+      // sort so files of the same kind keep their original relative order.
+      const ordered = [...patchableFiles].sort((a, b) => {
+        const aDoc = isDocLikeFile(a.filename), bDoc = isDocLikeFile(b.filename);
+        return aDoc === bDoc ? 0 : (aDoc ? 1 : -1);
+      });
+
+      // Take-until-full, but skip (not stop at) a file that doesn't fit, so
+      // a later, smaller file still gets a chance - and cap each file's own
+      // patch first (PER_FILE_MAX_CHARS) so one huge file can't consume the
+      // whole budget by itself.
+      const pieces = [];
+      const omittedFiles = [];
+      let runningLength = 0;
+      for (const f of ordered) {
+        const piece = `--- ${f.filename} (${f.status}) ---\n${truncateFilePatch(f.patch, f.filename)}`;
+        if (runningLength + piece.length + 2 > MAX_DIFF_CHARS) {
+          omittedFiles.push(f.filename);
+          continue;
+        }
+        pieces.push(piece);
+        runningLength += piece.length + 2;
+      }
+
+      const patches = pieces.join('\n\n');
       if (patches.length > 0) {
-        codeDiff = patches.length > MAX_DIFF_CHARS
-          ? patches.slice(0, MAX_DIFF_CHARS) + `\n\n[... diff truncated at ${MAX_DIFF_CHARS} chars ...]`
+        codeDiff = omittedFiles.length > 0
+          ? patches + `\n\n[... ${omittedFiles.length} file(s) omitted to stay under ${MAX_DIFF_CHARS} chars: ` +
+            `${omittedFiles.slice(0, 10).join(', ')}${omittedFiles.length > 10 ? ', ...' : ''} ...]`
           : patches;
       }
     } catch (e) {
