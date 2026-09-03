@@ -105,5 +105,53 @@
     "mode": "refactor",
     "owner": "adamberneche-afk",
     "repo": "Mothership"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-09-03T00:00:00.000Z",
+    "eventType": "review_run",
+    "mode": "debug",
+    "owner": "adamberneche-afk",
+    "repo": "kos"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-09-03T00:00:00.000Z",
+    "eventType": "review_run",
+    "mode": "hunt",
+    "owner": "adamberneche-afk",
+    "repo": "kos"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-09-03T00:00:00.000Z",
+    "eventType": "review_run",
+    "mode": "refactor",
+    "owner": "adamberneche-afk",
+    "repo": "kos"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-09-03T00:05:00.000Z",
+    "eventType": "review_run",
+    "mode": "debug",
+    "owner": "adamberneche-afk",
+    "repo": "kos"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-09-03T00:05:00.000Z",
+    "eventType": "review_run",
+    "mode": "hunt",
+    "owner": "adamberneche-afk",
+    "repo": "kos"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-09-03T00:05:00.000Z",
+    "eventType": "review_run",
+    "mode": "refactor",
+    "owner": "adamberneche-afk",
+    "repo": "kos"
   }
 ]
