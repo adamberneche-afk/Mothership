@@ -98,7 +98,17 @@ function makeGithubClient(httpFetch, token) {
         request(httpFetch, token, 'get', `/repos/${owner}/${repo}/commits`, { query: { per_page } }),
 
       getCommit: ({ owner, repo, ref }) =>
-        request(httpFetch, token, 'get', `/repos/${owner}/${repo}/commits/${ref}`)
+        request(httpFetch, token, 'get', `/repos/${owner}/${repo}/commits/${ref}`),
+
+      // Used by deploy_version_report.js's self-report - fires a
+      // repository_dispatch event .github/workflows/deploy-drift.yml
+      // reacts to. A real 204-No-Content response (no body) falls out of
+      // request()'s normal 2xx handling with data: null - no special case
+      // needed here.
+      createDispatchEvent: ({ owner, repo, event_type, client_payload }) =>
+        request(httpFetch, token, 'post', `/repos/${owner}/${repo}/dispatches`, {
+          body: { event_type, client_payload }
+        })
     },
     issues: {
       listForRepo: ({ owner, repo, state, labels, sort, direction, per_page }) =>

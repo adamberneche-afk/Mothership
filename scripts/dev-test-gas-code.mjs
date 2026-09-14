@@ -115,7 +115,7 @@ function loadCodeWithFakes({ props = {}, aiJsonContent = NO_FINDING_JSON, github
     SpreadsheetApp: trackedSpreadsheetApp,
     Logger: { log: () => {} }
   };
-  const context = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js', 'recursive_learning.js', 'Code.js', seed);
+  const context = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js', 'recursive_learning.js', 'deploy_version_marker.js', 'deploy_version_report.js', 'Code.js', seed);
   return { context, urlFetchApp, openByIdCalls };
 }
 
