@@ -19,6 +19,10 @@
 // anything else) can never end up in a saveSettings() payload even if a
 // caller tries to smuggle it in.
 const SETTINGS_KEYS = [
+  // No longer required for the review/proposal pipeline itself - see
+  // review_queue.js's header comment. Kept settable here only for a
+  // possible future direct-call fallback mode; QUEUE_SHEET_ID below is
+  // what the actual deployed pipeline reads.
   'AI_API_KEY',
   'AI_MODEL',
   'AI_BASE_URL',
@@ -26,7 +30,11 @@ const SETTINGS_KEYS = [
   'DRY_RUN_MODE',
   'RATE_CAP_PER_REPO_PER_DAY',
   'HUB_GITHUB_OWNER',
-  'HUB_GITHUB_REPO'
+  'HUB_GITHUB_REPO',
+  // ID of the Google Sheet holding ReviewQueue/LearningQueue - see
+  // review_queue.js's header comment and README.md's "Deploy Without
+  // Vercel" section for the one-time setup this needs.
+  'QUEUE_SHEET_ID'
 ];
 
 // Shown masked, never in full, and never pre-filled into an editable value -
