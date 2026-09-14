@@ -2,6 +2,8 @@
 
 Written for whoever (human or a fresh Claude Code session) picks this up next. Read the "Start here" section first — everything else is context for *why*, not things to do before that.
 
+> **Update (2026-09-14):** A later session re-verified this handoff's entire open-items list, plus every finding in KOS Audit Docket II, against then-current code across every repo in the account, then ran a scoped one-item sprint against Mothership specifically. **Items 5 and 8 below have since closed** — marked inline. Item 5 closed incidentally, as a side effect of an unrelated lock-hardening commit in kos-personal. Item 8 closed in two steps: Argoloth's half closed incidentally too (found mid-feature-work), but **Mothership's own copy was fixed deliberately, as its own scoped sprint** — the account's first case of an item actually getting pulled off this list on purpose rather than by accident. Every other item, including item 1, was re-confirmed exactly as open as described below. Full detail: [The Pivot Ledger](https://claude.ai/code/artifact/324d94db-64b1-4e3d-904f-16de245a2f79)'s "Auditing the audit" section — leaving this table's original claims uncorrected here would repeat the exact mistake that section exists to catch.
+
 ---
 
 ## Start here: one pending decision blocks nothing else, but is the highest-priority open item
@@ -20,7 +22,7 @@ This was flagged to the repo owner directly and is **awaiting a decision, not a 
    - Argoloth needed a from-scratch GAS-mock test harness (none existed) — now 105 committed tests.
    - TSO had a genuinely broken floor: 4 workflow files were silently invalid YAML (a real incident, not hypothetical) and its one test file had never actually run (truncated mid-statement, plus a missing `require`). All fixed and verified green.
    - Mothership picked up its own missing Dependabot/CodeQL, plus a real docs-drift fix: the dashboard's "Hub Health" panel was undercounting its own scheduled workflows by 3 (one pre-existing gap, two from this session's own additions).
-2. **Ran the `mothership-live-review` skill against KOS's two newest commits** at the time (the docs-check-gate + watchdog feature, and its README follow-up) — found nothing wrong in what wasn't truncated away by `MAX_DIFF_CHARS`, but did find and fix a real backported bug: KOS's own copy of the watchdog silently reported "every file clean" if `actionlint` couldn't even be spawned, instead of surfacing the tool failure. Fixed there; **still not backported to Argoloth's or Mothership's copies** — see Open Items below.
+2. **Ran the `mothership-live-review` skill against KOS's two newest commits** at the time (the docs-check-gate + watchdog feature, and its README follow-up) — found nothing wrong in what wasn't truncated away by `MAX_DIFF_CHARS`, but did find and fix a real backported bug: KOS's own copy of the watchdog silently reported "every file clean" if `actionlint` couldn't even be spawned, instead of surfacing the tool failure. Fixed there; still not backported to Argoloth's or Mothership's copies at the time — **update, 2026-09-14: both are now fixed too, see Open Items item 8**.
 3. **Discovered KOS's local clone was ~100 commits behind `origin/main`** — silently missing an entire leader-hub server migration, a new autonomous "Drive Steward" system, and a full "Flow doctrine" rollout, discovered only when a routine push was rejected as non-fast-forward. Merged cleanly, no conflicts, no lost work.
 4. **Given that scale of surprise change, ran a full re-audit** (4 parallel research passes) against KOS's original audit findings plus everything genuinely new. Published as **[KOS Audit Docket II](https://claude.ai/code/artifact/a34064f3-f903-4c6d-9834-e845057c9053)**. Headline results:
    - kos-personal: 1 of 5 original findings genuinely fixed (webhook auth), 4 untouched, 2 new concurrency bugs.
@@ -40,14 +42,14 @@ This was flagged to the repo owner directly and is **awaiting a decision, not a 
 | 2 | Anchor/escape the prompt delimiter feeding forged SCR evidence | KOS, cas-ccps | Open, HIGH — Audit Docket II rec #2 |
 | 3 | Validate the intake email before it grants Drive access | KOS, cas-ccps | Open, HIGH — same gap since the *first* KOS audit |
 | 4 | Wire a real SCR confirm/override caller (or rescope the status table + disable the dead Weekly Parent Report section) | KOS, cas-ccps | Open |
-| 5 | Add `LockService` to `harvestStudioReturns()` and `_markAuditRetryPriority_()` | KOS, kos-personal | Open, new this session |
-| 6 | Encrypt OAuth refresh tokens at rest, narrow Drive scope to `drive.file` | KOS, kos-personal | Open since the *first* KOS audit |
-| 7 | Fix `tools/doc-currency/check.js:100`'s exclusion-path bug (root-only match, not any-depth) | KOS | Open, low severity, fully reproducible |
-| 8 | Backport the actionlint-ENOENT watchdog fix | Argoloth, Mothership | Open (KOS and TSO already have it) |
-| 9 | Bring ThinkOS-Server and Tais up to the same CI/CD floor as the other 4 repos | ThinkOS-Server, Tais | Not started — see Pivot Ledger status table |
-| 10 | School Store Sales Log's unescaped `innerHTML` sink | KOS, leader-hub | Open, low severity (single-owner data only) |
+| 5 | Add `LockService` to `harvestStudioReturns()` and `_markAuditRetryPriority_()` | KOS, kos-personal | ✅ **Resolved (2026-09-14)** — both closed as a side effect of an unrelated lock-hardening commit (`7921cde`) wrapping `processInferenceQueue()`'s whole body in `LockService.getScriptLock()`; `harvestStudioReturns()` now takes the lock directly, and `_markAuditRetryPriority_()`'s one call site sits inside that same lock. Not a targeted fix for this item, but the race it named is genuinely closed. |
+| 6 | Encrypt OAuth refresh tokens at rest, narrow Drive scope to `drive.file` | KOS, kos-personal | Open since the *first* KOS audit — re-confirmed open 2026-09-14 |
+| 7 | Fix `tools/doc-currency/check.js:100`'s exclusion-path bug (root-only match, not any-depth) | KOS | Open, low severity, fully reproducible — re-confirmed open 2026-09-14 |
+| 8 | Backport the actionlint-ENOENT watchdog fix | Argoloth, Mothership | ✅ **Resolved (2026-09-14)** — Argoloth's copy fixed incidentally during unrelated feature work (commit `35beb6e`); Mothership's copy fixed deliberately in a scoped one-item sprint (commit `751f8e0`), with a new regression test covering the spawn-failure path. All four repos with this watchdog (KOS, Mothership, Argoloth, TSO) are now consistent. |
+| 9 | Bring ThinkOS-Server and Tais up to the same CI/CD floor as the other 4 repos | ThinkOS-Server, Tais | Not started — re-confirmed via a live `git ls-remote` (not a stale clone) on 2026-09-14 — see Pivot Ledger status table |
+| 10 | School Store Sales Log's unescaped `innerHTML` sink | KOS, leader-hub | Open, low severity (single-owner data only) — re-confirmed open 2026-09-14 |
 
-Items 2–4 and 6–7 are unchanged in substance from what Audit Docket II already recommends in more detail — that document is the source of truth for exact file:line citations, not this summary.
+Items 2–4, 6, 7, and 10 are unchanged in substance from what Audit Docket II already recommends in more detail — that document is the source of truth for exact file:line citations, not this summary. Items 5 and 8 are the first two items on this list to actually close since it was written; see the 2026-09-14 update note at the top of this file for how each one closed.
 
 ---
 
