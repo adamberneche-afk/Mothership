@@ -246,6 +246,21 @@ function testLivenessDistinguishesNeverAnsweredFromSlowFromAnswered() {
   check('1 ready, 1 answered, everAnswered true', report.ready === 1 && report.answered === 1 && report.everAnswered === true);
 }
 
+function testLivenessCatchesARowStuckAtReadyWithRealOutput() {
+  console.log('checkReviewQueueLiveness catches a row where the Flow wrote real output but never advanced ReadyStatus past READY - the exact bug KOS\'s checkFlow2Binding found and fixed for cas-ccps');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput'],
+    [new Date(), 'o', 'r', 'debug', 'sha1', 'READY', 'prompt', 'a real answer landed here, but status never flipped']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkReviewQueueLiveness({ queueSheetId: 'sheet-1' });
+  check('reported as stuckAtReady, not as a healthy "answered" row', report.stuckAtReady === 1 && report.answered === 0);
+  check('not double-counted as still ready-and-waiting either', report.ready === 0);
+  check('everAnswered is NOT set from a stuck row - it never really reached harvest', report.everAnswered === false);
+}
+
 function testLearningQueueLivenessSameShape() {
   console.log('checkLearningQueueLiveness reports the same three-state shape for LearningQueue rows');
   const ctx = freshContext();
@@ -328,6 +343,7 @@ function main() {
   testHarvestReviewCallsFinalizeAndMarksHarvested();
   testHarvestReviewMarksThrownErrorsDistinctly();
   testLivenessDistinguishesNeverAnsweredFromSlowFromAnswered();
+  testLivenessCatchesARowStuckAtReadyWithRealOutput();
   testLearningQueueLivenessSameShape();
   testLivenessFailsSafeWithNoQueueSheetConfigured();
   testInstallTriggersCreatesBothOnAFreshProject();

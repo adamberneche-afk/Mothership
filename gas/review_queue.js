@@ -268,32 +268,61 @@ function harvestLearningResults(deps) {
   return { harvested };
 }
 
+const LIVENESS_ZERO_REPORT = { ready: 0, answered: 0, everAnswered: false, oldestReadyMins: 0, stuckAtReady: 0 };
+
+// FIX (found by reviewing KOS's own cas-ccps Flow-doctrine tooling, not a
+// live incident here yet): a Flow's "update row" step can write
+// GeminiFullOutput and forget to also set ReadyStatus = "EVALUATED" in
+// that same step - harvestReviewResults()/harvestLearningResults() only
+// ever scan for ReadyStatus === "EVALUATED" (see their own loops above),
+// so a row with real output sitting right there, still at "READY", is
+// never picked up - forever. This function used to count any row with
+// non-empty output as simply "answered," which would have reported that
+// exact failure mode as healthy - the identical bug KOS's own
+// checkFlow2Binding() found and fixed for cas-ccps's Flow 2. Reported
+// here as its own `stuckAtReady` count, and logged with the same
+// actionable guidance that fix's own comment gives, rather than folded
+// silently into `answered`.
 function checkQueueLiveness_(sheet, statusColIdx, outputColIdx, timestampColIdx) {
   const data = sheet.getDataRange().getValues();
-  const report = { ready: 0, answered: 0, everAnswered: false, oldestReadyMins: 0 };
+  const report = { ready: 0, answered: 0, everAnswered: false, oldestReadyMins: 0, stuckAtReady: 0 };
   const nowMs = Date.now();
   for (let i = 1; i < data.length; i++) {
     const row = data[i];
-    const answered = String(row[outputColIdx] || '').trim() !== '';
-    if (answered) { report.answered++; report.everAnswered = true; continue; }
-    if (String(row[statusColIdx] || '').trim() !== 'READY') continue;
+    const hasOutput = String(row[outputColIdx] || '').trim() !== '';
+    const status = String(row[statusColIdx] || '').trim();
+
+    if (hasOutput && status === 'READY') {
+      report.stuckAtReady++;
+      continue;
+    }
+    if (hasOutput) { report.answered++; report.everAnswered = true; continue; }
+    if (status !== 'READY') continue;
     report.ready++;
     const ageMins = Math.round((nowMs - new Date(row[timestampColIdx]).getTime()) / 60000);
     if (ageMins > report.oldestReadyMins) report.oldestReadyMins = ageMins;
   }
+
+  if (report.stuckAtReady > 0) {
+    Logger.log('[ReviewQueue] ' + report.stuckAtReady + ' row(s) have a real answer in the output ' +
+      'column but ReadyStatus never advanced past READY - harvest will never pick these up. The ' +
+      'Flow\'s "update spreadsheet row" step needs to write the output column AND set ReadyStatus ' +
+      'to the literal "EVALUATED", both in the same step. Change nothing else about the row.');
+  }
+
   return report;
 }
 
 function checkReviewQueueLiveness(config) {
   const ss = openQueueSpreadsheet_(config);
-  if (!ss) return { ready: 0, answered: 0, everAnswered: false, oldestReadyMins: 0 };
+  if (!ss) return { ...LIVENESS_ZERO_REPORT };
   const sheet = ensureQueueTab_(ss, QUEUE_TAB_REVIEW, RQ_HEADERS);
   return checkQueueLiveness_(sheet, RQ.READY_STATUS, RQ.GEMINI_FULL_OUTPUT, RQ.TIMESTAMP);
 }
 
 function checkLearningQueueLiveness(config) {
   const ss = openQueueSpreadsheet_(config);
-  if (!ss) return { ready: 0, answered: 0, everAnswered: false, oldestReadyMins: 0 };
+  if (!ss) return { ...LIVENESS_ZERO_REPORT };
   const sheet = ensureQueueTab_(ss, QUEUE_TAB_LEARNING, LQ_HEADERS);
   return checkQueueLiveness_(sheet, LQ.READY_STATUS, LQ.GEMINI_FULL_OUTPUT, LQ.TIMESTAMP);
 }
