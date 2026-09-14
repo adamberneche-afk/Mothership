@@ -331,6 +331,186 @@ function testInstallTriggersOnlyCreatesTheMissingOne() {
   check('only the missing learning trigger was created', names.length === 1 && names[0] === 'runHarvestLearningResults');
 }
 
+// --- checkReviewQueueBinding / checkLearningQueueBinding --------------------
+
+function testBindingReportsOkWhenHeadersMatchExactly() {
+  console.log('checkReviewQueueBinding reports ok:true when the sheet header row matches RQ_HEADERS exactly');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkReviewQueueBinding({ queueSheetId: 'sheet-1' });
+  check('ok is true', report.ok === true);
+  check('nothing missing/mismatched/extra', report.missing.length === 0 && report.mismatched.length === 0 && report.extra.length === 0);
+}
+
+function testBindingCatchesAMissingColumn() {
+  console.log('checkReviewQueueBinding catches a header cell a human deleted while hand-editing the sheet');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', '', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkReviewQueueBinding({ queueSheetId: 'sheet-1' });
+  check('ok is false', report.ok === false);
+  check('ReadyStatus reported missing', report.missing.includes('ReadyStatus'));
+}
+
+function testBindingCatchesARenamedColumn() {
+  console.log('checkReviewQueueBinding catches a header cell a human renamed (not blank, just wrong)');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repository', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkReviewQueueBinding({ queueSheetId: 'sheet-1' });
+  check('ok is false', report.ok === false);
+  check('the mismatch is reported at the right index with expected/got', report.mismatched.some((m) => m.index === 2 && m.expected === 'Repo' && m.got === 'Repository'));
+}
+
+function testBindingCatchesAnExtraColumn() {
+  console.log('checkReviewQueueBinding catches an extra column tacked onto the end of the header row');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'Notes']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkReviewQueueBinding({ queueSheetId: 'sheet-1' });
+  check('ok is false', report.ok === false);
+  check('the extra column is reported', report.extra.includes('Notes'));
+}
+
+function testLearningBindingSameShape() {
+  console.log('checkLearningQueueBinding reports the same shape against LQ_HEADERS');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Kind', 'TenantId', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'ContextJson']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ LearningQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkLearningQueueBinding({ queueSheetId: 'sheet-1' });
+  check('ok is true', report.ok === true);
+}
+
+function testBindingFailsSafeWithNoQueueSheetConfigured() {
+  console.log('checkReviewQueueBinding reports a clean not-ok, not a crash, when QUEUE_SHEET_ID is unconfigured');
+  const ctx = freshContext();
+  const report = ctx.checkReviewQueueBinding({});
+  check('ok is false', report.ok === false);
+  check('reason explains why', typeof report.reason === 'string' && report.reason.length > 0);
+}
+
+// --- installReviewQueueFixture / installLearningQueueFixture ----------------
+
+function testInstallReviewFixtureAppendsAFixtureRow() {
+  console.log('installReviewQueueFixture appends a _fixture/_fixture row a human can point a Flow test run at');
+  const ctx = freshContext();
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const result = ctx.installReviewQueueFixture({ queueSheetId: 'sheet-1' });
+  check('reports ok, not already installed', result.ok === true && result.alreadyInstalled === false);
+  check('a _fixture/_fixture row landed with ReadyStatus READY', rqSheet._rows.some((r) => r[1] === '_fixture' && r[2] === '_fixture' && r[5] === 'READY'));
+}
+
+function testInstallReviewFixtureIsIdempotent() {
+  console.log('installReviewQueueFixture never installs a second fixture row when one already exists');
+  const ctx = freshContext();
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput'],
+    [new Date(), '_fixture', '_fixture', 'fixture', '_fixture', 'READY', 'prompt', '']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const before = rqSheet._rows.length;
+  const result = ctx.installReviewQueueFixture({ queueSheetId: 'sheet-1' });
+  check('reports already installed', result.ok === true && result.alreadyInstalled === true);
+  check('row count unchanged', rqSheet._rows.length === before);
+}
+
+function testInstallLearningFixtureAppendsAFixtureRow() {
+  console.log('installLearningQueueFixture appends a TenantId=_fixture row a human can point a Flow test run at');
+  const ctx = freshContext();
+  const lqSheet = makeFakeSheet([
+    ['Timestamp', 'Kind', 'TenantId', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'ContextJson']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ LearningQueue: lqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const result = ctx.installLearningQueueFixture({ queueSheetId: 'sheet-1' });
+  check('reports ok, not already installed', result.ok === true && result.alreadyInstalled === false);
+  check('a TenantId=_fixture row landed with ReadyStatus READY', lqSheet._rows.some((r) => r[2] === '_fixture' && r[3] === 'READY'));
+}
+
+function testInstallLearningFixtureIsIdempotent() {
+  console.log('installLearningQueueFixture never installs a second fixture row when one already exists');
+  const ctx = freshContext();
+  const lqSheet = makeFakeSheet([
+    ['Timestamp', 'Kind', 'TenantId', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'ContextJson'],
+    [new Date(), 'tenant', '_fixture', 'READY', 'prompt', '', '']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ LearningQueue: lqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const before = lqSheet._rows.length;
+  const result = ctx.installLearningQueueFixture({ queueSheetId: 'sheet-1' });
+  check('reports already installed', result.ok === true && result.alreadyInstalled === true);
+  check('row count unchanged', lqSheet._rows.length === before);
+}
+
+// --- runReviewQueueCanary / runLearningQueueCanary ---------------------------
+
+function testReviewCanaryRunsEndToEndAndLeavesHarvestedRow() {
+  console.log('runReviewQueueCanary enqueues, self-answers, and harvests its own row end to end, landing HARVESTED');
+  const ctx = freshContext();
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const github = makeFakeGithubForFinalize();
+  const result = ctx.runReviewQueueCanary({ ...BASE_DEPS, githubFactory: () => github, hubGithub: github, config: { queueSheetId: 'sheet-1', dryRunMode: 'true' } });
+  check('reports ok', result.ok === true);
+  check('a HARVESTED canary row landed, targeting the hub\'s own repo', rqSheet._rows.some((r) => r[3] === 'canary' && r[5] === 'HARVESTED' && String(r[4]).startsWith('CANARY-')));
+  check('the commitSha returned matches the row actually written', rqSheet._rows.some((r) => r[4] === result.commitSha));
+}
+
+function testReviewCanaryNeverCreatesARealIssueEvenLiveOffDryRun() {
+  console.log('runReviewQueueCanary never files a real issue even when dryRunMode would otherwise allow it (has_findings: false stops it first)');
+  const ctx = freshContext();
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const github = makeFakeGithubForFinalize();
+  // dryRunMode explicitly 'false' - live mode - the canary must still never
+  // reach github.issues.create.
+  const result = ctx.runReviewQueueCanary({ ...BASE_DEPS, githubFactory: () => github, hubGithub: github, config: { queueSheetId: 'sheet-1', dryRunMode: 'false', globalGithubToken: 'tok' } });
+  check('reports ok', result.ok === true);
+  check('no real issue was ever created', github.calls.issuesCreate.length === 0);
+}
+
+function testLearningCanaryRunsEndToEndAndLeavesHarvestedRow() {
+  console.log('runLearningQueueCanary enqueues, self-answers, and harvests its own row end to end, landing HARVESTED');
+  const ctx = freshContext();
+  const lqSheet = makeFakeSheet([
+    ['Timestamp', 'Kind', 'TenantId', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'ContextJson']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ LearningQueue: lqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const hubGithub = makeFakeGithubForFinalize();
+  const result = ctx.runLearningQueueCanary({ ...BASE_DEPS, githubFactory: () => hubGithub, hubGithub, config: { queueSheetId: 'sheet-1', dryRunMode: 'false', globalGithubToken: 'tok' } });
+  check('reports ok', result.ok === true);
+  check('a HARVESTED canary row landed with TenantId=canary', lqSheet._rows.some((r) => r[2] === 'canary' && r[3] === 'HARVESTED'));
+  check('no real PR was ever opened, even in live mode - has_proposal:false stops it first', hubGithub.calls.createOrUpdateFileContents.length === 0);
+}
+
 function main() {
   testAutoCreatesQueueSpreadsheetWhenUnconfigured();
   testAutoCreateSkipsCleanlyWhenLockContended();
@@ -349,6 +529,19 @@ function main() {
   testInstallTriggersCreatesBothOnAFreshProject();
   testInstallTriggersIsIdempotent();
   testInstallTriggersOnlyCreatesTheMissingOne();
+  testBindingReportsOkWhenHeadersMatchExactly();
+  testBindingCatchesAMissingColumn();
+  testBindingCatchesARenamedColumn();
+  testBindingCatchesAnExtraColumn();
+  testLearningBindingSameShape();
+  testBindingFailsSafeWithNoQueueSheetConfigured();
+  testInstallReviewFixtureAppendsAFixtureRow();
+  testInstallReviewFixtureIsIdempotent();
+  testInstallLearningFixtureAppendsAFixtureRow();
+  testInstallLearningFixtureIsIdempotent();
+  testReviewCanaryRunsEndToEndAndLeavesHarvestedRow();
+  testReviewCanaryNeverCreatesARealIssueEvenLiveOffDryRun();
+  testLearningCanaryRunsEndToEndAndLeavesHarvestedRow();
 
   console.log('');
   if (failures > 0) {
