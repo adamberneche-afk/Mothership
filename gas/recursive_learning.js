@@ -479,7 +479,7 @@ function runRecursiveLearning(reqBody, {
   })();
 
   if (!sheet) {
-    return { httpStatus: 200, body: { status: 'Skipped', reason: 'QUEUE_SHEET_ID is not configured - nothing to queue this run into', dryRun } };
+    return { httpStatus: 200, body: { status: 'Skipped', reason: 'No queue spreadsheet available (QUEUE_SHEET_ID unset and no scriptProperties to auto-create/persist one into, or the create-lock was briefly contended) - nothing to queue this run into', dryRun } };
   }
 
   // One independent run per tenant - never pooled. See

@@ -106,13 +106,54 @@ function ensureQueueTab_(ss, tabName, headers) {
 
 // config.queueSheetId is the QUEUE_SHEET_ID Script Property - one
 // spreadsheet, both tabs, same "one Central Ledger" shape cas-ccps already
-// uses. Returns null (not a throw) when unset, so a deployment that hasn't
-// run the one-time setup step yet fails a specific, loggable way rather
+// uses. Auto-creates it on first use (see ensureQueueSpreadsheetCreated_)
+// when unset and a real Script Properties handle is available to persist
+// the new ID into; returns null only when there's truly no way to proceed
+// (no config.scriptProperties, or the create-lock couldn't be acquired), so
+// a genuinely broken deployment still fails a specific, loggable way rather
 // than an opaque SpreadsheetApp error.
 function openQueueSpreadsheet_(config) {
   const id = config && config.queueSheetId;
-  if (!id) return null;
-  return SpreadsheetApp.openById(id);
+  if (id) return SpreadsheetApp.openById(id);
+  return ensureQueueSpreadsheetCreated_(config);
+}
+
+// Removes the one manual "create a blank Sheet, copy its ID into
+// QUEUE_SHEET_ID" setup step - the only genuinely manual step left after
+// this is building the two Workspace Flows, since Studio/Flow itself has
+// no deploy API (see this file's header comment).
+//
+// Locked (LockService.getScriptLock()) and re-checks Script Properties
+// under the lock before creating - two concurrent requests both hitting
+// doPost() before QUEUE_SHEET_ID exists yet must not create two
+// spreadsheets. A human's Flow only ever gets built against one of them;
+// a second, orphaned spreadsheet nobody's Flow is watching would silently
+// swallow every request routed to it - exactly the invisible-failure class
+// this account's own watchdog/liveness-check philosophy exists to catch,
+// not a risk worth taking to save one lock acquisition. If the lock can't
+// be acquired, this run skips cleanly (returns null, same as "not
+// configured") rather than risking a duplicate - the next run tries again.
+function ensureQueueSpreadsheetCreated_(config) {
+  if (!config || !config.scriptProperties) return null; // no way to persist a new ID - fail safe, same as before
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    Logger.log('[ReviewQueue] Could not acquire the create-lock for the queue spreadsheet - another request is likely creating it right now. Skipping this run; the next one will find it.');
+    return null;
+  }
+  try {
+    // Re-check under the lock - another request may have already created
+    // and persisted it while this one was waiting on tryLock.
+    const existingId = config.scriptProperties.getProperty('QUEUE_SHEET_ID');
+    if (existingId) return SpreadsheetApp.openById(existingId);
+
+    const ss = SpreadsheetApp.create('Mothership Review Queue');
+    config.scriptProperties.setProperty('QUEUE_SHEET_ID', ss.getId());
+    Logger.log('[ReviewQueue] Created the queue spreadsheet: ' + ss.getUrl() + ' - build the two Workspace Flows against it next (see README.md\'s "Native Workspace Inference" section), or find this link again on the settings page.');
+    return ss;
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 // enqueueReviewRow_ - dedup on Owner+Repo+Mode+CommitSha among rows not yet

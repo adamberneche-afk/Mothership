@@ -190,6 +190,23 @@ function renderFormHtml_(token, currentValues) {
         '</label></div>'
       );
     }
+    if (key === 'QUEUE_SHEET_ID') {
+      const current = currentValues[key] || '';
+      // Auto-created on first real request/harvest run if left unset (see
+      // review_queue.js's ensureQueueSpreadsheetCreated_) - shown here as a
+      // live link once it exists, since that's the one place a human needs
+      // to go build the two Workspace Flows. Still a plain editable field
+      // too, for an operator who wants to point this at a specific
+      // existing Sheet instead of letting one get created automatically.
+      const linkHtml = current
+        ? '<a href="https://docs.google.com/spreadsheets/d/' + encodeURIComponent(current) + '/edit" target="_blank" rel="noopener">open the queue spreadsheet ↗</a>'
+        : '(not created yet - the first real request or scheduled harvest run creates one automatically and fills this in; reload this page after that to get the link)';
+      return (
+        '<div style="margin-bottom:12px"><label>' + key + '<br>' +
+        '<input type="text" name="' + key + '" value="' + htmlEscape_(current) + '" style="width:100%;padding:6px" autocomplete="off">' +
+        '</label><div style="font-size:0.85em;margin-top:2px">' + linkHtml + '</div></div>'
+      );
+    }
     if (isSecret) {
       const placeholder = maskSecret_(currentValues[key]);
       // GLOBAL_GITHUB_TOKEN and AI_API_KEY are the two credentials that get

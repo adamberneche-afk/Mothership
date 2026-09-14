@@ -57,6 +57,75 @@ function testHarvestCreatesTheTabOnFirstRunIfMissing() {
   check('the tab got a real header row', spreadsheet.getSheetByName('ReviewQueue')._rows[0][0] === 'Timestamp');
 }
 
+// --- Auto-creating the queue spreadsheet on first use -----------------------
+
+function makeFakeScriptProperties(initial = {}) {
+  const store = { ...initial };
+  return {
+    getProperty: (k) => (store[k] !== undefined ? store[k] : null),
+    setProperty: (k, v) => { store[k] = v; },
+    _store: store
+  };
+}
+
+function makeFakeLockService(acquireSucceeds = true) {
+  return {
+    getScriptLock: () => ({
+      tryLock: () => acquireSucceeds,
+      releaseLock: () => {}
+    })
+  };
+}
+
+function testAutoCreatesQueueSpreadsheetWhenUnconfigured() {
+  console.log('openQueueSpreadsheet_ auto-creates the queue spreadsheet and persists its ID when QUEUE_SHEET_ID is unset');
+  const ctx = freshContext();
+  const created = makeFakeSpreadsheet();
+  created.getId = () => 'new-sheet-id';
+  created.getUrl = () => 'https://docs.google.com/spreadsheets/d/new-sheet-id/edit';
+  ctx.SpreadsheetApp = { ...makeFakeSpreadsheetApp({}), create: () => created };
+  ctx.LockService = makeFakeLockService(true);
+  const scriptProperties = makeFakeScriptProperties({});
+  const ss = ctx.openQueueSpreadsheet_({ scriptProperties });
+  check('a spreadsheet was returned', ss === created);
+  check('QUEUE_SHEET_ID was persisted back to Script Properties', scriptProperties._store.QUEUE_SHEET_ID === 'new-sheet-id');
+}
+
+function testAutoCreateSkipsCleanlyWhenLockContended() {
+  console.log('openQueueSpreadsheet_ skips cleanly (no duplicate spreadsheet) when the create-lock is already held');
+  const ctx = freshContext();
+  let createCalls = 0;
+  ctx.SpreadsheetApp = { ...makeFakeSpreadsheetApp({}), create: () => { createCalls++; return makeFakeSpreadsheet(); } };
+  ctx.LockService = makeFakeLockService(false); // tryLock fails
+  const scriptProperties = makeFakeScriptProperties({});
+  const ss = ctx.openQueueSpreadsheet_({ scriptProperties });
+  check('returns null rather than risking a duplicate', ss === null);
+  check('SpreadsheetApp.create was never called', createCalls === 0);
+}
+
+function testAutoCreateReturnsNullWithNoScriptPropertiesToPersistInto() {
+  console.log('openQueueSpreadsheet_ fails safe (null, not a throw) when there is no scriptProperties handle to persist a new ID into');
+  const ctx = freshContext();
+  const ss = ctx.openQueueSpreadsheet_({});
+  check('returns null', ss === null);
+}
+
+function testAutoCreateRechecksUnderTheLockBeforeCreating() {
+  console.log('openQueueSpreadsheet_ re-checks Script Properties under the lock - a concurrent request that already created it wins, no duplicate');
+  const ctx = freshContext();
+  let createCalls = 0;
+  const alreadyCreated = makeFakeSpreadsheet();
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'already-created-id': alreadyCreated });
+  ctx.SpreadsheetApp.create = () => { createCalls++; return makeFakeSpreadsheet(); };
+  ctx.LockService = makeFakeLockService(true);
+  // Simulate the property having been set by "another request" the instant
+  // before this one acquired the lock.
+  const scriptProperties = makeFakeScriptProperties({ QUEUE_SHEET_ID: 'already-created-id' });
+  const ss = ctx.openQueueSpreadsheet_({ scriptProperties });
+  check('opened the already-created spreadsheet, not a new one', ss === alreadyCreated);
+  check('SpreadsheetApp.create was never called', createCalls === 0);
+}
+
 // --- harvestReviewResults: row scanning + status transitions ---------------
 
 function testHarvestReviewSkipsRowsNotYetEvaluated() {
@@ -248,6 +317,10 @@ function testInstallTriggersOnlyCreatesTheMissingOne() {
 }
 
 function main() {
+  testAutoCreatesQueueSpreadsheetWhenUnconfigured();
+  testAutoCreateSkipsCleanlyWhenLockContended();
+  testAutoCreateReturnsNullWithNoScriptPropertiesToPersistInto();
+  testAutoCreateRechecksUnderTheLockBeforeCreating();
   testHarvestReturnsZeroWhenQueueSheetIdUnconfigured();
   testHarvestCreatesTheTabOnFirstRunIfMissing();
   testHarvestReviewSkipsRowsNotYetEvaluated();
