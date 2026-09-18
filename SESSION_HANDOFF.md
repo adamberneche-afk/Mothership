@@ -83,7 +83,7 @@ All local clones are clean and pushed, `main` branch, no uncommitted changes:
 ## Conventions this session established or relied on — worth preserving
 
 - **Direct-to-`main` pushes, no PRs**, across every repo — always run the repo's real tests + `actionlint` (or equivalent) before pushing, never push speculatively.
-- **`mothership-live-review` skill** for on-demand debug/hunt/refactor reviews against a spoke's latest commit(s), sidestepping the still-undeployed real AI-backend endpoint. Dedup is by `(commitSha, mode)` in that spoke's own `ai_decision_log.json` — check it before re-reviewing a commit.
+- **`mothership-live-review` skill** for on-demand debug/hunt/refactor reviews against a spoke's latest commit(s), sidestepping the AI-backend endpoint (undeployed at the time this line was written; **update 2026-09-18: Mothership's own Apps Script backend is now live**, though no real spoke points at it yet and this skill's own value as an on-demand, no-Flow-needed path is unchanged). Dedup is by `(commitSha, mode)` in that spoke's own `ai_decision_log.json` — check it before re-reviewing a commit.
 - **The Pivot Ledger is the durable index** — when in doubt about "has this already been looked at / fixed," check it before re-deriving from scratch.
 - **A docket/audit is a dated filing, not a rolling document** — when a repo has moved substantially since its last audit, file a new, cross-referenced docket rather than editing the old one in place. The Pivot Ledger *is* the rolling document; audit dockets are snapshots.
 - **Ground every finding in code you actually read**, never a commit message's own claim about itself — this is what caught both the ENOENT watchdog bug and the two doc-drift items fixed this session.
