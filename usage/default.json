@@ -153,5 +153,13 @@
     "mode": "refactor",
     "owner": "adamberneche-afk",
     "repo": "kos"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-09-18T17:11:05.208Z",
+    "eventType": "review_run",
+    "mode": "canary",
+    "owner": "adamberneche-afk",
+    "repo": "Mothership"
   }
 ]
