@@ -17,11 +17,16 @@ jobs:
           # authenticates to GitHub server-side using its own Script
           # Property, not anything the caller sends.
           APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          # Mothership maps to the "default" tenant just like every other
+          # spoke - see call-hub.apps-script.example.yml's own comment on
+          # why this is now required, not optional.
+          TENANT_CALLER_KEY: ${{ secrets.TENANT_CALLER_KEY }}
         run: |
           curl -X POST "${APPS_SCRIPT_URL}?endpoint=autonomous_agent" \
             -H "Content-Type: application/json" \
             -d '{
               "owner": "${{ github.repository_owner }}",
               "repo": "${{ github.event.repository.name }}",
-              "mode": "refactor"
+              "mode": "refactor",
+              "callerKey": "${{ secrets.TENANT_CALLER_KEY }}"
             }'
