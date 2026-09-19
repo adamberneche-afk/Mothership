@@ -166,7 +166,27 @@ const NO_FINDING_JSON = JSON.stringify({
   value_impact: { reasoning: '' }
 });
 
-const BASE_DEPS = { base64Encode: b64, base64Decode: unb64 };
+// Registers the plain 'o'/'r' owner/repo pair every non-multi-tenancy test
+// below uses, as a real registered spoke on a tenant with no callerKeyRef -
+// these tests exist to exercise queuing/dedup/dry-run/etc., not tenant
+// resolution, and processRequest() now rejects an owner/repo that isn't a
+// registered spoke outright (see autonomous_agent.js's resolveTenantIdForSpoke
+// header comment), so they need a real registration to keep reaching the
+// behavior they're actually testing. Multi-tenancy-specific tests below
+// override both fields explicitly with their own fixtures (TWO_TENANT_SPOKES/
+// TWO_TENANTS, or a deliberately-unregistered owner/repo) later in the same
+// object literal, which wins over this default.
+const GENERIC_SPOKE = [
+  { tenantId: 'generic', owner: 'o', repo: 'r', addedAt: '2026-08-13T00:00:00Z', status: 'active' }
+];
+const GENERIC_TENANT = [
+  { tenantId: 'generic', name: 'Generic test tenant', status: 'active', plan: 'internal', quota: { reviewsPerMonth: null }, createdAt: '2026-08-13T00:00:00Z' }
+];
+
+const BASE_DEPS = {
+  base64Encode: b64, base64Decode: unb64,
+  spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT
+};
 
 const TWO_TENANT_SPOKES = [
   { tenantId: 'acme', owner: 'acme-org', repo: 'acme-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active' },
@@ -333,17 +353,26 @@ function testCallerKeyAcceptedWhenCorrect() {
   check('a row was queued', sheet._rows.length === 1);
 }
 
-function testUnregisteredSpokeFallsBackToDefaultTenantCredential() {
-  console.log('Multi-tenancy: a spoke not in spokes.json falls back to the "default" tenant credential (backward compat)');
+function testUnregisteredSpokeIsRejectedOutright() {
+  // Real gap this closed: gas/'s deployment is a publicly-reachable
+  // ("Anyone") web app, and resolveTenantIdForSpoke() used to fall back to
+  // the "default" tenant - and its GLOBAL_GITHUB_TOKEN-backed credential -
+  // for ANY owner/repo, not just this hub's own registered spokes. It now
+  // returns no tenant at all for an unmatched owner/repo, and
+  // processRequest() rejects the request before any GitHub call runs.
+  console.log('Multi-tenancy: an owner/repo that is not a registered spoke of ANY tenant is rejected outright, before any GitHub call runs');
   const github = makeFakeGithub();
   const factory = makeFakeGithubFactory(github);
   const hubGithub = makeFakeHubGithub();
   const sheet = makeFakeSheet();
-  processRequest(
+  const { httpStatus, body } = processRequest(
     { owner: 'not-registered-owner', repo: 'not-registered-repo', mode: 'debug' },
     { ...BASE_DEPS, githubFactory: factory, hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { globalGithubToken: 'the-global-token' }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
-  check('resolved to config.globalGithubToken, not a tenant-specific one', factory.tokensUsed[0] === 'the-global-token');
+  check('httpStatus is 403', httpStatus === 403);
+  check('error names the actual problem', /not a registered spoke/i.test(body.error || ''));
+  check('no real GitHub API call ever ran with the global token', github.calls.getContent.length === 0);
+  check('nothing was queued for a rejected owner/repo', sheet._rows.length === 0);
 }
 
 function testRegisteredSpokeResolvesItsOwnTenantCredential() {
@@ -582,7 +611,7 @@ async function main() {
   testQuotaExceededBlocksBeforeQueuing();
   testCallerKeyRejectedWhenWrongForATenantThatRequiresOne();
   testCallerKeyAcceptedWhenCorrect();
-  testUnregisteredSpokeFallsBackToDefaultTenantCredential();
+  testUnregisteredSpokeIsRejectedOutright();
   testRegisteredSpokeResolvesItsOwnTenantCredential();
   testQuotaUnderLimitProceedsToQueuing();
   testNullQuotaMeansUnlimited();

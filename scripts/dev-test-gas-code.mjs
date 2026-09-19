@@ -124,11 +124,31 @@ function loadCodeWithFakes({ props = {}, aiJsonContent = NO_FINDING_JSON, github
 // exercises doPost's full routing and response-shaping.
 const NOT_FOUND = { getResponseCode: () => 404, getContentText: () => '{}' };
 
+// Registers 'o'/'r' (every generic doPost test below's owner/repo) as a
+// real spoke on a tenant with no callerKeyRef - processRequest() now
+// rejects an owner/repo that isn't a registered spoke outright (see
+// autonomous_agent.js's resolveTenantIdForSpoke), and these tests exist to
+// exercise doPost's routing/config-loading, not tenant resolution. Longer
+// than the generic '/contents/' NOT_FOUND key below, so the harness's
+// longest-match-wins URL matching picks this one for these two specific
+// paths instead.
+function jsonFileResponse(value) {
+  return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ content: b64(JSON.stringify(value)) }) };
+}
+const GENERIC_SPOKE_RESPONSES = {
+  'contents/spokes.json': jsonFileResponse([
+    { tenantId: 'generic', owner: 'o', repo: 'r', addedAt: '2026-08-13T00:00:00Z', status: 'active' }
+  ]),
+  'contents/tenants.json': jsonFileResponse([
+    { tenantId: 'generic', name: 'Generic test tenant', status: 'active', plan: 'internal', quota: { reviewsPerMonth: null }, createdAt: '2026-08-13T00:00:00Z' }
+  ])
+};
+
 function testDefaultsToAutonomousAgentWhenNoEndpointGiven() {
   console.log("doPost defaults to autonomous_agent when no ?endpoint= is given (matches Vercel's original default route)");
   const { context } = loadCodeWithFakes({
     props: { DRY_RUN_MODE: 'true' },
-    githubResponses: { '/commits': NOT_FOUND, '/contents/': NOT_FOUND }
+    githubResponses: { '/commits': NOT_FOUND, '/contents/': NOT_FOUND, ...GENERIC_SPOKE_RESPONSES }
   });
   const e = { parameter: {}, postData: { contents: JSON.stringify({ owner: 'o', repo: 'r', mode: 'debug' }) } };
   const output = context.doPost(e);
@@ -176,7 +196,7 @@ function testConfigIsReadFromScriptPropertiesNotHardcoded() {
     spreadsheetsById: { 'my-real-sheet-id': reviewQueue },
     githubResponses: { '/commits': { getResponseCode: () => 200, getContentText: () => JSON.stringify([{ sha: 'abc123' }]) },
                         '/commits/abc123': { getResponseCode: () => 200, getContentText: () => JSON.stringify({ files: [{ filename: 'x', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b' }] }) },
-                        '/contents/': NOT_FOUND }
+                        '/contents/': NOT_FOUND, ...GENERIC_SPOKE_RESPONSES }
   });
   const e = { parameter: {}, postData: { contents: JSON.stringify({ owner: 'o', repo: 'r', mode: 'debug' }) } };
   const output = context.doPost(e);

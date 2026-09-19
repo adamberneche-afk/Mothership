@@ -34,13 +34,19 @@ const SETTINGS_KEYS = [
   // ID of the Google Sheet holding ReviewQueue/LearningQueue - see
   // review_queue.js's header comment and README.md's "Deploy Without
   // Vercel" section for the one-time setup this needs.
-  'QUEUE_SHEET_ID'
+  'QUEUE_SHEET_ID',
+  // tenants.json's "default" tenant callerKeyRef ("env:DEFAULT_TENANT_CALLER_KEY")
+  // - every registered spoke currently maps to "default", so this one value
+  // gates every real spoke-to-hub POST this deployment accepts. Settable
+  // here so rotating it doesn't require the IDE, same reasoning as
+  // GLOBAL_GITHUB_TOKEN above.
+  'DEFAULT_TENANT_CALLER_KEY'
 ];
 
 // Shown masked, never in full, and never pre-filled into an editable value -
 // the input starts blank with the masked value as a placeholder, so leaving
 // it untouched and submitting means "keep the current value," not "clear it."
-const SETTINGS_SECRET_KEYS = ['AI_API_KEY', 'GLOBAL_GITHUB_TOKEN'];
+const SETTINGS_SECRET_KEYS = ['AI_API_KEY', 'GLOBAL_GITHUB_TOKEN', 'DEFAULT_TENANT_CALLER_KEY'];
 
 function maskSecret_(value) {
   if (!value) return '(not set)';
