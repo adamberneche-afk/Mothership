@@ -6,6 +6,7 @@
     "plan": "internal",
     "quota": { "reviewsPerMonth": null },
     "githubCredentialRef": "env:GLOBAL_GITHUB_TOKEN",
+    "callerKeyRef": "env:DEFAULT_TENANT_CALLER_KEY",
     "createdAt": "2026-08-13T00:00:00Z"
   }
 ]

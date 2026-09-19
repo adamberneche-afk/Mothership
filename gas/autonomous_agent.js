@@ -94,9 +94,19 @@ function safeGetJsonArrayFromHub(hubGithub, base64Decode, hubOwner, hubRepo, pat
   }
 }
 
+// Returns null, not DEFAULT_TENANT_ID, for an owner/repo that isn't one of
+// this hub's registered spokes. Used to fall back to the "default" tenant
+// for ANYTHING unmatched - a deliberate backward-compatibility choice from
+// before this hub had a live, publicly-reachable deployment, not a security
+// feature. Once the gas/ deployment went live with "Anyone" access, that
+// same fallback meant any caller on the internet could name an arbitrary
+// owner/repo and have this hub fetch it with GLOBAL_GITHUB_TOKEN - see
+// processRequest()'s own tenant-resolution comment for the caller-facing
+// half of this fix. Returning null here lets processRequest() reject an
+// unmatched spoke outright instead of silently treating it as "default".
 function resolveTenantIdForSpoke(owner, repo, spokes) {
   const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+  return match ? match.tenantId : null;
 }
 
 function findTenant(tenantId, tenants) {
@@ -305,7 +315,20 @@ function processRequest(reqBody, {
     spokesOverride, tenantsOverride, dryRunOverride
   });
 
-  const requiredCallerKey = tenant ? resolveSecretRef(tenant.callerKeyRef, config.scriptProperties) : null;
+  // Reject an owner/repo that isn't a registered spoke outright, before any
+  // GitHub call runs with GLOBAL_GITHUB_TOKEN under it. Real fix, not
+  // defense-in-depth theater: owner/repo is caller-supplied and trivially
+  // spoofable, so this alone wouldn't stop someone claiming to BE a
+  // registered spoke - the requiredCallerKey check right below is what
+  // actually gates that. What this specifically closes is the blast radius
+  // of a leaked/guessed caller key: even with it, a caller can only target
+  // this hub's own registered spokes, never an arbitrary repo on GitHub
+  // that GLOBAL_GITHUB_TOKEN happens to be able to read.
+  if (!tenant) {
+    return { httpStatus: 403, body: { error: 'owner/repo is not a registered spoke of this hub' } };
+  }
+
+  const requiredCallerKey = resolveSecretRef(tenant.callerKeyRef, config.scriptProperties);
   if (requiredCallerKey && callerKey !== requiredCallerKey) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
