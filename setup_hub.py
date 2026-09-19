@@ -134,16 +134,19 @@ function loadJsonArrayFromDisk(path) {
   }
 }
 
-// Finds which tenant a given owner/repo belongs to. Falls back to
+// Finds which tenant a given owner/repo belongs to. Used to fall back to
 // DEFAULT_TENANT_ID for anything not found in spokes.json - a deliberate
-// backward-compatibility choice, not a security feature: it preserves
-// today's exact behavior (no registration required to get a response) for
-// spokes nobody has migrated into the tenant model yet. Once real
-// multi-tenant onboarding exists, an unmatched spoke should probably reject
-// instead of silently defaulting - flagged here, not fixed here.
+// backward-compatibility choice, not a security feature: it preserved
+// pre-deployment behavior (no registration required to get a response) for
+// spokes nobody had migrated into the tenant model yet. Once the gas/ twin
+// of this file went live with a publicly-reachable "Anyone" deployment,
+// that same fallback meant any caller on the internet could name an
+// arbitrary owner/repo and have this hub fetch it with GLOBAL_GITHUB_TOKEN.
+// Returns null now instead, so processRequest() can reject an unmatched
+// spoke outright - see its own tenant-resolution comment below.
 function resolveTenantIdForSpoke(owner, repo, spokes) {
   const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+  return match ? match.tenantId : null;
 }
 
 function findTenant(tenantId, tenants) {
@@ -349,11 +352,12 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   // carried ZERO credential before this - any caller who knew the hub URL
   // could trigger a review for any registered owner/repo. The check below
   // is deliberately opt-in per tenant: a tenant with no `callerKeyRef` set
-  // (true for "default" today) skips verification entirely, preserving
-  // today's exact zero-auth behavior for anything not yet migrated. A
-  // tenant that HAS set one gets it strictly enforced. Migrating a tenant
-  // to enforced caller-auth is then just a config change, not a breaking
-  // flag day for spokes that were already working.
+  // skips verification entirely. "default" now has one set (tenants.json),
+  // since it's the tenant every registered spoke currently maps to and this
+  // hub has a live, publicly-reachable deployment (the gas/ twin) - a
+  // tenant with no key configured at all would otherwise stay silently
+  // open. Migrating a NEW tenant to enforced caller-auth is then just a
+  // config change, not a breaking flag day for spokes already working.
   //
   // spokesOverride/tenantsOverride let tests inject a registry instead of
   // reading this checkout's real spokes.json/tenants.json - same
@@ -361,22 +365,33 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   const spokes = spokesOverride || loadSpokesRegistry();
   const tenants = tenantsOverride || loadTenantsRegistry();
   const tenantId = resolveTenantIdForSpoke(owner, repo, spokes);
-  const tenant = findTenant(tenantId, tenants);
+  const tenant = tenantId ? findTenant(tenantId, tenants) : null;
 
-  const requiredCallerKey = tenant ? resolveSecretRef(tenant.callerKeyRef) : null;
+  // Reject an owner/repo that isn't a registered spoke outright, before any
+  // GitHub call runs with GLOBAL_GITHUB_TOKEN under it. owner/repo is
+  // caller-supplied and spoofable, so this alone doesn't stop someone
+  // claiming to BE a registered spoke - the requiredCallerKey check right
+  // below is what actually gates that. What this closes is the blast
+  // radius of a leaked/guessed caller key: even with it, a caller can only
+  // target this hub's own registered spokes, never an arbitrary repo on
+  // GitHub that GLOBAL_GITHUB_TOKEN happens to be able to read.
+  if (!tenant) {
+    return { httpStatus: 403, body: { error: 'owner/repo is not a registered spoke of this hub' } };
+  }
+
+  const requiredCallerKey = resolveSecretRef(tenant.callerKeyRef);
   if (requiredCallerKey && callerKey !== requiredCallerKey) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
 
   // Credential for this request's SPOKE operations - the tenant's own
   // token (decision #1), resolved via the same env:/kv: scheme as the
-  // caller key above. Falls back to GLOBAL_GITHUB_TOKEN only when no
-  // tenant match exists at all (mirrors resolveTenantIdForSpoke's own
-  // backward-compatibility fallback) or the ref can't be resolved yet
-  // (e.g. a kv: ref with no secrets store behind it) - fails toward "use
-  // the one credential that's always been used" rather than toward a
-  // silent, harder-to-diagnose 401 from GitHub itself.
-  const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+  // caller key above. `tenant` is guaranteed non-null past the reject
+  // above; this still falls back to GLOBAL_GITHUB_TOKEN when the ref itself
+  // can't be resolved (e.g. a kv: ref with no secrets store behind it yet)
+  // - fails toward "use the one credential that's always been used" rather
+  // than toward a silent, harder-to-diagnose 401 from GitHub itself.
+  const spokeToken = resolveSecretRef(tenant.githubCredentialRef) || process.env.GLOBAL_GITHUB_TOKEN;
   const octokit = octokitFactory(spokeToken);
 
   // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
