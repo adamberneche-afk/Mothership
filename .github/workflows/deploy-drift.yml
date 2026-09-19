@@ -20,7 +20,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # full history - deploy-drift-expected-marker.js needs `git log` over gas/'s tracked files, not just the latest commit
 
