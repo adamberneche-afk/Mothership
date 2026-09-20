@@ -135,6 +135,20 @@ function testRunActionlintAttributesFindingsToTheRightFile() {
   rmSync(dir, { recursive: true, force: true });
 }
 
+function testRunActionlintSurfacesASpawnFailureInsteadOfReportingClean() {
+  console.log('runActionlint: a spawn failure (actionlint missing/ENOENT) is surfaced as a finding, never silently "clean"');
+  const dir = makeWorkflowsDir({ 'a.yml': SIMPLE_WORKFLOW, 'b.yml': SIMPLE_WORKFLOW });
+  const fakeExec = () => {
+    const err = new Error('spawn actionlint ENOENT');
+    err.code = 'ENOENT';
+    throw err;
+  };
+  const results = runActionlint(dir, { execFn: fakeExec });
+  check('every file gets a finding, not silence', results['a.yml'].length === 1 && results['b.yml'].length === 1);
+  check('the finding explains the spawn failure, not a workflow error', results['a.yml'][0].includes('could not run actionlint'));
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- checkScheduledWorkflowRuns ---------------------------------------------
 
 async function testChecksOnlyScheduledWorkflowsNotEveryFile() {
@@ -233,6 +247,7 @@ async function main() {
   testHasScheduleTriggerDetectsScheduleBlock();
   testRunActionlintReturnsAllCleanOnZeroExit();
   testRunActionlintAttributesFindingsToTheRightFile();
+  testRunActionlintSurfacesASpawnFailureInsteadOfReportingClean();
   await testChecksOnlyScheduledWorkflowsNotEveryFile();
   await testFlagsAFailedLastScheduledRun();
   await testFlagsAScheduledWorkflowWithNoRunHistoryAtAll();

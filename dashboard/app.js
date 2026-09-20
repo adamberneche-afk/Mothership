@@ -46,6 +46,9 @@ const HUB_WORKFLOWS = [
   { file: 'health-report.yml', label: 'Health Report' },
   { file: 'recursive-learning.yml', label: 'Recursive Learning' },
   { file: 'prune-logs.yml', label: 'Prune Decision Logs' },
+  { file: 'collect-issue-feedback.yml', label: 'Collect Issue Feedback' },
+  { file: 'watchdog.yml', label: 'Scheduled-Job Watchdog' },
+  { file: 'codeql.yml', label: 'CodeQL' },
 ];
 
 // Human labels for the raw decision-log outcome enum (ai_decision_log.json's

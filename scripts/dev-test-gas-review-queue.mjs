@@ -1,0 +1,554 @@
+// Local verification harness for gas/review_queue.js - the async hand-off
+// layer between this Apps Script backend and a human-built Google
+// Workspace Studio Flow's native inference step. Covers what
+// dev-test-gas-handler.mjs/dev-test-gas-recursive-learning.mjs don't:
+// ensureQueueTab_'s tab-creation behavior, harvestReviewResults'/
+// harvestLearningResults' row-scanning and error-status handling, the
+// liveness checks, and installReviewQueueTriggers' idempotency. Same
+// vm-based harness real Apps Script uses to run these files.
+//
+// Usage: node scripts/dev-test-gas-review-queue.mjs
+
+import { loadGasGlobals } from './gas-test-harness.mjs';
+import { makeFakeSheet, makeFakeSpreadsheet, makeFakeSpreadsheetApp, makeFakeLogger } from './gas-sheet-fakes.mjs';
+
+let failures = 0;
+function check(name, condition) {
+  if (condition) {
+    console.log(`  ok - ${name}`);
+  } else {
+    console.error(`  FAIL - ${name}`);
+    failures++;
+  }
+}
+
+function b64(str) { return Buffer.from(str, 'utf8').toString('base64'); }
+function unb64(str) { return Buffer.from(str, 'base64').toString('utf8'); }
+const BASE_DEPS = { base64Encode: b64, base64Decode: unb64 };
+
+// finalizeReviewResult_/finalizeLearningResult_ need real github/decision-
+// log plumbing - autonomous_agent.js and recursive_learning.js are loaded
+// alongside review_queue.js so harvest can actually call them, same as a
+// real deployment's one shared script scope.
+function freshContext() {
+  const Logger = makeFakeLogger();
+  return loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js', 'recursive_learning.js', { Logger });
+}
+
+// --- ensureQueueTab_ / openQueueSpreadsheet_ (via the harvest functions) ---
+
+function testHarvestReturnsZeroWhenQueueSheetIdUnconfigured() {
+  console.log('harvestReviewResults/harvestLearningResults: no QUEUE_SHEET_ID configured is a clean {harvested: 0}, not a crash');
+  const ctx = freshContext();
+  const r1 = ctx.harvestReviewResults({ ...BASE_DEPS, config: {} });
+  const r2 = ctx.harvestLearningResults({ ...BASE_DEPS, config: {} });
+  check('harvestReviewResults returns harvested: 0', r1.harvested === 0);
+  check('harvestLearningResults returns harvested: 0', r2.harvested === 0);
+}
+
+function testHarvestCreatesTheTabOnFirstRunIfMissing() {
+  console.log('harvestReviewResults creates the ReviewQueue tab (with headers) on a brand-new spreadsheet');
+  const ctx = freshContext();
+  const spreadsheet = makeFakeSpreadsheet();
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const result = ctx.harvestReviewResults({ ...BASE_DEPS, config: { queueSheetId: 'sheet-1' } });
+  check('nothing to harvest on a freshly created tab', result.harvested === 0);
+  check('the ReviewQueue tab now exists', !!spreadsheet.getSheetByName('ReviewQueue'));
+  check('the tab got a real header row', spreadsheet.getSheetByName('ReviewQueue')._rows[0][0] === 'Timestamp');
+}
+
+// --- Auto-creating the queue spreadsheet on first use -----------------------
+
+function makeFakeScriptProperties(initial = {}) {
+  const store = { ...initial };
+  return {
+    getProperty: (k) => (store[k] !== undefined ? store[k] : null),
+    setProperty: (k, v) => { store[k] = v; },
+    _store: store
+  };
+}
+
+function makeFakeLockService(acquireSucceeds = true) {
+  return {
+    getScriptLock: () => ({
+      tryLock: () => acquireSucceeds,
+      releaseLock: () => {}
+    })
+  };
+}
+
+function testAutoCreatesQueueSpreadsheetWhenUnconfigured() {
+  console.log('openQueueSpreadsheet_ auto-creates the queue spreadsheet and persists its ID when QUEUE_SHEET_ID is unset');
+  const ctx = freshContext();
+  const created = makeFakeSpreadsheet();
+  created.getId = () => 'new-sheet-id';
+  created.getUrl = () => 'https://docs.google.com/spreadsheets/d/new-sheet-id/edit';
+  ctx.SpreadsheetApp = { ...makeFakeSpreadsheetApp({}), create: () => created };
+  ctx.LockService = makeFakeLockService(true);
+  const scriptProperties = makeFakeScriptProperties({});
+  const ss = ctx.openQueueSpreadsheet_({ scriptProperties });
+  check('a spreadsheet was returned', ss === created);
+  check('QUEUE_SHEET_ID was persisted back to Script Properties', scriptProperties._store.QUEUE_SHEET_ID === 'new-sheet-id');
+}
+
+function testAutoCreateSkipsCleanlyWhenLockContended() {
+  console.log('openQueueSpreadsheet_ skips cleanly (no duplicate spreadsheet) when the create-lock is already held');
+  const ctx = freshContext();
+  let createCalls = 0;
+  ctx.SpreadsheetApp = { ...makeFakeSpreadsheetApp({}), create: () => { createCalls++; return makeFakeSpreadsheet(); } };
+  ctx.LockService = makeFakeLockService(false); // tryLock fails
+  const scriptProperties = makeFakeScriptProperties({});
+  const ss = ctx.openQueueSpreadsheet_({ scriptProperties });
+  check('returns null rather than risking a duplicate', ss === null);
+  check('SpreadsheetApp.create was never called', createCalls === 0);
+}
+
+function testAutoCreateReturnsNullWithNoScriptPropertiesToPersistInto() {
+  console.log('openQueueSpreadsheet_ fails safe (null, not a throw) when there is no scriptProperties handle to persist a new ID into');
+  const ctx = freshContext();
+  const ss = ctx.openQueueSpreadsheet_({});
+  check('returns null', ss === null);
+}
+
+function testAutoCreateRechecksUnderTheLockBeforeCreating() {
+  console.log('openQueueSpreadsheet_ re-checks Script Properties under the lock - a concurrent request that already created it wins, no duplicate');
+  const ctx = freshContext();
+  let createCalls = 0;
+  const alreadyCreated = makeFakeSpreadsheet();
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'already-created-id': alreadyCreated });
+  ctx.SpreadsheetApp.create = () => { createCalls++; return makeFakeSpreadsheet(); };
+  ctx.LockService = makeFakeLockService(true);
+  // Simulate the property having been set by "another request" the instant
+  // before this one acquired the lock.
+  const scriptProperties = makeFakeScriptProperties({ QUEUE_SHEET_ID: 'already-created-id' });
+  const ss = ctx.openQueueSpreadsheet_({ scriptProperties });
+  check('opened the already-created spreadsheet, not a new one', ss === alreadyCreated);
+  check('SpreadsheetApp.create was never called', createCalls === 0);
+}
+
+// --- harvestReviewResults: row scanning + status transitions ---------------
+
+function testHarvestReviewSkipsRowsNotYetEvaluated() {
+  console.log('harvestReviewResults only acts on EVALUATED rows, leaves READY/HARVESTED rows untouched');
+  const ctx = freshContext();
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput'],
+    [new Date(), 'o', 'r', 'debug', 'sha1', 'READY', 'prompt', ''],
+    [new Date(), 'o', 'r', 'debug', 'sha2', 'HARVESTED', 'prompt', 'old output']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const github = makeFakeGithubForFinalize();
+  const result = ctx.harvestReviewResults({ ...BASE_DEPS, githubFactory: () => github, hubGithub: github, config: { queueSheetId: 'sheet-1' } });
+  check('nothing was harvested', result.harvested === 0);
+  check('READY row untouched', rqSheet._rows[1][5] === 'READY');
+  check('HARVESTED row untouched', rqSheet._rows[2][5] === 'HARVESTED');
+}
+
+function testHarvestReviewMarksEmptyOutputAsError() {
+  console.log('harvestReviewResults marks an EVALUATED row with a blank GeminiFullOutput as ERROR_EMPTY_OUTPUT, not a crash');
+  const ctx = freshContext();
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput'],
+    [new Date(), 'o', 'r', 'debug', 'sha1', 'EVALUATED', 'prompt', '   ']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const result = ctx.harvestReviewResults({ ...BASE_DEPS, config: { queueSheetId: 'sheet-1' } });
+  check('nothing counted as harvested', result.harvested === 0);
+  check('row marked ERROR_EMPTY_OUTPUT', rqSheet._rows[1][5] === 'ERROR_EMPTY_OUTPUT');
+}
+
+function testHarvestReviewCallsFinalizeAndMarksHarvested() {
+  console.log('harvestReviewResults calls finalizeReviewResult_ for a real EVALUATED row and marks it HARVESTED on success');
+  const ctx = freshContext();
+  const noFindingJson = JSON.stringify({ has_findings: false, action_summary: '', code_patch: '', value_impact: { reasoning: '' } });
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput'],
+    [new Date(), 'o', 'r', 'debug', 'sha1', 'EVALUATED', 'prompt', noFindingJson]
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const github = makeFakeGithubForFinalize();
+  const result = ctx.harvestReviewResults({ ...BASE_DEPS, githubFactory: () => github, hubGithub: github, config: { queueSheetId: 'sheet-1', dryRunMode: 'true' } });
+  check('one row harvested', result.harvested === 1);
+  check('row marked HARVESTED', rqSheet._rows[1][5] === 'HARVESTED');
+  // hubGithub and githubFactory both resolve to this same fake here, so
+  // this also picks up finalizeReviewResult_'s usage-log write alongside
+  // the decision-log one - assert the decision-log write specifically
+  // happened, not a raw call count.
+  check('a decision-log entry was actually written', github.calls.createOrUpdateFileContents.some((p) => p.path === 'ai_decision_log.json'));
+}
+
+function testHarvestReviewMarksThrownErrorsDistinctly() {
+  console.log('harvestReviewResults marks a row ERROR_HARVEST_FAILED (not HARVESTED) if finalizeReviewResult_ throws, and keeps going');
+  const ctx = freshContext();
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput'],
+    [new Date(), 'o', 'r', 'debug', 'sha1', 'EVALUATED', 'prompt', 'not valid json'],
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  // A github client whose getContent always throws mid-decision-log-write
+  // would be a real thrown error, but invalid JSON itself is handled
+  // cleanly by finalizeReviewResult_ (returns Skipped, not a throw) - so to
+  // actually exercise the ERROR_HARVEST_FAILED path, force githubFactory
+  // itself to throw (a plausible real failure: a revoked credential).
+  const throwingFactory = () => { throw new Error('credential revoked'); };
+  const result = ctx.harvestReviewResults({ ...BASE_DEPS, githubFactory: throwingFactory, hubGithub: {}, config: { queueSheetId: 'sheet-1' } });
+  check('nothing counted as harvested', result.harvested === 0);
+  check('row marked ERROR_HARVEST_FAILED', rqSheet._rows[1][5] === 'ERROR_HARVEST_FAILED');
+}
+
+function makeFakeGithubForFinalize() {
+  const calls = { createOrUpdateFileContents: [], issuesCreate: [], getContent: [] };
+  return {
+    calls,
+    repos: {
+      getContent: ({ path }) => { calls.getContent.push(path); throw new Error('404 not found'); },
+      createOrUpdateFileContents: (p) => { calls.createOrUpdateFileContents.push(p); return { data: {} }; }
+    },
+    issues: {
+      listForRepo: () => ({ data: [] }),
+      create: (p) => { calls.issuesCreate.push(p); return { data: { html_url: 'https://github.com/fake/fake/issues/1' } }; }
+    }
+  };
+}
+
+// --- checkReviewQueueLiveness / checkLearningQueueLiveness ------------------
+
+function testLivenessDistinguishesNeverAnsweredFromSlowFromAnswered() {
+  console.log('checkReviewQueueLiveness distinguishes "never answered" from "slow" from "has answered before" - same backstop as cas-ccps\'s checkFlow2Liveness');
+  const ctx = freshContext();
+
+  // Case 1: rows READY, none ever answered.
+  const oldTimestamp = new Date(Date.now() - 45 * 60 * 1000); // 45 min ago
+  const neverAnsweredSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput'],
+    [oldTimestamp, 'o', 'r', 'debug', 'sha1', 'READY', 'prompt', '']
+  ]);
+  let spreadsheet = makeFakeSpreadsheet({ ReviewQueue: neverAnsweredSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  let report = ctx.checkReviewQueueLiveness({ queueSheetId: 'sheet-1' });
+  check('1 ready, 0 answered, everAnswered false', report.ready === 1 && report.answered === 0 && report.everAnswered === false);
+  check('oldestReadyMins reflects the real age (~45 min)', report.oldestReadyMins >= 44 && report.oldestReadyMins <= 46);
+
+  // Case 2: one row has answered before - everAnswered flips true even
+  // with a separate row still waiting.
+  const mixedSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput'],
+    [new Date(), 'o', 'r', 'debug', 'sha1', 'HARVESTED', 'prompt', 'some real answer'],
+    [new Date(), 'o', 'r', 'debug', 'sha2', 'READY', 'prompt', '']
+  ]);
+  spreadsheet = makeFakeSpreadsheet({ ReviewQueue: mixedSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-2': spreadsheet });
+  report = ctx.checkReviewQueueLiveness({ queueSheetId: 'sheet-2' });
+  check('1 ready, 1 answered, everAnswered true', report.ready === 1 && report.answered === 1 && report.everAnswered === true);
+}
+
+function testLivenessCatchesARowStuckAtReadyWithRealOutput() {
+  console.log('checkReviewQueueLiveness catches a row where the Flow wrote real output but never advanced ReadyStatus past READY - the exact bug KOS\'s checkFlow2Binding found and fixed for cas-ccps');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput'],
+    [new Date(), 'o', 'r', 'debug', 'sha1', 'READY', 'prompt', 'a real answer landed here, but status never flipped']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkReviewQueueLiveness({ queueSheetId: 'sheet-1' });
+  check('reported as stuckAtReady, not as a healthy "answered" row', report.stuckAtReady === 1 && report.answered === 0);
+  check('not double-counted as still ready-and-waiting either', report.ready === 0);
+  check('everAnswered is NOT set from a stuck row - it never really reached harvest', report.everAnswered === false);
+}
+
+function testLearningQueueLivenessSameShape() {
+  console.log('checkLearningQueueLiveness reports the same three-state shape for LearningQueue rows');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Kind', 'TenantId', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'ContextJson'],
+    [new Date(), 'tenant', 'acme', 'READY', 'prompt', '', '']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ LearningQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkLearningQueueLiveness({ queueSheetId: 'sheet-1' });
+  check('1 ready, 0 answered, everAnswered false', report.ready === 1 && report.answered === 0 && report.everAnswered === false);
+}
+
+function testLivenessFailsSafeWithNoQueueSheetConfigured() {
+  console.log('Both liveness checks report a clean all-zero report, not a crash, when QUEUE_SHEET_ID is unconfigured');
+  const ctx = freshContext();
+  const report = ctx.checkReviewQueueLiveness({});
+  check('all-zero, not a throw', report.ready === 0 && report.answered === 0 && report.everAnswered === false);
+}
+
+// --- installReviewQueueTriggers: idempotent by handler name -----------------
+
+function makeFakeScriptApp(existingHandlerNames = []) {
+  const created = [];
+  const triggers = existingHandlerNames.map((name) => ({ getHandlerFunction: () => name }));
+  return {
+    getProjectTriggers: () => triggers,
+    newTrigger: (handlerName) => {
+      const builder = {
+        timeBased: () => builder,
+        everyMinutes: (n) => {
+          created.push({ handlerName, everyMinutes: n });
+          return { create: () => {} };
+        }
+      };
+      return builder;
+    },
+    _created: created
+  };
+}
+
+function testInstallTriggersCreatesBothOnAFreshProject() {
+  console.log('installReviewQueueTriggers creates both harvest triggers when neither exists yet');
+  const ctx = freshContext();
+  ctx.ScriptApp = makeFakeScriptApp([]);
+  ctx.installReviewQueueTriggers();
+  const names = ctx.ScriptApp._created.map((c) => c.handlerName);
+  check('runHarvestReviewResults was installed', names.includes('runHarvestReviewResults'));
+  check('runHarvestLearningResults was installed', names.includes('runHarvestLearningResults'));
+  check('review trigger runs every 5 minutes', ctx.ScriptApp._created.find((c) => c.handlerName === 'runHarvestReviewResults')?.everyMinutes === 5);
+  check('learning trigger runs every 30 minutes', ctx.ScriptApp._created.find((c) => c.handlerName === 'runHarvestLearningResults')?.everyMinutes === 30);
+}
+
+function testInstallTriggersIsIdempotent() {
+  console.log('installReviewQueueTriggers never installs a duplicate when both already exist');
+  const ctx = freshContext();
+  ctx.ScriptApp = makeFakeScriptApp(['runHarvestReviewResults', 'runHarvestLearningResults']);
+  ctx.installReviewQueueTriggers();
+  check('nothing new was created', ctx.ScriptApp._created.length === 0);
+}
+
+function testInstallTriggersOnlyCreatesTheMissingOne() {
+  console.log('installReviewQueueTriggers only creates the one that\'s actually missing, not both');
+  const ctx = freshContext();
+  ctx.ScriptApp = makeFakeScriptApp(['runHarvestReviewResults']);
+  ctx.installReviewQueueTriggers();
+  const names = ctx.ScriptApp._created.map((c) => c.handlerName);
+  check('only the missing learning trigger was created', names.length === 1 && names[0] === 'runHarvestLearningResults');
+}
+
+// --- checkReviewQueueBinding / checkLearningQueueBinding --------------------
+
+function testBindingReportsOkWhenHeadersMatchExactly() {
+  console.log('checkReviewQueueBinding reports ok:true when the sheet header row matches RQ_HEADERS exactly');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkReviewQueueBinding({ queueSheetId: 'sheet-1' });
+  check('ok is true', report.ok === true);
+  check('nothing missing/mismatched/extra', report.missing.length === 0 && report.mismatched.length === 0 && report.extra.length === 0);
+}
+
+function testBindingCatchesAMissingColumn() {
+  console.log('checkReviewQueueBinding catches a header cell a human deleted while hand-editing the sheet');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', '', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkReviewQueueBinding({ queueSheetId: 'sheet-1' });
+  check('ok is false', report.ok === false);
+  check('ReadyStatus reported missing', report.missing.includes('ReadyStatus'));
+}
+
+function testBindingCatchesARenamedColumn() {
+  console.log('checkReviewQueueBinding catches a header cell a human renamed (not blank, just wrong)');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repository', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkReviewQueueBinding({ queueSheetId: 'sheet-1' });
+  check('ok is false', report.ok === false);
+  check('the mismatch is reported at the right index with expected/got', report.mismatched.some((m) => m.index === 2 && m.expected === 'Repo' && m.got === 'Repository'));
+}
+
+function testBindingCatchesAnExtraColumn() {
+  console.log('checkReviewQueueBinding catches an extra column tacked onto the end of the header row');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'Notes']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkReviewQueueBinding({ queueSheetId: 'sheet-1' });
+  check('ok is false', report.ok === false);
+  check('the extra column is reported', report.extra.includes('Notes'));
+}
+
+function testLearningBindingSameShape() {
+  console.log('checkLearningQueueBinding reports the same shape against LQ_HEADERS');
+  const ctx = freshContext();
+  const sheet = makeFakeSheet([
+    ['Timestamp', 'Kind', 'TenantId', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'ContextJson']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ LearningQueue: sheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const report = ctx.checkLearningQueueBinding({ queueSheetId: 'sheet-1' });
+  check('ok is true', report.ok === true);
+}
+
+function testBindingFailsSafeWithNoQueueSheetConfigured() {
+  console.log('checkReviewQueueBinding reports a clean not-ok, not a crash, when QUEUE_SHEET_ID is unconfigured');
+  const ctx = freshContext();
+  const report = ctx.checkReviewQueueBinding({});
+  check('ok is false', report.ok === false);
+  check('reason explains why', typeof report.reason === 'string' && report.reason.length > 0);
+}
+
+// --- installReviewQueueFixture / installLearningQueueFixture ----------------
+
+function testInstallReviewFixtureAppendsAFixtureRow() {
+  console.log('installReviewQueueFixture appends a _fixture/_fixture row a human can point a Flow test run at');
+  const ctx = freshContext();
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const result = ctx.installReviewQueueFixture({ queueSheetId: 'sheet-1' });
+  check('reports ok, not already installed', result.ok === true && result.alreadyInstalled === false);
+  check('a _fixture/_fixture row landed with ReadyStatus READY', rqSheet._rows.some((r) => r[1] === '_fixture' && r[2] === '_fixture' && r[5] === 'READY'));
+}
+
+function testInstallReviewFixtureIsIdempotent() {
+  console.log('installReviewQueueFixture never installs a second fixture row when one already exists');
+  const ctx = freshContext();
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput'],
+    [new Date(), '_fixture', '_fixture', 'fixture', '_fixture', 'READY', 'prompt', '']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const before = rqSheet._rows.length;
+  const result = ctx.installReviewQueueFixture({ queueSheetId: 'sheet-1' });
+  check('reports already installed', result.ok === true && result.alreadyInstalled === true);
+  check('row count unchanged', rqSheet._rows.length === before);
+}
+
+function testInstallLearningFixtureAppendsAFixtureRow() {
+  console.log('installLearningQueueFixture appends a TenantId=_fixture row a human can point a Flow test run at');
+  const ctx = freshContext();
+  const lqSheet = makeFakeSheet([
+    ['Timestamp', 'Kind', 'TenantId', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'ContextJson']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ LearningQueue: lqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const result = ctx.installLearningQueueFixture({ queueSheetId: 'sheet-1' });
+  check('reports ok, not already installed', result.ok === true && result.alreadyInstalled === false);
+  check('a TenantId=_fixture row landed with ReadyStatus READY', lqSheet._rows.some((r) => r[2] === '_fixture' && r[3] === 'READY'));
+}
+
+function testInstallLearningFixtureIsIdempotent() {
+  console.log('installLearningQueueFixture never installs a second fixture row when one already exists');
+  const ctx = freshContext();
+  const lqSheet = makeFakeSheet([
+    ['Timestamp', 'Kind', 'TenantId', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'ContextJson'],
+    [new Date(), 'tenant', '_fixture', 'READY', 'prompt', '', '']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ LearningQueue: lqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const before = lqSheet._rows.length;
+  const result = ctx.installLearningQueueFixture({ queueSheetId: 'sheet-1' });
+  check('reports already installed', result.ok === true && result.alreadyInstalled === true);
+  check('row count unchanged', lqSheet._rows.length === before);
+}
+
+// --- runReviewQueueCanary / runLearningQueueCanary ---------------------------
+
+function testReviewCanaryRunsEndToEndAndLeavesHarvestedRow() {
+  console.log('runReviewQueueCanary enqueues, self-answers, and harvests its own row end to end, landing HARVESTED');
+  const ctx = freshContext();
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const github = makeFakeGithubForFinalize();
+  const result = ctx.runReviewQueueCanary({ ...BASE_DEPS, githubFactory: () => github, hubGithub: github, config: { queueSheetId: 'sheet-1', dryRunMode: 'true' } });
+  check('reports ok', result.ok === true);
+  check('a HARVESTED canary row landed, targeting the hub\'s own repo', rqSheet._rows.some((r) => r[3] === 'canary' && r[5] === 'HARVESTED' && String(r[4]).startsWith('CANARY-')));
+  check('the commitSha returned matches the row actually written', rqSheet._rows.some((r) => r[4] === result.commitSha));
+}
+
+function testReviewCanaryNeverCreatesARealIssueEvenLiveOffDryRun() {
+  console.log('runReviewQueueCanary never files a real issue even when dryRunMode would otherwise allow it (has_findings: false stops it first)');
+  const ctx = freshContext();
+  const rqSheet = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ ReviewQueue: rqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const github = makeFakeGithubForFinalize();
+  // dryRunMode explicitly 'false' - live mode - the canary must still never
+  // reach github.issues.create.
+  const result = ctx.runReviewQueueCanary({ ...BASE_DEPS, githubFactory: () => github, hubGithub: github, config: { queueSheetId: 'sheet-1', dryRunMode: 'false', globalGithubToken: 'tok' } });
+  check('reports ok', result.ok === true);
+  check('no real issue was ever created', github.calls.issuesCreate.length === 0);
+}
+
+function testLearningCanaryRunsEndToEndAndLeavesHarvestedRow() {
+  console.log('runLearningQueueCanary enqueues, self-answers, and harvests its own row end to end, landing HARVESTED');
+  const ctx = freshContext();
+  const lqSheet = makeFakeSheet([
+    ['Timestamp', 'Kind', 'TenantId', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'ContextJson']
+  ]);
+  const spreadsheet = makeFakeSpreadsheet({ LearningQueue: lqSheet });
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': spreadsheet });
+  const hubGithub = makeFakeGithubForFinalize();
+  const result = ctx.runLearningQueueCanary({ ...BASE_DEPS, githubFactory: () => hubGithub, hubGithub, config: { queueSheetId: 'sheet-1', dryRunMode: 'false', globalGithubToken: 'tok' } });
+  check('reports ok', result.ok === true);
+  check('a HARVESTED canary row landed with TenantId=canary', lqSheet._rows.some((r) => r[2] === 'canary' && r[3] === 'HARVESTED'));
+  check('no real PR was ever opened, even in live mode - has_proposal:false stops it first', hubGithub.calls.createOrUpdateFileContents.length === 0);
+}
+
+function main() {
+  testAutoCreatesQueueSpreadsheetWhenUnconfigured();
+  testAutoCreateSkipsCleanlyWhenLockContended();
+  testAutoCreateReturnsNullWithNoScriptPropertiesToPersistInto();
+  testAutoCreateRechecksUnderTheLockBeforeCreating();
+  testHarvestReturnsZeroWhenQueueSheetIdUnconfigured();
+  testHarvestCreatesTheTabOnFirstRunIfMissing();
+  testHarvestReviewSkipsRowsNotYetEvaluated();
+  testHarvestReviewMarksEmptyOutputAsError();
+  testHarvestReviewCallsFinalizeAndMarksHarvested();
+  testHarvestReviewMarksThrownErrorsDistinctly();
+  testLivenessDistinguishesNeverAnsweredFromSlowFromAnswered();
+  testLivenessCatchesARowStuckAtReadyWithRealOutput();
+  testLearningQueueLivenessSameShape();
+  testLivenessFailsSafeWithNoQueueSheetConfigured();
+  testInstallTriggersCreatesBothOnAFreshProject();
+  testInstallTriggersIsIdempotent();
+  testInstallTriggersOnlyCreatesTheMissingOne();
+  testBindingReportsOkWhenHeadersMatchExactly();
+  testBindingCatchesAMissingColumn();
+  testBindingCatchesARenamedColumn();
+  testBindingCatchesAnExtraColumn();
+  testLearningBindingSameShape();
+  testBindingFailsSafeWithNoQueueSheetConfigured();
+  testInstallReviewFixtureAppendsAFixtureRow();
+  testInstallReviewFixtureIsIdempotent();
+  testInstallLearningFixtureAppendsAFixtureRow();
+  testInstallLearningFixtureIsIdempotent();
+  testReviewCanaryRunsEndToEndAndLeavesHarvestedRow();
+  testReviewCanaryNeverCreatesARealIssueEvenLiveOffDryRun();
+  testLearningCanaryRunsEndToEndAndLeavesHarvestedRow();
+
+  console.log('');
+  if (failures > 0) {
+    console.error(`${failures} check(s) failed.`);
+    process.exit(1);
+  }
+  console.log('All checks passed.');
+}
+
+main();

@@ -1,17 +1,23 @@
-// Local verification harness for gas/autonomous_agent.js's processRequest(),
-// the Apps Script port of api/autonomous_agent.js. Same rationale as
-// dev-test-handler.mjs: nothing here calls GitHub, the AI API, or a real
-// Apps Script deployment - every github/aiFetch call is a hand-rolled fake,
-// loaded via the same vm-based harness (scripts/gas-test-harness.mjs) real
-// Apps Script uses to run these files, so what's tested here is exactly
-// what a real deployment executes.
+// Local verification harness for gas/autonomous_agent.js's processRequest()
+// and finalizeReviewResult_() - the Apps Script port of api/autonomous_agent.js,
+// now split into an enqueue half (processRequest, called synchronously from
+// doPost) and a finalize half (finalizeReviewResult_, called by
+// harvestReviewResults() once a human-built Workspace Studio Flow has
+// answered - see gas/review_queue.js's header comment for the full
+// mechanics). Same rationale as every other dev-test-gas-*.mjs harness:
+// nothing here calls GitHub, an AI API, or a real Apps Script deployment -
+// every github/sheet call is a hand-rolled fake, loaded via the same
+// vm-based harness (scripts/gas-test-harness.mjs) real Apps Script uses to
+// run these files, so what's tested here is exactly what a real deployment
+// executes.
 //
 // Usage: node scripts/dev-test-gas-handler.mjs
 
 import { loadGasGlobals } from './gas-test-harness.mjs';
+import { makeFakeSheet } from './gas-sheet-fakes.mjs';
 import { strict as assert } from 'assert';
 
-const { processRequest } = loadGasGlobals('constants.js', 'github.js', 'autonomous_agent.js');
+const { processRequest, finalizeReviewResult_ } = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js');
 
 let failures = 0;
 
@@ -137,34 +143,13 @@ function makeFakeHubGithub({ hubOwner = 'adamberneche-afk', hubRepo = 'Mothershi
   };
 }
 
-function makeFakeAiFetch(aiJsonContent) {
-  let callCount = 0;
-  const aiFetch = () => {
-    callCount++;
-    return {
-      getResponseCode: () => 200,
-      getContentText: () => JSON.stringify({ choices: [{ message: { content: aiJsonContent } }] })
-    };
-  };
-  aiFetch.callCount = () => callCount;
-  return aiFetch;
-}
-
-// Same as makeFakeAiFetch, but also captures the actual payload sent to the
-// AI - needed to assert on which files/text made it into the prompt (issue
-// #34's ordering/truncation fix, issue #35's local-context fix).
-function makeFakeAiFetchCapturing(aiJsonContent) {
-  const calls = [];
-  const aiFetch = (url, options) => {
-    calls.push(JSON.parse(options.payload));
-    return {
-      getResponseCode: () => 200,
-      getContentText: () => JSON.stringify({ choices: [{ message: { content: aiJsonContent } }] })
-    };
-  };
-  aiFetch.callCount = () => calls.length;
-  aiFetch.lastPrompt = () => calls[calls.length - 1]?.messages?.[0]?.content ?? '';
-  return aiFetch;
+// Reads back the PromptText column (index 6) of the most recently
+// appendRow()'d ReviewQueue row - what a diff-ordering/truncation
+// assertion needs to inspect now, since there's no aiFetch payload to
+// capture anymore (see review_queue.js's RQ column map).
+function lastQueuedPrompt(sheet) {
+  const rows = sheet._rows;
+  return rows.length ? rows[rows.length - 1][6] : '';
 }
 
 const FINDING_JSON = JSON.stringify({
@@ -181,7 +166,27 @@ const NO_FINDING_JSON = JSON.stringify({
   value_impact: { reasoning: '' }
 });
 
-const BASE_DEPS = { base64Encode: b64, base64Decode: unb64 };
+// Registers the plain 'o'/'r' owner/repo pair every non-multi-tenancy test
+// below uses, as a real registered spoke on a tenant with no callerKeyRef -
+// these tests exist to exercise queuing/dedup/dry-run/etc., not tenant
+// resolution, and processRequest() now rejects an owner/repo that isn't a
+// registered spoke outright (see autonomous_agent.js's resolveTenantIdForSpoke
+// header comment), so they need a real registration to keep reaching the
+// behavior they're actually testing. Multi-tenancy-specific tests below
+// override both fields explicitly with their own fixtures (TWO_TENANT_SPOKES/
+// TWO_TENANTS, or a deliberately-unregistered owner/repo) later in the same
+// object literal, which wins over this default.
+const GENERIC_SPOKE = [
+  { tenantId: 'generic', owner: 'o', repo: 'r', addedAt: '2026-08-13T00:00:00Z', status: 'active' }
+];
+const GENERIC_TENANT = [
+  { tenantId: 'generic', name: 'Generic test tenant', status: 'active', plan: 'internal', quota: { reviewsPerMonth: null }, createdAt: '2026-08-13T00:00:00Z' }
+];
+
+const BASE_DEPS = {
+  base64Encode: b64, base64Decode: unb64,
+  spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT
+};
 
 const TWO_TENANT_SPOKES = [
   { tenantId: 'acme', owner: 'acme-org', repo: 'acme-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active' },
@@ -197,114 +202,77 @@ function makeFakeScriptProperties(props) {
   return { getProperty: (key) => (props[key] !== undefined ? props[key] : null) };
 }
 
-// --- Safety rails ------------------------------------------------------------
+// --- Enqueue half: processRequest() only queues, never answers directly ----
 
-function testDryRunNeverCreatesIssue() {
-  console.log('Dry-run mode never calls issues.create');
+function testProcessRequestQueuesInsteadOfAnswering() {
+  console.log('processRequest() queues a row and responds "Queued" - no more inline AI call/answer');
   const github = makeFakeGithub();
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
+  const sheet = makeFakeSheet();
   const { httpStatus, body } = processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
   check('httpStatus is 200', httpStatus === 200);
-  check('status is DryRunFinding', body.status === 'DryRunFinding');
-  check('dryRun is true', body.dryRun === true);
-  check('wouldCreate is present', !!body.wouldCreate?.title);
-  check('issues.create was never called', github.calls.issuesCreate.length === 0);
-}
-
-function testRateCapBlocksAtLimit() {
-  console.log('Live mode blocks once the daily cap is reached');
-  const cap = 3;
-  const todayIssues = Array.from({ length: cap }, (_, i) => ({
-    created_at: new Date().toISOString(),
-    number: i
-  }));
-  const github = makeFakeGithub({ issuesCreatedToday: todayIssues });
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
-  const { body } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: false, config: { rateCapPerRepoPerDay: cap } }
-  );
-  check('status is Skipped once at cap', body.status === 'Skipped');
-  check('reason mentions rate cap', /rate cap/i.test(body.reason || ''));
-  check('issues.create was never called', github.calls.issuesCreate.length === 0);
-}
-
-function testRateCapAllowsUnderLimit() {
-  console.log('Live mode creates an issue when under the daily cap');
-  const github = makeFakeGithub({ issuesCreatedToday: [] });
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
-  const { body } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: false, config: { rateCapPerRepoPerDay: 3 } }
-  );
-  check('status is Success', body.status === 'Success');
-  check('dryRun is false', body.dryRun === false);
-  check('issues.create was called exactly once', github.calls.issuesCreate.length === 1);
-  check('issue carries the hub label', github.calls.issuesCreate[0]?.labels?.includes('cto-hub-auto'));
-}
-
-function testNoFindingsResponseCarriesDryRun() {
-  console.log('A no-findings response still carries dryRun');
-  const github = makeFakeGithub();
-  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
-  const { body } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
-  );
-  check('status is Skipped', body.status === 'Skipped');
+  check('status is Queued', body.status === 'Queued');
   check('dryRun field is present', body.dryRun === true);
+  check('exactly one row was queued', sheet._rows.length === 1);
+  check('queued row carries owner/repo/mode/commitSha/READY', sheet._rows[0].slice(1, 6).join('|') === 'o|r|debug|abc123|READY');
+  check('queued row carries a real prompt', sheet._rows[0][6].includes('MODE: DEBUG'));
 }
 
-// --- Decision logging ---------------------------------------------------------
+function testProcessRequestDedupsARepeatedQueueAttempt() {
+  console.log('processRequest() does not queue a second row for the same owner/repo/mode/commit while one is still pending');
+  const github = makeFakeGithub();
+  const sheet = makeFakeSheet();
+  processRequest({ owner: 'o', repo: 'r', mode: 'debug' }, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true });
+  const { body } = processRequest({ owner: 'o', repo: 'r', mode: 'debug' }, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true });
+  check('still only one row queued', sheet._rows.length === 1);
+  check('second call reports already queued', /already queued/i.test(body.reason || ''));
+}
+
+function testProcessRequestSkipsCleanlyWhenNoQueueSheetConfigured() {
+  console.log('processRequest() fails safe (Skipped, not a crash) when QUEUE_SHEET_ID is not configured and no override is given');
+  const github = makeFakeGithub();
+  const { httpStatus, body } = processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true, config: {} }
+  );
+  check('httpStatus is 200', httpStatus === 200);
+  check('status is Skipped', body.status === 'Skipped');
+  check('reason names the missing QUEUE_SHEET_ID', /QUEUE_SHEET_ID/.test(body.reason || ''));
+}
+
+// --- Skip paths stay synchronous and unchanged in substance -----------------
 
 function testDecisionLogSkipsAlreadyDecidedCommit() {
-  console.log('A logged (non-ai_error) decision for this commit+mode skips the AI call');
+  console.log('A logged (non-ai_error) decision for this commit+mode skips queuing entirely');
   const decisionLog = [
     { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'abc123', outcome: 'no_findings', issueUrl: null, summary: null }
   ];
   const github = makeFakeGithub({ decisionLog, commitSha: 'abc123' });
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
+  const sheet = makeFakeSheet();
   const { body } = processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
-  check('AI was never called', aiFetch.callCount() === 0);
+  check('nothing was queued', sheet._rows.length === 0);
   check('status is Skipped', body.status === 'Skipped');
   check('priorDecision reflects the logged outcome', body.priorDecision?.outcome === 'no_findings');
 }
 
 function testAiErrorDoesNotBlockRetry() {
-  console.log("A logged 'ai_error' outcome does NOT block retrying the same commit+mode");
+  console.log("A logged 'ai_error' outcome does NOT block re-queuing the same commit+mode");
   const decisionLog = [
     { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'abc123', outcome: 'ai_error', issueUrl: null, summary: null }
   ];
   const github = makeFakeGithub({ decisionLog, commitSha: 'abc123' });
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
+  const sheet = makeFakeSheet();
   const { body } = processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
-  check('AI was called (not skipped)', aiFetch.callCount() === 1);
-  check('a real decision was reached', body.status === 'DryRunFinding');
-}
-
-function testDecisionLogWritesEntryOnNormalRun() {
-  console.log('A normal run appends a well-formed entry to the decision log');
-  const github = makeFakeGithub({ decisionLog: null, commitSha: 'abc123' }); // no log file yet
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
-  processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
-  );
-  const writes = github.calls.createOrUpdateFileContents;
-  check('exactly one write to the decision log', writes.length === 1);
-  const writtenEntries = JSON.parse(unb64(writes[0].content));
-  check('log now has one entry', writtenEntries.length === 1);
-  check('entry has the right commitSha/mode/outcome', writtenEntries[0].commitSha === 'abc123' && writtenEntries[0].mode === 'debug' && writtenEntries[0].outcome === 'dry_run_would_create');
-  check('no sha sent when the file did not exist yet', writes[0].sha === undefined);
+  check('a fresh row was queued (not skipped)', sheet._rows.length === 1);
+  check('status is Queued', body.status === 'Queued');
 }
 
 function testReplayOfACreatedDecisionSurfacesIssueUrlAtTopLevel() {
@@ -313,12 +281,12 @@ function testReplayOfACreatedDecisionSurfacesIssueUrlAtTopLevel() {
     { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'abc123', outcome: 'created', issueUrl: 'https://github.com/o/r/issues/42', summary: 'Found a thing' }
   ];
   const github = makeFakeGithub({ decisionLog, commitSha: 'abc123' });
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
+  const sheet = makeFakeSheet();
   const { body } = processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
-  check('AI was never called', aiFetch.callCount() === 0);
+  check('nothing was queued', sheet._rows.length === 0);
   check('top-level issueUrl matches the logged one', body.issueUrl === 'https://github.com/o/r/issues/42');
   check('still nested under priorDecision too', body.priorDecision?.issueUrl === 'https://github.com/o/r/issues/42');
 }
@@ -329,42 +297,82 @@ function testReplayWithoutAnIssueUrlOmitsTheField() {
     { timestamp: '2026-08-01T00:00:00Z', mode: 'debug', commitSha: 'abc123', outcome: 'no_findings', issueUrl: null, summary: null }
   ];
   const github = makeFakeGithub({ decisionLog, commitSha: 'abc123' });
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
+  const sheet = makeFakeSheet();
   const { body } = processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
   check('no top-level issueUrl field', body.issueUrl === undefined);
 }
 
-// --- Platform port: base64 round-trips through the injected functions -------
-
-function testBase64RoundTripsThroughInjectedFunctions() {
-  console.log('Platform port: content written to the decision log round-trips through base64Encode/Decode correctly');
-  const github = makeFakeGithub({ decisionLog: [], commitSha: 'abc123' });
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
-  processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+function testQuotaExceededBlocksBeforeQueuing() {
+  console.log('Multi-tenancy: a tenant over their monthly quota (globex, cap 2) is blocked BEFORE anything is queued');
+  const github = makeFakeGithub();
+  const hubGithub = makeFakeHubGithub();
+  hubGithub._logs.globex = [
+    { tenantId: 'globex', timestamp: '2026-08-01T00:00:00Z', eventType: 'review_run' },
+    { tenantId: 'globex', timestamp: '2026-08-05T00:00:00Z', eventType: 'review_run' }
+  ];
+  const sheet = makeFakeSheet();
+  const scriptProperties = makeFakeScriptProperties({ GLOBEX_TEST_TOKEN: 'globex-secret-token', GLOBEX_TEST_CALLER_KEY: 'globex-caller-key' });
+  const now = new Date('2026-08-13T00:00:00Z');
+  const { body } = processRequest(
+    { owner: 'globex-org', repo: 'globex-repo', mode: 'debug', callerKey: 'globex-caller-key' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, now, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
-  const writes = github.calls.createOrUpdateFileContents;
-  const decoded = JSON.parse(unb64(writes[0].content));
-  check('the written entry is valid JSON after a real base64 round-trip', Array.isArray(decoded) && decoded.length === 1);
+  check('status is Skipped', body.status === 'Skipped');
+  check('reason mentions the monthly quota', /quota/i.test(body.reason || ''));
+  check('nothing was queued once over quota', sheet._rows.length === 0);
 }
 
-// --- Multi-tenancy: credential resolution, isolation, usage, quota --------
+function testCallerKeyRejectedWhenWrongForATenantThatRequiresOne() {
+  console.log('Multi-tenancy: a tenant WITH callerKeyRef set (globex) rejects a missing/wrong key with 401, before queuing');
+  const github = makeFakeGithub();
+  const hubGithub = makeFakeHubGithub();
+  const sheet = makeFakeSheet();
+  const scriptProperties = makeFakeScriptProperties({ GLOBEX_TEST_TOKEN: 'globex-secret-token', GLOBEX_TEST_CALLER_KEY: 'globex-caller-key' });
+  const { httpStatus } = processRequest(
+    { owner: 'globex-org', repo: 'globex-repo', mode: 'debug', callerKey: 'wrong-key' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+  );
+  check('httpStatus is 401', httpStatus === 401);
+  check('nothing was queued for a rejected caller', sheet._rows.length === 0);
+}
 
-function testUnregisteredSpokeFallsBackToDefaultTenantCredential() {
-  console.log('Multi-tenancy: a spoke not in spokes.json falls back to the "default" tenant (backward compat)');
+function testCallerKeyAcceptedWhenCorrect() {
+  console.log('Multi-tenancy: the correct callerKey for a tenant that requires one proceeds normally');
+  const github = makeFakeGithub();
+  const hubGithub = makeFakeHubGithub();
+  const sheet = makeFakeSheet();
+  const scriptProperties = makeFakeScriptProperties({ GLOBEX_TEST_TOKEN: 'globex-secret-token', GLOBEX_TEST_CALLER_KEY: 'globex-caller-key' });
+  const { httpStatus } = processRequest(
+    { owner: 'globex-org', repo: 'globex-repo', mode: 'debug', callerKey: 'globex-caller-key' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+  );
+  check('httpStatus is 200 with the correct key', httpStatus === 200);
+  check('a row was queued', sheet._rows.length === 1);
+}
+
+function testUnregisteredSpokeIsRejectedOutright() {
+  // Real gap this closed: gas/'s deployment is a publicly-reachable
+  // ("Anyone") web app, and resolveTenantIdForSpoke() used to fall back to
+  // the "default" tenant - and its GLOBAL_GITHUB_TOKEN-backed credential -
+  // for ANY owner/repo, not just this hub's own registered spokes. It now
+  // returns no tenant at all for an unmatched owner/repo, and
+  // processRequest() rejects the request before any GitHub call runs.
+  console.log('Multi-tenancy: an owner/repo that is not a registered spoke of ANY tenant is rejected outright, before any GitHub call runs');
   const github = makeFakeGithub();
   const factory = makeFakeGithubFactory(github);
   const hubGithub = makeFakeHubGithub();
-  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
-  processRequest(
+  const sheet = makeFakeSheet();
+  const { httpStatus, body } = processRequest(
     { owner: 'not-registered-owner', repo: 'not-registered-repo', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: factory, hubGithub, aiFetch, dryRunOverride: true, config: { globalGithubToken: 'the-global-token' }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+    { ...BASE_DEPS, githubFactory: factory, hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { globalGithubToken: 'the-global-token' }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
-  check('resolved to config.globalGithubToken, not a tenant-specific one', factory.tokensUsed[0] === 'the-global-token');
+  check('httpStatus is 403', httpStatus === 403);
+  check('error names the actual problem', /not a registered spoke/i.test(body.error || ''));
+  check('no real GitHub API call ever ran with the global token', github.calls.getContent.length === 0);
+  check('nothing was queued for a rejected owner/repo', sheet._rows.length === 0);
 }
 
 function testRegisteredSpokeResolvesItsOwnTenantCredential() {
@@ -372,105 +380,28 @@ function testRegisteredSpokeResolvesItsOwnTenantCredential() {
   const github = makeFakeGithub();
   const factory = makeFakeGithubFactory(github);
   const hubGithub = makeFakeHubGithub();
-  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
+  const sheet = makeFakeSheet();
   const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
   processRequest(
     { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: factory, hubGithub, aiFetch, dryRunOverride: true, config: { globalGithubToken: 'the-global-token', scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+    { ...BASE_DEPS, githubFactory: factory, hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { globalGithubToken: 'the-global-token', scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
   check("resolved to acme's own token, not the global one", factory.tokensUsed[0] === 'acme-secret-token');
 }
 
-function testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured() {
-  console.log('Multi-tenancy: a tenant with no callerKeyRef set (acme) accepts any/no callerKey - backward compatible');
-  const github = makeFakeGithub();
-  const hubGithub = makeFakeHubGithub();
-  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
-  const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
-  const { httpStatus } = processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
-  );
-  check('request proceeds (200), no caller-key requirement for this tenant', httpStatus === 200);
-}
-
-function testCallerKeyRejectedWhenWrongForATenantThatRequiresOne() {
-  console.log('Multi-tenancy: a tenant WITH callerKeyRef set (globex) rejects a missing/wrong key with 401');
-  const github = makeFakeGithub();
-  const hubGithub = makeFakeHubGithub();
-  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
-  const scriptProperties = makeFakeScriptProperties({ GLOBEX_TEST_TOKEN: 'globex-secret-token', GLOBEX_TEST_CALLER_KEY: 'globex-caller-key' });
-  const { httpStatus } = processRequest(
-    { owner: 'globex-org', repo: 'globex-repo', mode: 'debug', callerKey: 'wrong-key' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
-  );
-  check('httpStatus is 401', httpStatus === 401);
-  check('AI was never called for a rejected caller', aiFetch.callCount() === 0);
-}
-
-function testCallerKeyAcceptedWhenCorrect() {
-  console.log('Multi-tenancy: the correct callerKey for a tenant that requires one proceeds normally');
-  const github = makeFakeGithub();
-  const hubGithub = makeFakeHubGithub();
-  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
-  const scriptProperties = makeFakeScriptProperties({ GLOBEX_TEST_TOKEN: 'globex-secret-token', GLOBEX_TEST_CALLER_KEY: 'globex-caller-key' });
-  const { httpStatus } = processRequest(
-    { owner: 'globex-org', repo: 'globex-repo', mode: 'debug', callerKey: 'globex-caller-key' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
-  );
-  check('httpStatus is 200 with the correct key', httpStatus === 200);
-}
-
-function testUsageEventRecordedForTheCorrectTenantOnly() {
-  console.log("Multi-tenancy: a review run records a usage event under ITS tenant's usage log, never another tenant's");
-  const github = makeFakeGithub();
-  const hubGithub = makeFakeHubGithub();
-  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
-  const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
-  processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
-  );
-  check('exactly one usage write happened', hubGithub._writes.length === 1);
-  check("it was written to acme's usage log path", hubGithub._writes[0].path === 'usage/acme.json');
-  check("globex's usage log was never touched", hubGithub._logs.globex === undefined);
-  const acmeEntries = hubGithub._logs.acme;
-  check('the recorded event is tagged with the right tenantId/eventType', acmeEntries?.[0]?.tenantId === 'acme' && acmeEntries?.[0]?.eventType === 'review_run');
-}
-
-function testQuotaExceededBlocksBeforeTheAiCall() {
-  console.log('Multi-tenancy: a tenant over their monthly quota (globex, cap 2) is blocked BEFORE the AI call - no cost incurred');
-  const github = makeFakeGithub();
-  const hubGithub = makeFakeHubGithub();
-  hubGithub._logs.globex = [
-    { tenantId: 'globex', timestamp: '2026-08-01T00:00:00Z', eventType: 'review_run' },
-    { tenantId: 'globex', timestamp: '2026-08-05T00:00:00Z', eventType: 'review_run' }
-  ];
-  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
-  const scriptProperties = makeFakeScriptProperties({ GLOBEX_TEST_TOKEN: 'globex-secret-token', GLOBEX_TEST_CALLER_KEY: 'globex-caller-key' });
-  const now = new Date('2026-08-13T00:00:00Z');
-  const { body } = processRequest(
-    { owner: 'globex-org', repo: 'globex-repo', mode: 'debug', callerKey: 'globex-caller-key' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, aiFetch, dryRunOverride: true, now, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
-  );
-  check('status is Skipped', body.status === 'Skipped');
-  check('reason mentions the monthly quota', /quota/i.test(body.reason || ''));
-  check('the AI was never called - no cost incurred once over quota', aiFetch.callCount() === 0);
-}
-
-function testQuotaUnderLimitProceedsNormally() {
-  console.log('Multi-tenancy: a tenant under their monthly quota proceeds to the AI call normally');
+function testQuotaUnderLimitProceedsToQueuing() {
+  console.log('Multi-tenancy: a tenant under their monthly quota proceeds to queuing normally');
   const github = makeFakeGithub();
   const hubGithub = makeFakeHubGithub();
   hubGithub._logs.globex = [{ tenantId: 'globex', timestamp: '2026-08-01T00:00:00Z', eventType: 'review_run' }]; // 1 of 2 used
-  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
+  const sheet = makeFakeSheet();
   const scriptProperties = makeFakeScriptProperties({ GLOBEX_TEST_TOKEN: 'globex-secret-token', GLOBEX_TEST_CALLER_KEY: 'globex-caller-key' });
   const now = new Date('2026-08-13T00:00:00Z');
   const { body } = processRequest(
     { owner: 'globex-org', repo: 'globex-repo', mode: 'debug', callerKey: 'globex-caller-key' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, aiFetch, dryRunOverride: true, now, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, now, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
-  check('the AI was called - still under quota', aiFetch.callCount() === 1);
+  check('a row was queued - still under quota', sheet._rows.length === 1);
   check('status is not a quota skip', !/quota/i.test(body.reason || ''));
 }
 
@@ -479,17 +410,18 @@ function testNullQuotaMeansUnlimited() {
   const github = makeFakeGithub();
   const hubGithub = makeFakeHubGithub();
   hubGithub._logs.acme = Array.from({ length: 500 }, () => ({ tenantId: 'acme', timestamp: '2026-08-01T00:00:00Z', eventType: 'review_run' }));
-  const aiFetch = makeFakeAiFetch(NO_FINDING_JSON);
+  const sheet = makeFakeSheet();
   const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
-  const { body } = processRequest(
+  processRequest(
     { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
-  check('the AI was still called despite 500 prior events - null quota is unlimited', aiFetch.callCount() === 1);
+  check('a row was queued despite 500 prior events - null quota is unlimited', sheet._rows.length === 1);
 }
 
 // --- Issue #34: diff ordering/truncation puts code before docs, and one -----
-// --- huge file can't starve everything after it -----------------------------
+// --- huge file can't starve everything after it - now checked in the -------
+// --- queued PromptText, since there's no aiFetch payload to capture --------
 
 function testDiffOrdersCodeFilesBeforeDocFilesWhenBothCantFit() {
   console.log('Issue #34: when the diff is too big to fit, a doc file yields its slot to a code file');
@@ -499,12 +431,12 @@ function testDiffOrdersCodeFilesBeforeDocFilesWhenBothCantFit() {
     { filename: 'src/real_logic.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n-buggy\n+fixed' }
   ];
   const github = makeFakeGithub({ diffFiles });
-  const aiFetch = makeFakeAiFetchCapturing(NO_FINDING_JSON);
+  const sheet = makeFakeSheet();
   processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
-  const prompt = aiFetch.lastPrompt();
+  const prompt = lastQueuedPrompt(sheet);
   check('the code file made it into the prompt', prompt.includes('src/real_logic.js'));
   check('the code file\'s actual patch text is present', prompt.includes('buggy') && prompt.includes('fixed'));
 }
@@ -517,12 +449,12 @@ function testDiffCapsAnySingleFileSoItCannotStarveTheRest() {
     { filename: 'src/small_file.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n-old\n+distinctive_marker' }
   ];
   const github = makeFakeGithub({ diffFiles });
-  const aiFetch = makeFakeAiFetchCapturing(NO_FINDING_JSON);
+  const sheet = makeFakeSheet();
   processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
-  const prompt = aiFetch.lastPrompt();
+  const prompt = lastQueuedPrompt(sheet);
   check('the huge file is present but truncated', prompt.includes('src/huge_file.js') && prompt.includes('truncated'));
   check('the small file after it still made it in', prompt.includes('distinctive_marker'));
 }
@@ -535,118 +467,166 @@ function testDiffNotesOmittedFilesWhenTheyDontFit() {
     patch: '+line\n'.repeat(3000)
   }));
   const github = makeFakeGithub({ diffFiles });
-  const aiFetch = makeFakeAiFetchCapturing(NO_FINDING_JSON);
+  const sheet = makeFakeSheet();
   processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
-  const prompt = aiFetch.lastPrompt();
+  const prompt = lastQueuedPrompt(sheet);
   check('an omission note is present', prompt.includes('omitted'));
   check('the omission note names a specific dropped file', /src\/[a-g]\.js/.test(prompt.slice(prompt.indexOf('omitted'))));
 }
 
-// --- Issue #35: bot-authored / generated-data-only commits are skipped -----
-// --- before spending an AI call, and local-context files are independent --
+// --- Finalize half: finalizeReviewResult_() does everything the old --------
+// --- inline AI-response handling used to do, given a harvested answer ------
 
-function testBotAuthoredCommitIsSkippedBeforeTheAiCall() {
-  console.log('Issue #35: a github-actions[bot]-authored commit is skipped before the AI call');
-  const github = makeFakeGithub({ commitAuthorLogin: 'github-actions[bot]' });
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
-  const { body } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+function testFinalizeDryRunNeverCreatesIssue() {
+  console.log('finalizeReviewResult_: dry-run mode never calls issues.create');
+  const github = makeFakeGithub();
+  const result = finalizeReviewResult_(
+    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true }
   );
-  check('AI was never called', aiFetch.callCount() === 0);
-  check('status is Skipped', body.status === 'Skipped');
-  check('reason mentions bot/excluded', /bot|excluded/i.test(body.reason || ''));
+  check('status is DryRunFinding', result.status === 'DryRunFinding');
+  check('dryRun is true', result.dryRun === true);
+  check('wouldCreate is present', !!result.wouldCreate?.title);
+  check('issues.create was never called', github.calls.issuesCreate.length === 0);
 }
 
-function testHumanCommitTouchingOnlyExportsPathIsSkipped() {
-  console.log('Issue #35: a commit touching only exports/ paths is skipped even from a human author');
-  const diffFiles = [
-    { filename: 'exports/2026-08-17-issues.json', status: 'added', patch: '+huge json dump' },
-    { filename: 'exports/2026-08-17-issues.md', status: 'added', patch: '+huge md dump' }
-  ];
-  const github = makeFakeGithub({ diffFiles });
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
-  const { body } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+function testFinalizeRateCapBlocksAtLimit() {
+  console.log('finalizeReviewResult_: live mode blocks once the daily cap is reached');
+  const cap = 3;
+  const todayIssues = Array.from({ length: cap }, (_, i) => ({ created_at: new Date().toISOString(), number: i }));
+  const github = makeFakeGithub({ issuesCreatedToday: todayIssues });
+  const result = finalizeReviewResult_(
+    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: false, config: { rateCapPerRepoPerDay: cap } }
   );
-  check('AI was never called', aiFetch.callCount() === 0);
-  check('status is Skipped', body.status === 'Skipped');
+  check('status is Skipped once at cap', result.status === 'Skipped');
+  check('reason mentions rate cap', /rate cap/i.test(result.reason || ''));
+  check('issues.create was never called', github.calls.issuesCreate.length === 0);
 }
 
-function testNormalCommitFromABotIsNotSkippedIfPathsArentExcluded() {
-  console.log('Issue #35 (regression guard): a mixed path set is not treated as excluded unless ALL files match');
-  const diffFiles = [
-    { filename: 'src/real_logic.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n-old\n+new' },
-    { filename: 'exports/data.json', status: 'added', patch: '+data' }
-  ];
-  const github = makeFakeGithub({ diffFiles });
-  const aiFetch = makeFakeAiFetch(FINDING_JSON);
-  const { httpStatus } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+function testFinalizeRateCapAllowsUnderLimit() {
+  console.log('finalizeReviewResult_: live mode creates an issue when under the daily cap');
+  const github = makeFakeGithub({ issuesCreatedToday: [] });
+  const result = finalizeReviewResult_(
+    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: false, config: { rateCapPerRepoPerDay: 3 } }
   );
-  check('AI was still called - not every file matched the excluded prefix', aiFetch.callCount() === 1);
-  check('httpStatus is 200', httpStatus === 200);
+  check('status is Success', result.status === 'Success');
+  check('dryRun is false', result.dryRun === false);
+  check('issues.create was called exactly once', github.calls.issuesCreate.length === 1);
+  check('issue carries the hub label', github.calls.issuesCreate[0]?.labels?.includes('cto-hub-auto'));
 }
 
-function testLocalContextSurvivesWhenOnlyOneFileIsMissing() {
-  console.log('Issue #35: a real lessons.md still reaches the prompt even when NORTH_STAR.md 404s');
-  const github = makeFakeGithub({ missingLocalFiles: ['NORTH_STAR.md'] });
-  const aiFetch = makeFakeAiFetchCapturing(NO_FINDING_JSON);
-  processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+function testFinalizeNoFindingsResponseCarriesDryRun() {
+  console.log('finalizeReviewResult_: a no-findings response still carries dryRun');
+  const github = makeFakeGithub();
+  const result = finalizeReviewResult_(
+    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: NO_FINDING_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true }
   );
-  const prompt = aiFetch.lastPrompt();
-  check('the real lessons.md content reached the prompt', prompt.includes('fake content of lessons.md'));
-  check('NORTH_STAR is reported as not found, not silently dropped', prompt.includes('(none found)'));
-  check('the whole local context did NOT collapse to "No local context found."', !prompt.includes('No local context found.'));
+  check('status is Skipped', result.status === 'Skipped');
+  check('dryRun field is present', result.dryRun === true);
 }
 
-function testLocalContextIsTheNoneFoundFallbackWhenBothFilesAreMissing() {
-  console.log('Issue #35 (regression guard): when BOTH local files are genuinely missing, the fallback text still applies');
-  const github = makeFakeGithub({ missingLocalFiles: ['lessons.md', 'NORTH_STAR.md'] });
-  const aiFetch = makeFakeAiFetchCapturing(NO_FINDING_JSON);
-  processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), aiFetch, dryRunOverride: true }
+function testFinalizeInvalidJsonIsSkippedNotThrown() {
+  console.log('finalizeReviewResult_: malformed GeminiFullOutput is a clean Skipped, not a thrown error');
+  const github = makeFakeGithub();
+  const result = finalizeReviewResult_(
+    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: 'not json at all' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true }
   );
-  const prompt = aiFetch.lastPrompt();
-  check('falls back to "No local context found."', prompt.includes('No local context found.'));
+  check('status is Skipped', result.status === 'Skipped');
+  check('reason mentions invalid JSON', /valid JSON/i.test(result.reason || ''));
 }
 
-function main() {
-  testDryRunNeverCreatesIssue();
-  testRateCapBlocksAtLimit();
-  testRateCapAllowsUnderLimit();
-  testNoFindingsResponseCarriesDryRun();
+function testFinalizeWritesDecisionLogEntry() {
+  console.log('finalizeReviewResult_: a normal run appends a well-formed entry to the decision log');
+  const github = makeFakeGithub({ decisionLog: null, commitSha: 'abc123' }); // no log file yet
+  finalizeReviewResult_(
+    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true }
+  );
+  const writes = github.calls.createOrUpdateFileContents;
+  check('exactly one write to the decision log', writes.length === 1);
+  const writtenEntries = JSON.parse(unb64(writes[0].content));
+  check('log now has one entry', writtenEntries.length === 1);
+  check('entry has the right commitSha/mode/outcome', writtenEntries[0].commitSha === 'abc123' && writtenEntries[0].mode === 'debug' && writtenEntries[0].outcome === 'dry_run_would_create');
+  check('no sha sent when the file did not exist yet', writes[0].sha === undefined);
+}
+
+function testFinalizeRecordsUsageForTheCorrectTenantOnly() {
+  console.log("Multi-tenancy: finalizeReviewResult_ records a usage event under ITS tenant's usage log, never another tenant's");
+  const github = makeFakeGithub();
+  const hubGithub = makeFakeHubGithub();
+  const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
+  finalizeReviewResult_(
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', commitSha: 'abc123', rawContent: NO_FINDING_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+  );
+  check('exactly one usage write happened', hubGithub._writes.length === 1);
+  check("it was written to acme's usage log path", hubGithub._writes[0].path === 'usage/acme.json');
+  check("globex's usage log was never touched", hubGithub._logs.globex === undefined);
+  const acmeEntries = hubGithub._logs.acme;
+  check('the recorded event is tagged with the right tenantId/eventType', acmeEntries?.[0]?.tenantId === 'acme' && acmeEntries?.[0]?.eventType === 'review_run');
+}
+
+function testFinalizeReResolvesTheCorrectTenantCredential() {
+  console.log('finalizeReviewResult_ re-resolves the spoke\'s own tenant credential fresh, not a persisted one');
+  const github = makeFakeGithub({ issuesCreatedToday: [] });
+  const factory = makeFakeGithubFactory(github);
+  const hubGithub = makeFakeHubGithub();
+  const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
+  finalizeReviewResult_(
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { ...BASE_DEPS, githubFactory: factory, hubGithub, dryRunOverride: false, config: { scriptProperties, rateCapPerRepoPerDay: 3 }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+  );
+  check("resolved to acme's own token at finalize time", factory.tokensUsed.includes('acme-secret-token'));
+}
+
+// --- Platform port: base64 round-trips through the injected functions -------
+
+function testBase64RoundTripsThroughInjectedFunctions() {
+  console.log('Platform port: content written to the decision log round-trips through base64Encode/Decode correctly');
+  const github = makeFakeGithub({ decisionLog: [], commitSha: 'abc123' });
+  finalizeReviewResult_(
+    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true }
+  );
+  const writes = github.calls.createOrUpdateFileContents;
+  const decoded = JSON.parse(unb64(writes[0].content));
+  check('the written entry is valid JSON after a real base64 round-trip', Array.isArray(decoded) && decoded.length === 1);
+}
+
+async function main() {
+  testProcessRequestQueuesInsteadOfAnswering();
+  testProcessRequestDedupsARepeatedQueueAttempt();
+  testProcessRequestSkipsCleanlyWhenNoQueueSheetConfigured();
   testDecisionLogSkipsAlreadyDecidedCommit();
   testAiErrorDoesNotBlockRetry();
-  testDecisionLogWritesEntryOnNormalRun();
   testReplayOfACreatedDecisionSurfacesIssueUrlAtTopLevel();
   testReplayWithoutAnIssueUrlOmitsTheField();
-  testBase64RoundTripsThroughInjectedFunctions();
-  testUnregisteredSpokeFallsBackToDefaultTenantCredential();
-  testRegisteredSpokeResolvesItsOwnTenantCredential();
-  testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured();
+  testQuotaExceededBlocksBeforeQueuing();
   testCallerKeyRejectedWhenWrongForATenantThatRequiresOne();
   testCallerKeyAcceptedWhenCorrect();
-  testUsageEventRecordedForTheCorrectTenantOnly();
-  testQuotaExceededBlocksBeforeTheAiCall();
-  testQuotaUnderLimitProceedsNormally();
+  testUnregisteredSpokeIsRejectedOutright();
+  testRegisteredSpokeResolvesItsOwnTenantCredential();
+  testQuotaUnderLimitProceedsToQueuing();
   testNullQuotaMeansUnlimited();
   testDiffOrdersCodeFilesBeforeDocFilesWhenBothCantFit();
   testDiffCapsAnySingleFileSoItCannotStarveTheRest();
   testDiffNotesOmittedFilesWhenTheyDontFit();
-  testBotAuthoredCommitIsSkippedBeforeTheAiCall();
-  testHumanCommitTouchingOnlyExportsPathIsSkipped();
-  testNormalCommitFromABotIsNotSkippedIfPathsArentExcluded();
-  testLocalContextSurvivesWhenOnlyOneFileIsMissing();
-  testLocalContextIsTheNoneFoundFallbackWhenBothFilesAreMissing();
+  testFinalizeDryRunNeverCreatesIssue();
+  testFinalizeRateCapBlocksAtLimit();
+  testFinalizeRateCapAllowsUnderLimit();
+  testFinalizeNoFindingsResponseCarriesDryRun();
+  testFinalizeInvalidJsonIsSkippedNotThrown();
+  testFinalizeWritesDecisionLogEntry();
+  testFinalizeRecordsUsageForTheCorrectTenantOnly();
+  testFinalizeReResolvesTheCorrectTenantCredential();
+  testBase64RoundTripsThroughInjectedFunctions();
 
   console.log('');
   if (failures > 0) {

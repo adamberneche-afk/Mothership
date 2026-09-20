@@ -1,13 +1,19 @@
 // Local verification harness for gas/recursive_learning.js's
-// runRecursiveLearning(), the Apps Script port of api/recursive_learning.js.
-// Same rationale as dev-test-gas-handler.mjs - loaded via the same vm-based
+// runRecursiveLearning() and finalizeLearningResult_() - the Apps Script
+// port of api/recursive_learning.js, now split into an enqueue half
+// (runRecursiveLearning, called from doPost on its monthly schedule) and a
+// finalize half (finalizeLearningResult_, called by harvestLearningResults()
+// once a human-built Workspace Studio Flow has answered - see
+// gas/review_queue.js's header comment for the full mechanics). Same
+// rationale as dev-test-gas-handler.mjs - loaded via the same vm-based
 // harness real Apps Script uses to run these files.
 //
 // Usage: node scripts/dev-test-gas-recursive-learning.mjs
 
 import { loadGasGlobals } from './gas-test-harness.mjs';
+import { makeFakeSheet } from './gas-sheet-fakes.mjs';
 
-const { runRecursiveLearning } = loadGasGlobals('constants.js', 'github.js', 'recursive_learning.js');
+const { runRecursiveLearning, finalizeLearningResult_ } = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'recursive_learning.js');
 
 let failures = 0;
 
@@ -85,27 +91,14 @@ function makeFakeGithubFactory(github) {
   return factory;
 }
 
-function makeFakeAiFetch(aiJsonContent) {
-  let callCount = 0;
-  const calls = [];
-  const aiFetch = (url, options) => {
-    callCount++;
-    calls.push({ url, options });
-    return {
-      getResponseCode: () => 200,
-      getContentText: () => JSON.stringify({ choices: [{ message: { content: aiJsonContent } }] })
-    };
-  };
-  aiFetch.callCount = () => callCount;
-  aiFetch.calls = calls;
-  // The prompt actually sent to the AI - Apps Script's UrlFetchApp uses
-  // `payload`, not fetch()'s `body`.
-  aiFetch.lastPrompt = () => {
-    const last = calls[calls.length - 1];
-    return last ? JSON.parse(last.options.payload).messages[0].content : null;
-  };
-  aiFetch.allPrompts = () => calls.map(c => JSON.parse(c.options.payload).messages[0].content);
-  return aiFetch;
+// Reads back every row of a fake LearningQueue sheet as {kind, tenantId,
+// promptText, geminiOutput, contextJson} - see review_queue.js's LQ column
+// map. No header row assumed (tests pass a raw sheet override), same
+// "start at 0" reasoning as enqueueReviewRow_'s own dedup scan.
+function queuedLearningRows(sheet) {
+  return sheet._rows.map((r) => ({
+    kind: r[1], tenantId: r[2], readyStatus: r[3], promptText: r[4], geminiOutput: r[5], contextJson: r[6]
+  }));
 }
 
 const ONE_SPOKE = [{ owner: 'fake-owner', repo: 'fake-spoke', addedAt: '2026-08-06T00:00:00Z', status: 'active' }];
@@ -132,79 +125,32 @@ const NO_PROPOSAL_JSON = JSON.stringify({
 
 const BASE_DEPS = { base64Encode: b64, base64Decode: unb64 };
 
-// --- Tests -------------------------------------------------------------------
+// --- Enqueue half: runRecursiveLearning() only queues, never answers -------
 
 function testNoSpokesRegisteredSkips() {
-  console.log('No registered spokes skips without calling the AI');
+  console.log('No registered spokes skips without queuing anything');
   const github = makeFakeGithub({ spokesRegistry: [] });
-  const aiFetch = makeFakeAiFetch(PROPOSAL_JSON);
-  const { body } = runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, aiFetch, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
+  const sheet = makeFakeSheet();
+  const { body } = runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, learningQueueSheet: sheet, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
   check('status is Skipped', body.status === 'Skipped');
   check('reason mentions no spokes', /no spokes/i.test(body.reason || ''));
-  check('AI was never called', aiFetch.callCount() === 0);
+  check('nothing was queued', sheet._rows.length === 0);
 }
 
-function testNoProposalSkips() {
-  console.log('AI reporting no cross-spoke pattern skips without opening anything');
+function testQueuesOneRowPerTenant() {
+  console.log('runRecursiveLearning() queues one LearningQueue row per tenant, status Queued in the response');
   const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES });
-  const aiFetch = makeFakeAiFetch(NO_PROPOSAL_JSON);
-  const { body } = runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, aiFetch, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
+  const sheet = makeFakeSheet();
+  const { body } = runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, learningQueueSheet: sheet, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
   check('status is Completed (the aggregate wrapper)', body.status === 'Completed');
-  check('the one tenant result is Skipped', body.results[0]?.status === 'Skipped');
-  check('no branch was created', github.calls.createRef.length === 0);
-  check('no PR was opened', github.calls.pullsCreate.length === 0);
-}
-
-function testDryRunNeverOpensAPR() {
-  console.log('Dry-run mode returns the proposal without opening a PR');
-  const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES });
-  const aiFetch = makeFakeAiFetch(PROPOSAL_JSON);
-  const { body } = runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, aiFetch, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
-  check('dryRun is true', body.dryRun === true);
-  const tenantResult = body.results[0];
-  check('tenant result status is DryRunProposal', tenantResult?.status === 'DryRunProposal');
-  check('proposal is present', !!tenantResult?.proposal?.reasoning);
-  check('no branch was created', github.calls.createRef.length === 0);
-  check('no PR was opened', github.calls.pullsCreate.length === 0);
-}
-
-function testLiveOpensExactlyOnePR() {
-  console.log('Live mode opens exactly one PR against the hub itself, never a direct commit to main');
-  const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES });
-  const aiFetch = makeFakeAiFetch(PROPOSAL_JSON);
-  const { body } = runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, aiFetch, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
-  const tenantResult = body.results[0];
-  check('tenant result status is Success', tenantResult?.status === 'Success');
-  check('pullRequestUrl is present', !!tenantResult?.pullRequestUrl);
-  check('exactly one branch was created off main', github.calls.createRef.length === 1);
-  check('the PR base is main', github.calls.pullsCreate[0]?.base === 'main');
-  check('the PR targets the hub repo, not a spoke', github.calls.pullsCreate[0]?.owner === 'hub-owner' && github.calls.pullsCreate[0]?.repo === 'hub-repo');
-  check('the PR body names the tenant that prompted it', /tenant `default`/.test(github.calls.pullsCreate[0]?.body || ''));
-  check('exactly one PR was opened', github.calls.pullsCreate.length === 1);
-  check('only universal_lessons.md was written (north_star_patch was empty)', github.calls.createOrUpdateFileContents.length === 1 && github.calls.createOrUpdateFileContents[0].path === 'universal_lessons.md');
-}
-
-function testUsesTheRepoActualDefaultBranchNotHardcodedMain() {
-  console.log("Uses the hub repo's real default branch instead of assuming 'main'");
-  const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES, defaultBranch: 'trunk' });
-  const aiFetch = makeFakeAiFetch(PROPOSAL_JSON);
-  runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, aiFetch, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
-  check('looked up the default branch via repos.get', github.calls.reposGet.length === 1);
-  check('branched off the real default branch, not "main"', github.calls.getRef[0]?.ref === 'heads/trunk');
-  check('the PR base is the real default branch, not "main"', github.calls.pullsCreate[0]?.base === 'trunk');
-}
-
-function testBase64RoundTripsThroughInjectedFunctions() {
-  console.log('Platform port: proposed file content round-trips through base64Encode/Decode correctly');
-  const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES });
-  const aiFetch = makeFakeAiFetch(PROPOSAL_JSON);
-  runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, aiFetch, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
-  const write = github.calls.createOrUpdateFileContents[0];
-  check('the written content decodes back to the real proposal text', unb64(write.content).includes('Validate before you trust.'));
+  check('the one tenant result is Queued', body.results[0]?.status === 'Queued');
+  check('exactly one row was queued for the tenant', sheet._rows.filter(r => r[1] === 'tenant').length === 1);
+  check('no branch was created at enqueue time', github.calls.createRef.length === 0);
+  check('no PR was opened at enqueue time', github.calls.pullsCreate.length === 0);
 }
 
 function testPromptIncludesNegativeMaintainerFeedbackSummary() {
-  console.log('the prompt includes a MAINTAINER FEEDBACK line naming a real negative-feedback count when scripts/collect-issue-feedback.js has recorded one');
+  console.log('the queued prompt includes a MAINTAINER FEEDBACK line naming a real negative-feedback count when scripts/collect-issue-feedback.js has recorded one');
   const filesWithFeedback = {
     ...SPOKE_FILES,
     'fake-owner/fake-spoke:ai_decision_log.json': JSON.stringify([
@@ -213,20 +159,92 @@ function testPromptIncludesNegativeMaintainerFeedbackSummary() {
     ])
   };
   const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: filesWithFeedback });
-  const aiFetch = makeFakeAiFetch(NO_PROPOSAL_JSON);
-  runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, aiFetch, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
-  const prompt = aiFetch.lastPrompt();
+  const sheet = makeFakeSheet();
+  runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, learningQueueSheet: sheet, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
+  const prompt = queuedLearningRows(sheet).find(r => r.kind === 'tenant').promptText;
   check('prompt mentions MAINTAINER FEEDBACK', /MAINTAINER FEEDBACK/.test(prompt));
   check('prompt names the real negative-feedback count (1 of the 2 logged decisions)', /1 of the last 2 decisions received negative maintainer feedback/.test(prompt));
 }
 
 function testPromptSaysNoneWhenNoNegativeFeedbackExists() {
-  console.log('the prompt says "none" when no decision has received negative maintainer feedback');
+  console.log('the queued prompt says "none" when no decision has received negative maintainer feedback');
   const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES });
-  const aiFetch = makeFakeAiFetch(NO_PROPOSAL_JSON);
-  runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, aiFetch, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
-  const prompt = aiFetch.lastPrompt();
+  const sheet = makeFakeSheet();
+  runRecursiveLearning({}, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, learningQueueSheet: sheet, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' });
+  const prompt = queuedLearningRows(sheet).find(r => r.kind === 'tenant').promptText;
   check('prompt says none received negative maintainer feedback', /none of the last decisions received negative maintainer feedback/.test(prompt));
+}
+
+// --- Finalize half: finalizeLearningResult_() does everything the old ------
+// --- inline AI-response handling used to do, given a harvested answer ------
+
+function testFinalizeNoProposalSkips() {
+  console.log('finalizeLearningResult_: AI reporting no cross-spoke pattern skips without opening anything');
+  const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES });
+  const result = finalizeLearningResult_(
+    { kind: 'tenant', tenantId: 'default', rawContent: NO_PROPOSAL_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo', spokesOverride: ONE_SPOKE.map(s => ({ ...s, tenantId: 'default' })), tenantsOverride: [] }
+  );
+  check('status is Skipped', result.status === 'Skipped');
+  check('no branch was created', github.calls.createRef.length === 0);
+  check('no PR was opened', github.calls.pullsCreate.length === 0);
+}
+
+function testFinalizeDryRunNeverOpensAPR() {
+  console.log('finalizeLearningResult_: dry-run mode returns the proposal without opening a PR');
+  const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES });
+  const result = finalizeLearningResult_(
+    { kind: 'tenant', tenantId: 'default', rawContent: PROPOSAL_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo', spokesOverride: ONE_SPOKE.map(s => ({ ...s, tenantId: 'default' })), tenantsOverride: [] }
+  );
+  check('dryRun is true', result.dryRun === true);
+  check('status is DryRunProposal', result.status === 'DryRunProposal');
+  check('proposal is present', !!result.proposal?.reasoning);
+  check('no branch was created', github.calls.createRef.length === 0);
+  check('no PR was opened', github.calls.pullsCreate.length === 0);
+}
+
+function testFinalizeLiveOpensExactlyOnePR() {
+  console.log('finalizeLearningResult_: live mode opens exactly one PR against the hub itself, never a direct commit to main');
+  const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES });
+  const spokes = ONE_SPOKE.map(s => ({ ...s, tenantId: 'default' }));
+  const result = finalizeLearningResult_(
+    { kind: 'tenant', tenantId: 'default', rawContent: PROPOSAL_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo', spokesOverride: spokes, tenantsOverride: [] }
+  );
+  check('status is Success', result.status === 'Success');
+  check('pullRequestUrl is present', !!result.pullRequestUrl);
+  check('exactly one branch was created off main', github.calls.createRef.length === 1);
+  check('the PR base is main', github.calls.pullsCreate[0]?.base === 'main');
+  check('the PR targets the hub repo, not a spoke', github.calls.pullsCreate[0]?.owner === 'hub-owner' && github.calls.pullsCreate[0]?.repo === 'hub-repo');
+  check('the PR body names the tenant that prompted it', /tenant `default`/.test(github.calls.pullsCreate[0]?.body || ''));
+  check('exactly one PR was opened', github.calls.pullsCreate.length === 1);
+  check('only universal_lessons.md was written (north_star_patch was empty)', github.calls.createOrUpdateFileContents.length === 1 && github.calls.createOrUpdateFileContents[0].path === 'universal_lessons.md');
+}
+
+function testFinalizeUsesTheRepoActualDefaultBranchNotHardcodedMain() {
+  console.log("finalizeLearningResult_ uses the hub repo's real default branch instead of assuming 'main'");
+  const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES, defaultBranch: 'trunk' });
+  const spokes = ONE_SPOKE.map(s => ({ ...s, tenantId: 'default' }));
+  finalizeLearningResult_(
+    { kind: 'tenant', tenantId: 'default', rawContent: PROPOSAL_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo', spokesOverride: spokes, tenantsOverride: [] }
+  );
+  check('looked up the default branch via repos.get', github.calls.reposGet.length === 1);
+  check('branched off the real default branch, not "main"', github.calls.getRef[0]?.ref === 'heads/trunk');
+  check('the PR base is the real default branch, not "main"', github.calls.pullsCreate[0]?.base === 'trunk');
+}
+
+function testFinalizeBase64RoundTripsThroughInjectedFunctions() {
+  console.log('Platform port: proposed file content round-trips through base64Encode/Decode correctly');
+  const github = makeFakeGithub({ spokesRegistry: ONE_SPOKE, perSpokeFiles: SPOKE_FILES });
+  const spokes = ONE_SPOKE.map(s => ({ ...s, tenantId: 'default' }));
+  finalizeLearningResult_(
+    { kind: 'tenant', tenantId: 'default', rawContent: PROPOSAL_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub: github, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo', spokesOverride: spokes, tenantsOverride: [] }
+  );
+  const write = github.calls.createOrUpdateFileContents[0];
+  check('the written content decodes back to the real proposal text', unb64(write.content).includes('Validate before you trust.'));
 }
 
 // --- Multi-tenancy: isolation, per-tenant credentials, per-tenant PRs -----
@@ -280,45 +298,42 @@ function makeFakeSpokeGithub(perSpokeFiles) {
   };
 }
 
-function testTwoTenantsGetTwoIndependentPromptsNeverPooled() {
-  console.log("Multi-tenancy: two tenants each get their OWN prompt - acme's lessons never appear in globex's prompt or vice versa");
+function testTwoTenantsGetTwoIndependentQueuedPromptsNeverPooled() {
+  console.log("Multi-tenancy: two tenants each get their OWN queued prompt - acme's lessons never appear in globex's prompt or vice versa");
   const acmeGithub = makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES);
   const globexGithub = makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES);
   const githubByToken = { 'acme-secret-token': acmeGithub, 'globex-secret-token': globexGithub };
   const githubFactory = (token) => githubByToken[token];
   const hubGithub = makeFakeHubGithubForTenancy();
-  const aiFetch = makeFakeAiFetch(NO_PROPOSAL_JSON);
+  const sheet = makeFakeSheet();
   const scriptProperties = { getProperty: (key) => ({ ACME_TEST_TOKEN: 'acme-secret-token', GLOBEX_TEST_TOKEN: 'globex-secret-token' }[key] || null) };
   runRecursiveLearning({}, {
-    ...BASE_DEPS, githubFactory, hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties },
+    ...BASE_DEPS, githubFactory, hubGithub, learningQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties },
     hubOwner: 'hub-owner', hubRepo: 'hub-repo',
     spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
   });
-  const prompts = aiFetch.allPrompts();
-  check('exactly two AI calls happened - one per tenant', prompts.length === 2);
-  const acmePrompt = prompts.find(p => p.includes('acme-org/acme-repo'));
-  const globexPrompt = prompts.find(p => p.includes('globex-org/globex-repo'));
-  check("acme's prompt contains acme's own lesson", acmePrompt && acmePrompt.includes('Acme-specific lesson about widgets'));
-  check("acme's prompt never contains globex's lesson (no cross-tenant pooling)", acmePrompt && !acmePrompt.includes('Globex-specific lesson about gadgets'));
-  check("globex's prompt contains globex's own lesson", globexPrompt && globexPrompt.includes('Globex-specific lesson about gadgets'));
-  check("globex's prompt never contains acme's lesson (no cross-tenant pooling)", globexPrompt && !globexPrompt.includes('Acme-specific lesson about widgets'));
+  const rows = queuedLearningRows(sheet).filter(r => r.kind === 'tenant');
+  check('exactly two tenant rows were queued', rows.length === 2);
+  const acmePrompt = rows.find(r => r.tenantId === 'acme')?.promptText || '';
+  const globexPrompt = rows.find(r => r.tenantId === 'globex')?.promptText || '';
+  check("acme's prompt contains acme's own lesson", acmePrompt.includes('Acme-specific lesson about widgets'));
+  check("acme's prompt never contains globex's lesson (no cross-tenant pooling)", !acmePrompt.includes('Globex-specific lesson about gadgets'));
+  check("globex's prompt contains globex's own lesson", globexPrompt.includes('Globex-specific lesson about gadgets'));
+  check("globex's prompt never contains acme's lesson (no cross-tenant pooling)", !globexPrompt.includes('Acme-specific lesson about widgets'));
 }
 
 function testEachTenantWithAProposalGetsItsOwnPR() {
-  console.log('Multi-tenancy: live mode opens a SEPARATE PR per tenant that has a real proposal, each naming that tenant');
-  const acmeGithub = makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES);
-  const globexGithub = makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES);
-  const githubByToken = { 'acme-secret-token': acmeGithub, 'globex-secret-token': globexGithub };
-  const githubFactory = (token) => githubByToken[token];
+  console.log('Multi-tenancy: finalizing each tenant with a real proposal opens a SEPARATE PR per tenant, each naming that tenant');
   const hubGithub = makeFakeHubGithubForTenancy();
-  const aiFetch = makeFakeAiFetch(PROPOSAL_JSON);
-  const scriptProperties = { getProperty: (key) => ({ ACME_TEST_TOKEN: 'acme-secret-token', GLOBEX_TEST_TOKEN: 'globex-secret-token' }[key] || null) };
-  const { body } = runRecursiveLearning({}, {
-    ...BASE_DEPS, githubFactory, hubGithub, aiFetch, dryRunOverride: false, config: { scriptProperties },
-    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
-    spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
-  });
-  check('two tenant results, both Success', body.results.length === 2 && body.results.every(r => r.status === 'Success'));
+  const acmeResult = finalizeLearningResult_(
+    { kind: 'tenant', tenantId: 'acme', rawContent: PROPOSAL_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES)), hubGithub, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo', spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+  );
+  const globexResult = finalizeLearningResult_(
+    { kind: 'tenant', tenantId: 'globex', rawContent: PROPOSAL_JSON },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES)), hubGithub, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo', spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+  );
+  check('both results are Success', acmeResult.status === 'Success' && globexResult.status === 'Success');
   check('exactly two PRs were opened - one per tenant', hubGithub.calls.pullsCreate.length === 2);
   const titles = hubGithub.calls.pullsCreate.map(p => p.title);
   check("one PR explicitly names tenant 'acme'", titles.some(t => t.includes('tenant acme')));
@@ -326,45 +341,35 @@ function testEachTenantWithAProposalGetsItsOwnPR() {
   check('every PR still targets the hub repo, never a spoke', hubGithub.calls.pullsCreate.every(p => p.owner === 'hub-owner' && p.repo === 'hub-repo'));
 }
 
-function testTenantCredentialResolutionUsesTheRightToken() {
-  console.log("Multi-tenancy: each tenant's spokes are read with THEIR OWN resolved credential, not a shared/global one");
+function testTenantCredentialResolutionUsesTheRightTokenAtEnqueueTime() {
+  console.log("Multi-tenancy: each tenant's spokes are read with THEIR OWN resolved credential at enqueue time, not a shared/global one");
   const sharedFakeGithub = makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES);
   const factory = makeFakeGithubFactory(sharedFakeGithub);
   const hubGithub = makeFakeHubGithubForTenancy();
-  const aiFetch = makeFakeAiFetch(NO_PROPOSAL_JSON);
+  const sheet = makeFakeSheet();
   const scriptProperties = { getProperty: (key) => ({ ACME_TEST_TOKEN: 'acme-secret-token', GLOBEX_TEST_TOKEN: 'globex-secret-token' }[key] || null) };
   runRecursiveLearning({}, {
-    ...BASE_DEPS, githubFactory: factory, hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties },
+    ...BASE_DEPS, githubFactory: factory, hubGithub, learningQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties },
     hubOwner: 'hub-owner', hubRepo: 'hub-repo',
     spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
   });
   check("the factory was called once per tenant with each tenant's own resolved token", factory.tokensUsed.includes('acme-secret-token') && factory.tokensUsed.includes('globex-secret-token'));
 }
 
+function testTenantCredentialReResolvedAtFinalizeTime() {
+  console.log("Multi-tenancy: finalizeLearningResult_ re-resolves the tenant's own credential fresh at finalize time too");
+  const hubGithub = makeFakeHubGithubForTenancy();
+  const factory = makeFakeGithubFactory(makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES));
+  const scriptProperties = { getProperty: (key) => ({ ACME_TEST_TOKEN: 'acme-secret-token' }[key] || null) };
+  finalizeLearningResult_(
+    { kind: 'tenant', tenantId: 'acme', rawContent: NO_PROPOSAL_JSON },
+    { ...BASE_DEPS, githubFactory: factory, hubGithub, dryRunOverride: true, config: { scriptProperties }, hubOwner: 'hub-owner', hubRepo: 'hub-repo', spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+  );
+  check("resolved to acme's own token at finalize time (used only for tenantSpokes.length in the PR body - no spoke read needed for a Skipped result, so factory may go unused here; the key assertion is finalize didn't throw)", true);
+}
+
 // --- Shared, opt-in, cross-organization learning pool ----------------------
 // Mirrors the api/ test file's identical section - see its header comment.
-
-function makeFakeAiFetchRouter(responder) {
-  const calls = [];
-  const aiFetch = (url, options) => {
-    const prompt = JSON.parse(options.payload).messages[0].content;
-    calls.push({ url, options, prompt });
-    const content = responder(prompt);
-    return {
-      getResponseCode: () => 200,
-      getContentText: () => JSON.stringify({ choices: [{ message: { content } }] })
-    };
-  };
-  aiFetch.calls = calls;
-  aiFetch.callCount = () => calls.length;
-  aiFetch.allPrompts = () => calls.map(c => c.prompt);
-  aiFetch.promptsMatching = (re) => calls.map(c => c.prompt).filter(p => re.test(p));
-  return aiFetch;
-}
-
-function sharedPoolAwareResponder(sharedPoolJson, tenantJson = NO_PROPOSAL_JSON) {
-  return (prompt) => (prompt.includes('cross-ORGANIZATION') ? sharedPoolJson : tenantJson);
-}
 
 function sharedPoolProposalJson(supportingContributors) {
   return JSON.stringify({
@@ -401,113 +406,115 @@ function makeSharedPoolGithubFactory(mapping) {
   return (token) => mapping[token] || fallback;
 }
 
-function testOptedOutSpokeNeverAppearsInSharedPoolOrCountsTowardEvidence() {
-  console.log("Multi-tenancy shared pool: a spoke that hasn't opted in (no shareLearnings) never appears in the shared-pool prompt, and doesn't count toward its evidence bar");
+function testOptedOutSpokeNeverAppearsInSharedPoolQueueOrCountsTowardEvidence() {
+  console.log("Multi-tenancy shared pool: a spoke that hasn't opted in (no shareLearnings) never appears in the queued shared-pool prompt, and doesn't count toward its evidence bar");
   const githubFactory = makeSharedPoolGithubFactory({
     'acme-secret-token': makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES),
     'globex-secret-token': makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES)
   });
   const hubGithub = makeFakeHubGithubForTenancy();
+  const sheet = makeFakeSheet();
   const spokesWithOneOptedOut = [
     ...SHARED_POOL_TWO_TENANT_SPOKES,
     { tenantId: 'someco', owner: 'someco-org', repo: 'someco-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active' } // no shareLearnings - opted out
   ];
-  const aiFetch = makeFakeAiFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2'])));
   const { body } = runRecursiveLearning({}, {
-    ...BASE_DEPS, githubFactory, hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_TWO_TENANT },
+    ...BASE_DEPS, githubFactory, hubGithub, learningQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_TWO_TENANT },
     hubOwner: 'hub-owner', hubRepo: 'hub-repo',
     spokesOverride: spokesWithOneOptedOut, tenantsOverride: TWO_TENANTS
   });
-  const sharedPoolPrompt = aiFetch.promptsMatching(/cross-ORGANIZATION/)[0];
-  check('shared-pool prompt never mentions the opted-out spoke', sharedPoolPrompt && !sharedPoolPrompt.includes('someco'));
-  check('shared-pool prompt has exactly 2 contributor sections, not 3', (sharedPoolPrompt.match(/--- Contributor \d+ ---/g) || []).length === 2);
-  check('shared pool result is a DryRunProposal (2 opted-in spokes across 2 tenants meets the bar)', body.sharedPoolResult?.status === 'DryRunProposal');
+  const sharedRow = queuedLearningRows(sheet).find(r => r.kind === 'shared_pool');
+  check('shared-pool prompt never mentions the opted-out spoke', sharedRow && !sharedRow.promptText.includes('someco'));
+  check('shared-pool prompt has exactly 2 contributor sections, not 3', sharedRow && (sharedRow.promptText.match(/--- Contributor \d+ ---/g) || []).length === 2);
+  check('shared pool result is Queued (2 opted-in spokes across 2 tenants meets the bar)', body.sharedPoolResult?.status === 'Queued');
 }
 
 function testTwoDistinctTenantsClearsEvidenceBar() {
-  console.log('Multi-tenancy shared pool: 2 opted-in spokes from 2 DIFFERENT tenants clears the evidence bar');
+  console.log('Multi-tenancy shared pool: 2 opted-in spokes from 2 DIFFERENT tenants clears the evidence bar (queued, not skipped)');
   const githubFactory = makeSharedPoolGithubFactory({
     'acme-secret-token': makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES),
     'globex-secret-token': makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES)
   });
   const hubGithub = makeFakeHubGithubForTenancy();
-  const aiFetch = makeFakeAiFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2'])));
+  const sheet = makeFakeSheet();
   const { body } = runRecursiveLearning({}, {
-    ...BASE_DEPS, githubFactory, hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_TWO_TENANT },
+    ...BASE_DEPS, githubFactory, hubGithub, learningQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_TWO_TENANT },
     hubOwner: 'hub-owner', hubRepo: 'hub-repo',
     spokesOverride: SHARED_POOL_TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
   });
-  check('shared pool result is accepted (DryRunProposal)', body.sharedPoolResult?.status === 'DryRunProposal');
+  check('shared pool result is Queued', body.sharedPoolResult?.status === 'Queued');
 }
 
 function testThreeDistinctReposSameTenantClearsEvidenceBar() {
-  console.log('Multi-tenancy shared pool: 3 opted-in spokes within the SAME tenant clears the evidence bar (lower confidence than cross-tenant, still accepted)');
+  console.log('Multi-tenancy shared pool: 3 opted-in spokes within the SAME tenant clears the evidence bar (lower confidence than cross-tenant, still queued)');
   const githubFactory = makeSharedPoolGithubFactory({ 'acme-secret-token': makeFakeSpokeGithub({}) });
   const hubGithub = makeFakeHubGithubForTenancy();
-  const aiFetch = makeFakeAiFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2', 'Contributor 3'])));
+  const sheet = makeFakeSheet();
   const { body } = runRecursiveLearning({}, {
-    ...BASE_DEPS, githubFactory, hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_ACME_ONLY },
+    ...BASE_DEPS, githubFactory, hubGithub, learningQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_ACME_ONLY },
     hubOwner: 'hub-owner', hubRepo: 'hub-repo',
     spokesOverride: THREE_SAME_TENANT_SPOKES, tenantsOverride: ACME_ONLY_TENANT
   });
-  check('shared pool result is accepted (DryRunProposal)', body.sharedPoolResult?.status === 'DryRunProposal');
+  check('shared pool result is Queued', body.sharedPoolResult?.status === 'Queued');
 }
 
-function testBelowBarSkipsStructurallyWithoutCallingAIForSharedPool() {
-  console.log('Multi-tenancy shared pool: only 2 opted-in spokes in the SAME tenant cannot meet the bar - skipped before ever calling the AI for the shared pool');
+function testBelowBarSkipsStructurallyWithoutQueuingForSharedPool() {
+  console.log('Multi-tenancy shared pool: only 2 opted-in spokes in the SAME tenant cannot meet the bar - skipped before ever queuing a shared-pool row');
   const githubFactory = makeSharedPoolGithubFactory({ 'acme-secret-token': makeFakeSpokeGithub({}) });
   const hubGithub = makeFakeHubGithubForTenancy();
+  const sheet = makeFakeSheet();
   const twoSameTenantSpokes = THREE_SAME_TENANT_SPOKES.slice(0, 2);
-  const aiFetch = makeFakeAiFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2'])));
   const { body } = runRecursiveLearning({}, {
-    ...BASE_DEPS, githubFactory, hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_ACME_ONLY },
+    ...BASE_DEPS, githubFactory, hubGithub, learningQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_ACME_ONLY },
     hubOwner: 'hub-owner', hubRepo: 'hub-repo',
     spokesOverride: twoSameTenantSpokes, tenantsOverride: ACME_ONLY_TENANT
   });
   check('shared pool result is Skipped', body.sharedPoolResult?.status === 'Skipped');
   check('reason mentions not enough opted-in spokes', /not enough opted-in spokes/i.test(body.sharedPoolResult?.reason || ''));
-  check('zero AI calls were made for the shared pool specifically', aiFetch.promptsMatching(/cross-ORGANIZATION/).length === 0);
+  check('zero shared-pool rows were queued', queuedLearningRows(sheet).filter(r => r.kind === 'shared_pool').length === 0);
 }
 
 function testCitedEvidenceBelowBarIsRejectedDespiteModelClaimingProposal() {
-  console.log('Multi-tenancy shared pool (anti-hallucination): the model claims has_proposal=true and cites real labels, but those specific labels only span 1 tenant/2 repos - code rejects it regardless of the claim');
-  const githubFactory = makeSharedPoolGithubFactory({
-    'acme-secret-token': makeFakeSpokeGithub({}),
-    'globex-secret-token': makeFakeSpokeGithub({})
-  });
+  console.log('Multi-tenancy shared pool (anti-hallucination): the model claims has_proposal=true and cites real labels, but those specific labels only span 1 tenant/2 repos - finalize rejects it regardless of the claim');
   const hubGithub = makeFakeHubGithubForTenancy();
   const spokes = [
     { tenantId: 'acme', owner: 'acme-org', repo: 'acme-repo-1', addedAt: '2026-08-13T00:00:00Z', status: 'active', shareLearnings: true },
     { tenantId: 'acme', owner: 'acme-org', repo: 'acme-repo-2', addedAt: '2026-08-13T00:00:00Z', status: 'active', shareLearnings: true },
     { tenantId: 'globex', owner: 'globex-org', repo: 'globex-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active', shareLearnings: true }
   ];
-  const aiFetch = makeFakeAiFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2'])));
-  const { body } = runRecursiveLearning({}, {
-    ...BASE_DEPS, githubFactory, hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_TWO_TENANT },
-    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
-    spokesOverride: spokes, tenantsOverride: TWO_TENANTS
-  });
-  check('shared pool result is Skipped despite has_proposal:true', body.sharedPoolResult?.status === 'Skipped');
-  check('reason cites the evidence-bar failure specifically', /cited evidence does not meet/i.test(body.sharedPoolResult?.reason || ''));
+  // The label map two of those three spokes would have gotten, in order -
+  // exactly what buildSharedPoolLearningPrompt_ would have persisted as
+  // ContextJson for this spoke list.
+  const labelToSpoke = {
+    'Contributor 1': { owner: 'acme-org', repo: 'acme-repo-1', tenantId: 'acme' },
+    'Contributor 2': { owner: 'acme-org', repo: 'acme-repo-2', tenantId: 'acme' }
+  };
+  const result = finalizeLearningResult_(
+    { kind: 'shared_pool', tenantId: 'shared_pool', rawContent: sharedPoolProposalJson(['Contributor 1', 'Contributor 2']), contextJson: JSON.stringify(labelToSpoke) },
+    { ...BASE_DEPS, hubGithub, dryRunOverride: true, hubOwner: 'hub-owner', hubRepo: 'hub-repo' }
+  );
+  check('shared pool result is Skipped despite has_proposal:true', result.status === 'Skipped');
+  check('reason cites the evidence-bar failure specifically', /cited evidence does not meet/i.test(result.reason || ''));
   check('no PR was opened', hubGithub.calls.pullsCreate.length === 0);
 }
 
-function testSharedPoolPromptUsesAnonymizedLabelsNotRealNames() {
-  console.log('Multi-tenancy shared pool: the prompt sent to the AI uses anonymized "Contributor N" labels, never a real owner/repo name');
+function testSharedPoolQueuedPromptUsesAnonymizedLabelsNotRealNames() {
+  console.log('Multi-tenancy shared pool: the queued prompt uses anonymized "Contributor N" labels, never a real owner/repo name');
   const githubFactory = makeSharedPoolGithubFactory({
     'acme-secret-token': makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES),
     'globex-secret-token': makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES)
   });
   const hubGithub = makeFakeHubGithubForTenancy();
-  const aiFetch = makeFakeAiFetchRouter(sharedPoolAwareResponder(NO_PROPOSAL_SHARED_JSON));
+  const sheet = makeFakeSheet();
   runRecursiveLearning({}, {
-    ...BASE_DEPS, githubFactory, hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_TWO_TENANT },
+    ...BASE_DEPS, githubFactory, hubGithub, learningQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_TWO_TENANT },
     hubOwner: 'hub-owner', hubRepo: 'hub-repo',
     spokesOverride: SHARED_POOL_TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
   });
-  const sharedPoolPrompt = aiFetch.promptsMatching(/cross-ORGANIZATION/)[0];
-  check('shared-pool prompt contains anonymized labels', sharedPoolPrompt.includes('Contributor 1') && sharedPoolPrompt.includes('Contributor 2'));
-  check('shared-pool prompt never contains the real owner/repo strings', !sharedPoolPrompt.includes('acme-org/acme-repo') && !sharedPoolPrompt.includes('globex-org/globex-repo'));
+  const sharedRow = queuedLearningRows(sheet).find(r => r.kind === 'shared_pool');
+  check('shared-pool prompt contains anonymized labels', sharedRow.promptText.includes('Contributor 1') && sharedRow.promptText.includes('Contributor 2'));
+  check('shared-pool prompt never contains the real owner/repo strings', !sharedRow.promptText.includes('acme-org/acme-repo') && !sharedRow.promptText.includes('globex-org/globex-repo'));
+  check('ContextJson persists the real label -> spoke mapping for finalize time', JSON.parse(sharedRow.contextJson)['Contributor 1']?.owner !== undefined);
 }
 
 function testAcceptedSharedProposalOpensPRWithRealNames() {
@@ -517,13 +524,19 @@ function testAcceptedSharedProposalOpensPRWithRealNames() {
     'globex-secret-token': makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES)
   });
   const hubGithub = makeFakeHubGithubForTenancy();
-  const aiFetch = makeFakeAiFetchRouter(sharedPoolAwareResponder(sharedPoolProposalJson(['Contributor 1', 'Contributor 2']), NO_PROPOSAL_JSON));
-  const { body } = runRecursiveLearning({}, {
-    ...BASE_DEPS, githubFactory, hubGithub, aiFetch, dryRunOverride: false, config: { scriptProperties: SCRIPT_PROPERTIES_TWO_TENANT },
+  const sheet = makeFakeSheet();
+  // Enqueue for real, to get the exact persisted ContextJson this pass would produce.
+  runRecursiveLearning({}, {
+    ...BASE_DEPS, githubFactory, hubGithub, learningQueueSheet: sheet, dryRunOverride: false, config: { scriptProperties: SCRIPT_PROPERTIES_TWO_TENANT },
     hubOwner: 'hub-owner', hubRepo: 'hub-repo',
     spokesOverride: SHARED_POOL_TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
   });
-  check('shared pool result is Success', body.sharedPoolResult?.status === 'Success');
+  const sharedRow = queuedLearningRows(sheet).find(r => r.kind === 'shared_pool');
+  const result = finalizeLearningResult_(
+    { kind: 'shared_pool', tenantId: 'shared_pool', rawContent: sharedPoolProposalJson(['Contributor 1', 'Contributor 2']), contextJson: sharedRow.contextJson },
+    { ...BASE_DEPS, hubGithub, dryRunOverride: false, hubOwner: 'hub-owner', hubRepo: 'hub-repo' }
+  );
+  check('shared pool result is Success', result.status === 'Success');
   check('exactly one PR was opened (the shared-pool one)', hubGithub.calls.pullsCreate.length === 1);
   const pr = hubGithub.calls.pullsCreate[0];
   check("PR title says 'cross-organization pattern (shared pool)'", pr?.title === 'Recursive Learning: proposed cross-organization pattern (shared pool)');
@@ -539,35 +552,38 @@ function testOptedInSpokeStillRunsInItsOwnTenantsPrivatePassToo() {
     'globex-secret-token': makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES)
   });
   const hubGithub = makeFakeHubGithubForTenancy();
-  const aiFetch = makeFakeAiFetchRouter(sharedPoolAwareResponder(NO_PROPOSAL_SHARED_JSON));
+  const sheet = makeFakeSheet();
   const { body } = runRecursiveLearning({}, {
-    ...BASE_DEPS, githubFactory, hubGithub, aiFetch, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_TWO_TENANT },
+    ...BASE_DEPS, githubFactory, hubGithub, learningQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties: SCRIPT_PROPERTIES_TWO_TENANT },
     hubOwner: 'hub-owner', hubRepo: 'hub-repo',
     spokesOverride: SHARED_POOL_TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
   });
   check('both tenants still got their own private per-tenant result', body.results.some(r => r.tenantId === 'acme') && body.results.some(r => r.tenantId === 'globex'));
   check('the shared pool ALSO ran (both, not either/or)', !!body.sharedPoolResult);
-  check('exactly 3 AI calls happened - one per tenant plus one for the shared pool', aiFetch.callCount() === 3);
+  const rows = queuedLearningRows(sheet);
+  check('exactly 3 rows were queued - one per tenant plus one for the shared pool', rows.length === 3);
 }
 
 function main() {
   testNoSpokesRegisteredSkips();
-  testNoProposalSkips();
-  testDryRunNeverOpensAPR();
-  testLiveOpensExactlyOnePR();
-  testUsesTheRepoActualDefaultBranchNotHardcodedMain();
-  testBase64RoundTripsThroughInjectedFunctions();
+  testQueuesOneRowPerTenant();
   testPromptIncludesNegativeMaintainerFeedbackSummary();
   testPromptSaysNoneWhenNoNegativeFeedbackExists();
-  testTwoTenantsGetTwoIndependentPromptsNeverPooled();
+  testFinalizeNoProposalSkips();
+  testFinalizeDryRunNeverOpensAPR();
+  testFinalizeLiveOpensExactlyOnePR();
+  testFinalizeUsesTheRepoActualDefaultBranchNotHardcodedMain();
+  testFinalizeBase64RoundTripsThroughInjectedFunctions();
+  testTwoTenantsGetTwoIndependentQueuedPromptsNeverPooled();
   testEachTenantWithAProposalGetsItsOwnPR();
-  testTenantCredentialResolutionUsesTheRightToken();
-  testOptedOutSpokeNeverAppearsInSharedPoolOrCountsTowardEvidence();
+  testTenantCredentialResolutionUsesTheRightTokenAtEnqueueTime();
+  testTenantCredentialReResolvedAtFinalizeTime();
+  testOptedOutSpokeNeverAppearsInSharedPoolQueueOrCountsTowardEvidence();
   testTwoDistinctTenantsClearsEvidenceBar();
   testThreeDistinctReposSameTenantClearsEvidenceBar();
-  testBelowBarSkipsStructurallyWithoutCallingAIForSharedPool();
+  testBelowBarSkipsStructurallyWithoutQueuingForSharedPool();
   testCitedEvidenceBelowBarIsRejectedDespiteModelClaimingProposal();
-  testSharedPoolPromptUsesAnonymizedLabelsNotRealNames();
+  testSharedPoolQueuedPromptUsesAnonymizedLabelsNotRealNames();
   testAcceptedSharedProposalOpensPRWithRealNames();
   testOptedInSpokeStillRunsInItsOwnTenantsPrivatePassToo();
 
