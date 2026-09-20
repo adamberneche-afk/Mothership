@@ -2225,7 +2225,7 @@ jobs:
   prune:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -2266,7 +2266,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -2298,7 +2298,7 @@ jobs:
   collect-feedback:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -2334,7 +2334,7 @@ jobs:
   doctor:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Node.js
         uses: actions/setup-node@v4
