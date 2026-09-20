@@ -169,6 +169,25 @@ Validates: `GLOBAL_GITHUB_TOKEN` against `GET /rate_limit`, `AI_API_KEY`/`AI_BAS
 
 **Deliberately `workflow_dispatch`-only, no schedule** - this project's own investigation into its health started because scheduled workflows were failing silently with nobody watching; adding another scheduled job here would risk the identical failure mode this tool exists to catch. Run it manually when setting up a new spoke, rotating a credential, or troubleshooting.
 
+### Installer Copy Sync (`scripts/sync-installer-copies.py`)
+
+`setup_hub.py` scaffolds a fresh hub by writing out fourteen files whose contents it carries inline as Python string literals, and `ci.yml` guards that by running the installer into a scratch directory and diffing every generated file against the real one. That guard is why a fresh install can't silently drift from what this repo actually runs.
+
+What it lacked was a way to *satisfy* it. Fixing a violation meant hand-editing a string literal inside a 2400-line file, which a bot can't do - Dependabot edits `package.json` or a workflow, never sees the embedded copy, and fails the diff. Four dependency PRs sat red simultaneously, one since August, none failing for a reason that had anything to do with its own dependency.
+
+```bash
+python3 scripts/sync-installer-copies.py           # repair the drift
+python3 scripts/sync-installer-copies.py --check   # report it, change nothing
+python3 scripts/sync-installer-copies.py --list    # the tracked paths
+python3 scripts/sync-installer-copies.py --self-test
+```
+
+`ci.yml` names the repair command in its error output and takes its file list from `--list`, so the guard's list and the tool's list can't disagree.
+
+**Why this is safe to run:** the embedded literals are non-raw triple-quoted Python strings, so a backslash in a source file means something different once it's inside one - `api/autonomous_agent.js` alone carries thirteen `\n` sequences written as two characters in JavaScript, which a naive embedding turns into real newlines. The escaping is therefore never trusted: every literal is parsed back with `ast.literal_eval` and compared to the exact bytes it came from *before* anything is written, and one that doesn't round-trip is refused rather than spliced. The script can fail loudly; it can't corrupt the installer quietly.
+
+**Deliberately not synced:** `spokes.json`, `tenants.json`, `universal_lessons.md` and `north_star_framework.md`. `setup_hub.py` seeds those with fresh-install defaults rather than mirroring this repo's own accumulated state - syncing them would ship this hub's live spoke registry to every new install. `ci.yml` skips them for the same reason, and a test pins the exclusion.
+
 ## Setup Instructions
 
 ### 1. Deploy to Vercel
