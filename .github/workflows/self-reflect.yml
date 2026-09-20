@@ -19,7 +19,7 @@ jobs:
           # why this is now required, not optional.
           TENANT_CALLER_KEY: ${{ secrets.TENANT_CALLER_KEY }}
         run: |
-          curl -X POST "${APPS_SCRIPT_URL}?endpoint=autonomous_agent" \
+          curl --fail-with-body -sS -X POST "${APPS_SCRIPT_URL}?endpoint=autonomous_agent" \
             -H "Content-Type: application/json" \
             -d '{
               "owner": "${{ github.repository_owner }}",
