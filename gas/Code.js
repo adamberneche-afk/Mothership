@@ -56,15 +56,14 @@ function doPost(e) {
   // resolveSecretRef's env: scheme read other Script Properties by name.
   const githubFactory = (token) => makeGithubClient(UrlFetchApp.fetch, token);
   const hubGithub = makeGithubClient(UrlFetchApp.fetch, config.globalGithubToken);
-  const aiFetch = (url, options) => UrlFetchApp.fetch(url, options);
   config.scriptProperties = PropertiesService.getScriptProperties();
 
   let result;
   try {
     if (endpoint === 'recursive_learning') {
-      result = runRecursiveLearning(reqBody, { githubFactory, hubGithub, aiFetch, base64Encode, base64Decode, config });
+      result = runRecursiveLearning(reqBody, { githubFactory, hubGithub, base64Encode, base64Decode, config });
     } else {
-      result = processRequest(reqBody, { githubFactory, hubGithub, aiFetch, base64Encode, base64Decode, config });
+      result = processRequest(reqBody, { githubFactory, hubGithub, base64Encode, base64Decode, config });
     }
   } catch (err) {
     result = { httpStatus: 500, body: { error: err.message } };
@@ -78,9 +77,15 @@ function doPost(e) {
 
 // Config lives in Script Properties (Project Settings > Script Properties,
 // or `clasp` / the Apps Script API) - the equivalent of Vercel's
-// per-project environment variables. Same six keys, same defaults-that-
-// fail-safe behavior (a missing DRY_RUN_MODE still means dry-run, handled
-// inside processRequest/runRecursiveLearning exactly as before).
+// per-project environment variables. Same defaults-that-fail-safe behavior
+// (a missing DRY_RUN_MODE still means dry-run, handled inside
+// processRequest/runRecursiveLearning exactly as before).
+//
+// AI_API_KEY/AI_MODEL/AI_BASE_URL are read here but no longer required for
+// the actual review/proposal pipeline - see review_queue.js's header
+// comment. They're kept in config (and in settings.js's settable-keys
+// list) only because a future direct-call fallback mode may want them
+// again; nothing on the QUEUE_SHEET_ID path reads them today.
 function loadConfig() {
   const props = PropertiesService.getScriptProperties();
   return {
@@ -91,7 +96,13 @@ function loadConfig() {
     dryRunMode: props.getProperty('DRY_RUN_MODE'),
     rateCapPerRepoPerDay: props.getProperty('RATE_CAP_PER_REPO_PER_DAY'),
     hubOwner: props.getProperty('HUB_GITHUB_OWNER'),
-    hubRepo: props.getProperty('HUB_GITHUB_REPO')
+    hubRepo: props.getProperty('HUB_GITHUB_REPO'),
+    // ID of the single Google Sheet holding both the ReviewQueue and
+    // LearningQueue tabs - the hand-off point between this code and a
+    // human-built Workspace Studio Flow's native inference step. See
+    // review_queue.js's header comment and README.md's "Deploy Without
+    // Vercel" section for the one-time setup this requires.
+    queueSheetId: props.getProperty('QUEUE_SHEET_ID')
   };
 }
 

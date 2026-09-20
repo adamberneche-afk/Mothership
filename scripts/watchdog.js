@@ -67,6 +67,19 @@ export function runActionlint(dir = WORKFLOWS_DIR, { actionlintBin = 'actionlint
     return results; // exit 0 — every file clean
   } catch (e) {
     const output = `${e.stdout || ''}${e.stderr || ''}`;
+    // A failure to even spawn actionlint (binary missing from PATH, no exec
+    // permission, etc) has no stdout/stderr in actionlint's own
+    // "file:line: message" shape - treating that silence as "every file is
+    // clean" would be a false negative exactly as dangerous as the
+    // invalid-workflow-file gap this tool exists to catch. Surface it as a
+    // finding on every file instead of swallowing it. (The same gap was
+    // found and fixed in this account's KOS/TSO/Argoloth copies of this
+    // same watchdog before this one; ported here last.)
+    if (e.code === 'ENOENT' || (!e.stdout && !e.stderr)) {
+      const reason = `could not run actionlint (${e.code || e.message}) - is it installed and on PATH?`;
+      for (const f of Object.keys(results)) results[f].push(reason);
+      return results;
+    }
     for (const line of output.split('\n')) {
       const m = line.match(/^\.github\/workflows\/([^:]+):/);
       if (m && results[m[1]] !== undefined) results[m[1]].push(line.trim());

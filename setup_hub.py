@@ -42,6 +42,44 @@ import { join } from 'path';
 // size and API cost bounded.
 const MAX_DIFF_CHARS = 12000;
 
+// File extensions treated as documentation/config rather than source logic,
+// for the code-first ordering below (issue #34) - sorted to the END of the
+// diff, never dropped outright, so MAX_DIFF_CHARS's limited budget is spent
+// on code before these. Found via a real 122,293-char merge diff that got
+// cut off inside a data-seed file while 19 of 26 changed files - including
+// every one a full manual audit had found real bugs in - never reached the
+// prompt at all, because file order (not relevance) decided what fit.
+const DOC_LIKE_EXTENSIONS = new Set(['.md', '.json', '.yml', '.yaml', '.txt']);
+
+function isDocLikeFile(filename) {
+  const idx = filename.lastIndexOf('.');
+  return idx !== -1 && DOC_LIKE_EXTENSIONS.has(filename.slice(idx).toLowerCase());
+}
+
+// Caps any SINGLE file's own patch text, so one huge file at the front of
+// the (now code-first) order can't still consume the whole MAX_DIFF_CHARS
+// budget and starve every file after it - the second half of issue #34's
+// finding: reordering alone isn't enough if the first file in the new order
+// is itself bigger than the whole budget.
+const PER_FILE_MAX_CHARS = 2000;
+
+function truncateFilePatch(patch, filename) {
+  if (patch.length <= PER_FILE_MAX_CHARS) return patch;
+  return patch.slice(0, PER_FILE_MAX_CHARS) + `\\n[... ${filename} truncated at ${PER_FILE_MAX_CHARS} chars ...]`;
+}
+
+// A commit authored by one of these carries nothing a debug/hunt/refactor
+// review can meaningfully judge - a scheduled export, a dependency bump
+// commit. EXCLUDED_DIFF_PATH_PREFIXES catches the same class by content
+// instead of author, for a generated-data commit a human happened to push.
+// Both found via issue #35: a spoke's actual latest commit was a
+// `github-actions[bot]` weekly issue-export dump under exports/ - every
+// mode correctly said "no findings," but only because there was,
+// coincidentally, nothing unsafe in the JSON, not because this was ever
+// recognized as an unreviewable commit shape.
+const BOT_AUTHOR_LOGINS = new Set(['github-actions[bot]', 'dependabot[bot]']);
+const EXCLUDED_DIFF_PATH_PREFIXES = ['exports/'];
+
 // Every issue this handler files is tagged with this label. GitHub creates
 // the label automatically on first use. It's how the rate cap below counts
 // "issues the hub created" without confusing them with anything a human
@@ -96,16 +134,19 @@ function loadJsonArrayFromDisk(path) {
   }
 }
 
-// Finds which tenant a given owner/repo belongs to. Falls back to
+// Finds which tenant a given owner/repo belongs to. Used to fall back to
 // DEFAULT_TENANT_ID for anything not found in spokes.json - a deliberate
-// backward-compatibility choice, not a security feature: it preserves
-// today's exact behavior (no registration required to get a response) for
-// spokes nobody has migrated into the tenant model yet. Once real
-// multi-tenant onboarding exists, an unmatched spoke should probably reject
-// instead of silently defaulting - flagged here, not fixed here.
+// backward-compatibility choice, not a security feature: it preserved
+// pre-deployment behavior (no registration required to get a response) for
+// spokes nobody had migrated into the tenant model yet. Once the gas/ twin
+// of this file went live with a publicly-reachable "Anyone" deployment,
+// that same fallback meant any caller on the internet could name an
+// arbitrary owner/repo and have this hub fetch it with GLOBAL_GITHUB_TOKEN.
+// Returns null now instead, so processRequest() can reject an unmatched
+// spoke outright - see its own tenant-resolution comment below.
 function resolveTenantIdForSpoke(owner, repo, spokes) {
   const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+  return match ? match.tenantId : null;
 }
 
 function findTenant(tenantId, tenants) {
@@ -311,11 +352,12 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   // carried ZERO credential before this - any caller who knew the hub URL
   // could trigger a review for any registered owner/repo. The check below
   // is deliberately opt-in per tenant: a tenant with no `callerKeyRef` set
-  // (true for "default" today) skips verification entirely, preserving
-  // today's exact zero-auth behavior for anything not yet migrated. A
-  // tenant that HAS set one gets it strictly enforced. Migrating a tenant
-  // to enforced caller-auth is then just a config change, not a breaking
-  // flag day for spokes that were already working.
+  // skips verification entirely. "default" now has one set (tenants.json),
+  // since it's the tenant every registered spoke currently maps to and this
+  // hub has a live, publicly-reachable deployment (the gas/ twin) - a
+  // tenant with no key configured at all would otherwise stay silently
+  // open. Migrating a NEW tenant to enforced caller-auth is then just a
+  // config change, not a breaking flag day for spokes already working.
   //
   // spokesOverride/tenantsOverride let tests inject a registry instead of
   // reading this checkout's real spokes.json/tenants.json - same
@@ -323,22 +365,33 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   const spokes = spokesOverride || loadSpokesRegistry();
   const tenants = tenantsOverride || loadTenantsRegistry();
   const tenantId = resolveTenantIdForSpoke(owner, repo, spokes);
-  const tenant = findTenant(tenantId, tenants);
+  const tenant = tenantId ? findTenant(tenantId, tenants) : null;
 
-  const requiredCallerKey = tenant ? resolveSecretRef(tenant.callerKeyRef) : null;
+  // Reject an owner/repo that isn't a registered spoke outright, before any
+  // GitHub call runs with GLOBAL_GITHUB_TOKEN under it. owner/repo is
+  // caller-supplied and spoofable, so this alone doesn't stop someone
+  // claiming to BE a registered spoke - the requiredCallerKey check right
+  // below is what actually gates that. What this closes is the blast
+  // radius of a leaked/guessed caller key: even with it, a caller can only
+  // target this hub's own registered spokes, never an arbitrary repo on
+  // GitHub that GLOBAL_GITHUB_TOKEN happens to be able to read.
+  if (!tenant) {
+    return { httpStatus: 403, body: { error: 'owner/repo is not a registered spoke of this hub' } };
+  }
+
+  const requiredCallerKey = resolveSecretRef(tenant.callerKeyRef);
   if (requiredCallerKey && callerKey !== requiredCallerKey) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
 
   // Credential for this request's SPOKE operations - the tenant's own
   // token (decision #1), resolved via the same env:/kv: scheme as the
-  // caller key above. Falls back to GLOBAL_GITHUB_TOKEN only when no
-  // tenant match exists at all (mirrors resolveTenantIdForSpoke's own
-  // backward-compatibility fallback) or the ref can't be resolved yet
-  // (e.g. a kv: ref with no secrets store behind it) - fails toward "use
-  // the one credential that's always been used" rather than toward a
-  // silent, harder-to-diagnose 401 from GitHub itself.
-  const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+  // caller key above. `tenant` is guaranteed non-null past the reject
+  // above; this still falls back to GLOBAL_GITHUB_TOKEN when the ref itself
+  // can't be resolved (e.g. a kv: ref with no secrets store behind it yet)
+  // - fails toward "use the one credential that's always been used" rather
+  // than toward a silent, harder-to-diagnose 401 from GitHub itself.
+  const spokeToken = resolveSecretRef(tenant.githubCredentialRef) || process.env.GLOBAL_GITHUB_TOKEN;
   const octokit = octokitFactory(spokeToken);
 
   // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
@@ -366,18 +419,29 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
     ? readFileSync(hubLessonsPath, 'utf8')
     : "";
 
-  // Fetch Local Context from the Spoke repo
-  let localContext = "No local context found.";
-  try {
-    const { data: lsData } = await octokit.repos.getContent({ owner, repo, path: 'lessons.md' });
-    const { data: nsData } = await octokit.repos.getContent({ owner, repo, path: 'NORTH_STAR.md' });
-    localContext = `
-      LOCAL LESSONS: ${Buffer.from(lsData.content, 'base64').toString()}
-      LOCAL NORTH STAR: ${Buffer.from(nsData.content, 'base64').toString()}
-    `;
-  } catch (e) {
-    localContext = "No local context found.";
-  }
+  // Fetch Local Context from the Spoke repo. lessons.md and NORTH_STAR.md are
+  // fetched independently (issue #35) - this used to be one try/catch around
+  // both reads, so a spoke whose NORTH_STAR.md has moved off-root (confirmed
+  // on a real spoke that keeps a genuine, current lessons.md but only an
+  // archived NORTH_STAR.md) silently lost its otherwise-valid lessons.md too.
+  const fetchOptionalRepoFile = async (path) => {
+    try {
+      const { data } = await octokit.repos.getContent({ owner, repo, path });
+      return Buffer.from(data.content, 'base64').toString();
+    } catch (e) {
+      return null;
+    }
+  };
+  const [localLessons, localNorthStar] = await Promise.all([
+    fetchOptionalRepoFile('lessons.md'),
+    fetchOptionalRepoFile('NORTH_STAR.md'),
+  ]);
+  const localContext = (localLessons !== null || localNorthStar !== null)
+    ? `
+      LOCAL LESSONS: ${localLessons !== null ? localLessons : '(none found)'}
+      LOCAL NORTH STAR: ${localNorthStar !== null ? localNorthStar : '(none found)'}
+    `
+    : "No local context found.";
 
   // Find the spoke's latest commit sha up front - both the decision-log
   // dedup check below and the diff fetch further down need it, so fetch it
@@ -438,13 +502,54 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   if (latestCommitSha) {
     try {
       const { data: commitDetail } = await octokit.repos.getCommit({ owner, repo, ref: latestCommitSha });
-      const patches = (commitDetail.files || [])
-        .filter(f => typeof f.patch === 'string' && f.patch.length > 0)
-        .map(f => `--- ${f.filename} (${f.status}) ---\\n${f.patch}`)
-        .join('\\n\\n');
+      const changedFiles = commitDetail.files || [];
+
+      // Skip bot-authored / generated-data-only commits before spending an
+      // AI call on them (issue #35) - see BOT_AUTHOR_LOGINS/
+      // EXCLUDED_DIFF_PATH_PREFIXES above.
+      const commitAuthorLogin = commitDetail.author && commitDetail.author.login;
+      const allFilesExcluded = changedFiles.length > 0 && changedFiles.every(
+        f => EXCLUDED_DIFF_PATH_PREFIXES.some(prefix => f.filename.startsWith(prefix))
+      );
+      if (BOT_AUTHOR_LOGINS.has(commitAuthorLogin) || allFilesExcluded) {
+        await logOutcome('bot_or_generated_commit_skip');
+        return {
+          httpStatus: 200,
+          body: { status: 'Skipped', reason: 'Latest commit is bot-authored or touches only excluded paths', dryRun }
+        };
+      }
+
+      const patchableFiles = changedFiles.filter(f => typeof f.patch === 'string' && f.patch.length > 0);
+
+      // Code files first, doc/config-like files last (issue #34) - a stable
+      // sort so files of the same kind keep their original relative order.
+      const ordered = [...patchableFiles].sort((a, b) => {
+        const aDoc = isDocLikeFile(a.filename), bDoc = isDocLikeFile(b.filename);
+        return aDoc === bDoc ? 0 : (aDoc ? 1 : -1);
+      });
+
+      // Take-until-full, but skip (not stop at) a file that doesn't fit, so
+      // a later, smaller file still gets a chance - and cap each file's own
+      // patch first (PER_FILE_MAX_CHARS) so one huge file can't consume the
+      // whole budget by itself.
+      const pieces = [];
+      const omittedFiles = [];
+      let runningLength = 0;
+      for (const f of ordered) {
+        const piece = `--- ${f.filename} (${f.status}) ---\\n${truncateFilePatch(f.patch, f.filename)}`;
+        if (runningLength + piece.length + 2 > MAX_DIFF_CHARS) {
+          omittedFiles.push(f.filename);
+          continue;
+        }
+        pieces.push(piece);
+        runningLength += piece.length + 2;
+      }
+
+      const patches = pieces.join('\\n\\n');
       if (patches.length > 0) {
-        codeDiff = patches.length > MAX_DIFF_CHARS
-          ? patches.slice(0, MAX_DIFF_CHARS) + `\\n\\n[... diff truncated at ${MAX_DIFF_CHARS} chars ...]`
+        codeDiff = omittedFiles.length > 0
+          ? patches + `\\n\\n[... ${omittedFiles.length} file(s) omitted to stay under ${MAX_DIFF_CHARS} chars: ` +
+            `${omittedFiles.slice(0, 10).join(', ')}${omittedFiles.length > 10 ? ', ...' : ''} ...]`
           : patches;
       }
     } catch (e) {
@@ -2084,24 +2189,22 @@ jobs:
     steps:
       - name: Ping Hub for self-analysis
         env:
-          # Note: GLOBAL_GITHUB_TOKEN is not needed here - the hub authenticates
-          # to GitHub server-side using its own Vercel env var, not anything
-          # the caller sends. Only HUB_VERCEL_URL is actually required.
-          HUB_VERCEL_URL: ${{ secrets.HUB_VERCEL_URL }}
-          # The hub's deployment currently sits behind Vercel Deployment
-          # Protection - without this header every call gets a 403 before it
-          # ever reaches the handler. Get a "Protection Bypass for
-          # Automation" secret from the Vercel dashboard (Settings ->
-          # Deployment Protection) and store it as VERCEL_BYPASS_TOKEN.
-          VERCEL_BYPASS_TOKEN: ${{ secrets.VERCEL_BYPASS_TOKEN }}
+          # GLOBAL_GITHUB_TOKEN is still not needed here - the hub
+          # authenticates to GitHub server-side using its own Script
+          # Property, not anything the caller sends.
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          # Mothership maps to the "default" tenant just like every other
+          # spoke - see call-hub.apps-script.example.yml's own comment on
+          # why this is now required, not optional.
+          TENANT_CALLER_KEY: ${{ secrets.TENANT_CALLER_KEY }}
         run: |
-          curl -X POST "${HUB_VERCEL_URL}/api/autonomous_agent" \\
+          curl -X POST "${APPS_SCRIPT_URL}?endpoint=autonomous_agent" \\
             -H "Content-Type: application/json" \\
-            -H "x-vercel-protection-bypass: ${VERCEL_BYPASS_TOKEN}" \\
             -d '{
               "owner": "${{ github.repository_owner }}",
               "repo": "${{ github.event.repository.name }}",
-              "mode": "refactor"
+              "mode": "refactor",
+              "callerKey": "${{ secrets.TENANT_CALLER_KEY }}"
             }'"""
         },
         {

@@ -22,5 +22,13 @@
     "outcome": "no_findings",
     "issueUrl": null,
     "summary": "Considered whether setup_hub.py embedding a full copy of api/recursive_learning.js's source is a maintainability risk worth flagging - checked git history first rather than assuming: the prior commit in this same merge (9a4f0f1) already re-synced exactly this drift, caught by an existing, proven installer-drift check bundled into CI. Already covered; not filed as a new issue."
+  },
+  {
+    "timestamp": "2026-09-18T17:11:06.019Z",
+    "mode": "canary",
+    "commitSha": "CANARY-1789751463654-6ys09i",
+    "outcome": "no_findings",
+    "issueUrl": null,
+    "summary": null
   }
 ]

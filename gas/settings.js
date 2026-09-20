@@ -19,6 +19,10 @@
 // anything else) can never end up in a saveSettings() payload even if a
 // caller tries to smuggle it in.
 const SETTINGS_KEYS = [
+  // No longer required for the review/proposal pipeline itself - see
+  // review_queue.js's header comment. Kept settable here only for a
+  // possible future direct-call fallback mode; QUEUE_SHEET_ID below is
+  // what the actual deployed pipeline reads.
   'AI_API_KEY',
   'AI_MODEL',
   'AI_BASE_URL',
@@ -26,13 +30,23 @@ const SETTINGS_KEYS = [
   'DRY_RUN_MODE',
   'RATE_CAP_PER_REPO_PER_DAY',
   'HUB_GITHUB_OWNER',
-  'HUB_GITHUB_REPO'
+  'HUB_GITHUB_REPO',
+  // ID of the Google Sheet holding ReviewQueue/LearningQueue - see
+  // review_queue.js's header comment and README.md's "Deploy Without
+  // Vercel" section for the one-time setup this needs.
+  'QUEUE_SHEET_ID',
+  // tenants.json's "default" tenant callerKeyRef ("env:DEFAULT_TENANT_CALLER_KEY")
+  // - every registered spoke currently maps to "default", so this one value
+  // gates every real spoke-to-hub POST this deployment accepts. Settable
+  // here so rotating it doesn't require the IDE, same reasoning as
+  // GLOBAL_GITHUB_TOKEN above.
+  'DEFAULT_TENANT_CALLER_KEY'
 ];
 
 // Shown masked, never in full, and never pre-filled into an editable value -
 // the input starts blank with the masked value as a placeholder, so leaving
 // it untouched and submitting means "keep the current value," not "clear it."
-const SETTINGS_SECRET_KEYS = ['AI_API_KEY', 'GLOBAL_GITHUB_TOKEN'];
+const SETTINGS_SECRET_KEYS = ['AI_API_KEY', 'GLOBAL_GITHUB_TOKEN', 'DEFAULT_TENANT_CALLER_KEY'];
 
 function maskSecret_(value) {
   if (!value) return '(not set)';
@@ -180,6 +194,23 @@ function renderFormHtml_(token, currentValues) {
         '<div style="margin-bottom:12px"><label>' + key + '<br>' +
         '<select name="' + key + '" style="width:100%;padding:6px">' + options + '</select>' +
         '</label></div>'
+      );
+    }
+    if (key === 'QUEUE_SHEET_ID') {
+      const current = currentValues[key] || '';
+      // Auto-created on first real request/harvest run if left unset (see
+      // review_queue.js's ensureQueueSpreadsheetCreated_) - shown here as a
+      // live link once it exists, since that's the one place a human needs
+      // to go build the two Workspace Flows. Still a plain editable field
+      // too, for an operator who wants to point this at a specific
+      // existing Sheet instead of letting one get created automatically.
+      const linkHtml = current
+        ? '<a href="https://docs.google.com/spreadsheets/d/' + encodeURIComponent(current) + '/edit" target="_blank" rel="noopener">open the queue spreadsheet ↗</a>'
+        : '(not created yet - the first real request or scheduled harvest run creates one automatically and fills this in; reload this page after that to get the link)';
+      return (
+        '<div style="margin-bottom:12px"><label>' + key + '<br>' +
+        '<input type="text" name="' + key + '" value="' + htmlEscape_(current) + '" style="width:100%;padding:6px" autocomplete="off">' +
+        '</label><div style="font-size:0.85em;margin-top:2px">' + linkHtml + '</div></div>'
       );
     }
     if (isSecret) {

@@ -152,11 +152,13 @@ jobs:
           # Protection enabled - see README.md on the hub repo.
           VERCEL_BYPASS_TOKEN: ${{ secrets.VERCEL_BYPASS_TOKEN }}
           # Multi-tenancy caller auth (see the hub's lessons.md multi-tenancy
-          # entry) - only required if the hub has registered this spoke under
-          # a tenant with a callerKeyRef configured. Left unset, this is a
-          # no-op: the hub only enforces a match when the resolved tenant
-          # actually requires one, so an unconfigured single-tenant setup
-          # (the default) behaves exactly as before.
+          # entry) - REQUIRED as of the hub's live deployment. Every spoke
+          # currently maps to the "default" tenant, and "default" now has a
+          # callerKeyRef configured (tenants.json) - a request with no key,
+          # or the wrong one, gets a 401 from the hub. Ask whoever operates
+          # the hub for the current DEFAULT_TENANT_CALLER_KEY value and set
+          # it as this repo's TENANT_CALLER_KEY secret before triggering
+          # this workflow for real.
           TENANT_CALLER_KEY: ${{ secrets.TENANT_CALLER_KEY }}
         run: |
           curl -X POST "${VERCEL_URL}/api/autonomous_agent" \\
@@ -188,9 +190,11 @@ jobs:
     print("   - VERCEL_BYPASS_TOKEN: only needed if the hub's Vercel deployment")
     print("     has Deployment Protection enabled (a 'Protection Bypass for")
     print("     Automation' secret from the Vercel dashboard).")
-    print("   - TENANT_CALLER_KEY: only needed if the hub registers this repo")
-    print("     under a tenant with a callerKeyRef configured (multi-tenancy -")
-    print("     see the hub's README). Leave unset for a single-tenant/default setup.")
+    print("   - TENANT_CALLER_KEY: REQUIRED. Every spoke maps to the hub's")
+    print("     \"default\" tenant, which now has a callerKeyRef configured -")
+    print("     get the current value from whoever operates the hub")
+    print("     (tenants.json / DEFAULT_TENANT_CALLER_KEY Script Property).")
+    print("     A request with no key or the wrong one gets a 401.")
     print("3. Ensure the Hub's GLOBAL_GITHUB_TOKEN (a GitHub PAT) has access to this repo.")
     print("4. Trigger the 'Ping CTO Hub' workflow manually (workflow_dispatch) to test -")
     print("   the hub defaults to DRY_RUN_MODE, so a successful test reports what it")

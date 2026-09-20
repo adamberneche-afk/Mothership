@@ -8,6 +8,7 @@
 // Usage: node scripts/dev-test-gas-code.mjs
 
 import { loadGasGlobals } from './gas-test-harness.mjs';
+import { makeFakeSpreadsheet, makeFakeSpreadsheetApp } from './gas-sheet-fakes.mjs';
 
 let failures = 0;
 
@@ -98,16 +99,24 @@ const NO_FINDING_JSON = JSON.stringify({
   value_impact: { reasoning: '' }
 });
 
-function loadCodeWithFakes({ props = {}, aiJsonContent = NO_FINDING_JSON, githubResponses = {} } = {}) {
+function loadCodeWithFakes({ props = {}, aiJsonContent = NO_FINDING_JSON, githubResponses = {}, spreadsheetsById = {} } = {}) {
   const urlFetchApp = makeFakeUrlFetchApp({ aiJsonContent, githubResponses });
+  const spreadsheetApp = makeFakeSpreadsheetApp(spreadsheetsById);
+  const openByIdCalls = [];
+  const trackedSpreadsheetApp = {
+    ...spreadsheetApp,
+    openById: (id) => { openByIdCalls.push(id); return spreadsheetApp.openById(id); }
+  };
   const seed = {
     UrlFetchApp: urlFetchApp,
     PropertiesService: makeFakePropertiesService(props),
     ContentService: makeFakeContentService(),
-    Utilities: makeFakeUtilities()
+    Utilities: makeFakeUtilities(),
+    SpreadsheetApp: trackedSpreadsheetApp,
+    Logger: { log: () => {} }
   };
-  const context = loadGasGlobals('constants.js', 'github.js', 'autonomous_agent.js', 'recursive_learning.js', 'Code.js', seed);
-  return { context, urlFetchApp };
+  const context = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js', 'recursive_learning.js', 'deploy_version_marker.js', 'deploy_version_report.js', 'Code.js', seed);
+  return { context, urlFetchApp, openByIdCalls };
 }
 
 // A 404 for any GitHub content/commit lookup, and the AI returning
@@ -115,11 +124,31 @@ function loadCodeWithFakes({ props = {}, aiJsonContent = NO_FINDING_JSON, github
 // exercises doPost's full routing and response-shaping.
 const NOT_FOUND = { getResponseCode: () => 404, getContentText: () => '{}' };
 
+// Registers 'o'/'r' (every generic doPost test below's owner/repo) as a
+// real spoke on a tenant with no callerKeyRef - processRequest() now
+// rejects an owner/repo that isn't a registered spoke outright (see
+// autonomous_agent.js's resolveTenantIdForSpoke), and these tests exist to
+// exercise doPost's routing/config-loading, not tenant resolution. Longer
+// than the generic '/contents/' NOT_FOUND key below, so the harness's
+// longest-match-wins URL matching picks this one for these two specific
+// paths instead.
+function jsonFileResponse(value) {
+  return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ content: b64(JSON.stringify(value)) }) };
+}
+const GENERIC_SPOKE_RESPONSES = {
+  'contents/spokes.json': jsonFileResponse([
+    { tenantId: 'generic', owner: 'o', repo: 'r', addedAt: '2026-08-13T00:00:00Z', status: 'active' }
+  ]),
+  'contents/tenants.json': jsonFileResponse([
+    { tenantId: 'generic', name: 'Generic test tenant', status: 'active', plan: 'internal', quota: { reviewsPerMonth: null }, createdAt: '2026-08-13T00:00:00Z' }
+  ])
+};
+
 function testDefaultsToAutonomousAgentWhenNoEndpointGiven() {
   console.log("doPost defaults to autonomous_agent when no ?endpoint= is given (matches Vercel's original default route)");
   const { context } = loadCodeWithFakes({
     props: { DRY_RUN_MODE: 'true' },
-    githubResponses: { '/commits': NOT_FOUND, '/contents/': NOT_FOUND }
+    githubResponses: { '/commits': NOT_FOUND, '/contents/': NOT_FOUND, ...GENERIC_SPOKE_RESPONSES }
   });
   const e = { parameter: {}, postData: { contents: JSON.stringify({ owner: 'o', repo: 'r', mode: 'debug' }) } };
   const output = context.doPost(e);
@@ -160,19 +189,21 @@ function testMissingPostDataDoesNotThrow() {
 }
 
 function testConfigIsReadFromScriptPropertiesNotHardcoded() {
-  console.log('Config values actually come from PropertiesService, not a hardcoded default baked into Code.js');
-  const { context, urlFetchApp } = loadCodeWithFakes({
-    props: { DRY_RUN_MODE: 'true', AI_BASE_URL: 'https://my-custom-ai.example.com', AI_MODEL: 'test-model', AI_API_KEY: 'secret-key' },
-    aiJsonContent: NO_FINDING_JSON,
+  console.log('QUEUE_SHEET_ID actually comes from PropertiesService, not a hardcoded default baked into Code.js - and doPost queues into it, no more inline AI call');
+  const reviewQueue = makeFakeSpreadsheet();
+  const { context, openByIdCalls } = loadCodeWithFakes({
+    props: { DRY_RUN_MODE: 'true', QUEUE_SHEET_ID: 'my-real-sheet-id' },
+    spreadsheetsById: { 'my-real-sheet-id': reviewQueue },
     githubResponses: { '/commits': { getResponseCode: () => 200, getContentText: () => JSON.stringify([{ sha: 'abc123' }]) },
                         '/commits/abc123': { getResponseCode: () => 200, getContentText: () => JSON.stringify({ files: [{ filename: 'x', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b' }] }) },
-                        '/contents/': NOT_FOUND }
+                        '/contents/': NOT_FOUND, ...GENERIC_SPOKE_RESPONSES }
   });
   const e = { parameter: {}, postData: { contents: JSON.stringify({ owner: 'o', repo: 'r', mode: 'debug' }) } };
-  context.doPost(e);
-  const aiCall = urlFetchApp.calls.find((c) => c.url.includes('my-custom-ai.example.com'));
-  check('the AI call went to the AI_BASE_URL read from Script Properties', !!aiCall);
-  check('the Authorization header used the AI_API_KEY from Script Properties', aiCall?.options?.headers?.Authorization === 'Bearer secret-key');
+  const output = context.doPost(e);
+  const body = JSON.parse(output._text);
+  check('SpreadsheetApp.openById was called with the QUEUE_SHEET_ID read from Script Properties', openByIdCalls.includes('my-real-sheet-id'));
+  check('doPost responds Queued, not an inline AI answer', body.status === 'Queued');
+  check('a real row landed in the ReviewQueue tab of that spreadsheet', reviewQueue.getSheetByName('ReviewQueue')?._rows?.length === 2); // header + 1 row
 }
 
 function main() {
