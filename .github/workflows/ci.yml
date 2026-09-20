@@ -37,6 +37,9 @@ jobs:
       - name: Verify the installer scripts still compile
         run: python3 -m py_compile setup_hub.py setup_spoke.py
 
+      - name: Verify the installer-copy sync tool's escaping round-trips
+        run: python3 scripts/sync-installer-copies.py --self-test
+
       - name: Verify setup_hub.py's generated files match the real repo files
         run: |
           set -e
@@ -51,17 +54,14 @@ jobs:
           # installer would generate today and what's actually checked in.
           norm() { printf '%s\n' "$(cat "$1")"; }
 
+          # The list of files to compare comes from the sync script, not from
+          # a copy pasted here. The two used to be maintained separately,
+          # which is its own drift class.
           drift=0
-          for f in \
-            api/autonomous_agent.js api/recursive_learning.js \
-            scripts/prune-logs.js scripts/health-report.js scripts/collect-issue-feedback.js \
-            scripts/doctor.js \
-            .github/workflows/self-reflect.yml .github/workflows/prune-logs.yml \
-            .github/workflows/health-report.yml .github/workflows/recursive-learning.yml \
-            .github/workflows/collect-issue-feedback.yml .github/workflows/doctor.yml \
-            package.json .gitignore; do
+          for f in $(python3 scripts/sync-installer-copies.py --list); do
             if ! diff -u <(norm "$f") <(norm "/tmp/hub-scratch/$f") > /tmp/hub-scratch-diff.txt; then
-              echo "::error::setup_hub.py's embedded copy of $f has drifted from the real file"
+              echo "::error::setup_hub.py's embedded copy of $f has drifted from the real file. \
+          Fix it with: python3 scripts/sync-installer-copies.py"
               cat /tmp/hub-scratch-diff.txt
               drift=1
             fi
