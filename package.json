@@ -6,6 +6,6 @@
     "test": "for f in scripts/dev-test-*.mjs; do node \"$f\" || exit 1; done"
   },
   "dependencies": {
-    "@octokit/rest": "^19.0.0"
+    "@octokit/rest": "^22.0.1"
   }
 }
