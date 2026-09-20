@@ -2198,7 +2198,7 @@ jobs:
           # why this is now required, not optional.
           TENANT_CALLER_KEY: ${{ secrets.TENANT_CALLER_KEY }}
         run: |
-          curl -X POST "${APPS_SCRIPT_URL}?endpoint=autonomous_agent" \\
+          curl --fail-with-body -sS -X POST "${APPS_SCRIPT_URL}?endpoint=autonomous_agent" \\
             -H "Content-Type: application/json" \\
             -d '{
               "owner": "${{ github.repository_owner }}",
@@ -2364,7 +2364,15 @@ jobs:
 
         {
             "path": ".github/workflows/recursive-learning.yml",
-            "content": """name: Recursive Learning
+            "content": """# Targets the Apps Script deployment, not Vercel. This was the last live
+# workflow still pointing at the retired Vercel URL; gas/recursive-learning.
+# apps-script.example.yml is the template it was brought over from.
+#
+# NOTE: ?endpoint=recursive_learning has no caller-key check on the hub side
+# (only ?endpoint=autonomous_agent does), so no TENANT_CALLER_KEY is sent
+# here. Sending one the hub ignores would imply an authentication that is
+# not happening.
+name: Recursive Learning
 
 on:
   schedule:
@@ -2377,14 +2385,10 @@ jobs:
     steps:
       - name: Ping Hub for cross-spoke aggregation
         env:
-          HUB_VERCEL_URL: ${{ secrets.HUB_VERCEL_URL }}
-          # See self-reflect.yml - required while the deployment has Vercel
-          # Deployment Protection enabled.
-          VERCEL_BYPASS_TOKEN: ${{ secrets.VERCEL_BYPASS_TOKEN }}
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
         run: |
-          curl -X POST "${HUB_VERCEL_URL}/api/recursive_learning" \\
+          curl --fail-with-body -sS -X POST "${APPS_SCRIPT_URL}?endpoint=recursive_learning" \\
             -H "Content-Type: application/json" \\
-            -H "x-vercel-protection-bypass: ${VERCEL_BYPASS_TOKEN}" \\
             -d '{}'"""
         },
 

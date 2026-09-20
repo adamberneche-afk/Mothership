@@ -4,15 +4,28 @@ Written for whoever (human or a fresh Claude Code session) picks this up next. R
 
 > **Update (2026-09-14):** A later session re-verified this handoff's entire open-items list, plus every finding in KOS Audit Docket II, against then-current code across every repo in the account, then ran a scoped one-item sprint against Mothership specifically. **Items 5 and 8 below have since closed** — marked inline. Item 5 closed incidentally, as a side effect of an unrelated lock-hardening commit in kos-personal. Item 8 closed in two steps: Argoloth's half closed incidentally too (found mid-feature-work), but **Mothership's own copy was fixed deliberately, as its own scoped sprint** — the account's first case of an item actually getting pulled off this list on purpose rather than by accident. Every other item, including item 1, was re-confirmed exactly as open as described below. Full detail: [The Pivot Ledger](https://claude.ai/code/artifact/324d94db-64b1-4e3d-904f-16de245a2f79)'s "Auditing the audit" section — leaving this table's original claims uncorrected here would repeat the exact mistake that section exists to catch.
 
+> **Update (2026-09-20):** Two further sessions landed real work. **Items 3, 6 (half), and 7 have since closed**, and item 1 closed on 2026-09-18 — all marked inline below. New in this round: the KOS inference service was stood up on real infrastructure for the first time, which found five defects no test suite had caught; Mothership's own `doPost()` auth gap was found and fixed; and the dependabot backlog was cleared. **Three new items (11-13) are appended to the table** — 11 and 12 are things only the repo owner can do; 13 was found and closed the same day. The "Start here" section has been rewritten: leader-hub's `doPost()` is fixed, so it is no longer the top item.
+
+
 ---
 
-## Start here: one pending decision blocks nothing else, but is the highest-priority open item
+## Start here: manual steps only the repo owner can do
 
-**leader-hub's `EmailBridge.gs`'s `doPost()` has zero authentication, on the same `/exec` URL its own login gate protects.** Confirmed live, not theoretical: anyone signed into the CCPS Google Workspace domain (plausibly including students, not just staff — access level is `DOMAIN`) can currently call it directly and pull real student names, emails, phone numbers, parent contacts, and addresses for any shared organization; poison a roster before a teacher shares it; or trigger the owning teacher's own Gmail/Drive under their identity (`createBragDraft_`/`createSubPlanDoc_` run as `Execute as: Me`).
+Nothing below is a technical blocker — all of it is code that is merged and waiting on a credential or a console click.
 
-Full detail, exact file:line citations, and the concrete attack scenarios: **[KOS Audit Docket II](https://claude.ai/code/artifact/a34064f3-f903-4c6d-9834-e845057c9053)**, Case 05, Finding A/B.
+**1. Mothership's live Apps Script hub is running code that predates its own auth fix.** PR #43 added a caller-key gate; the deployed script has not been updated. Until these are done, the live `/exec` URL is still the unauthenticated one described in the 2026-09-18 Pivot Ledger entry:
+   - Set Script Property `DEFAULT_TENANT_CALLER_KEY` on the hub's Apps Script project.
+   - `clasp push`, then `clasp deploy -i <existing deployment id> -V <n>` — reusing the deployment id is what preserves the `/exec` URL and its access setting. A bare `clasp deploy` creates a *new* deployment defaulting to "Only myself".
+   - Add repo secrets `APPS_SCRIPT_URL` and `TENANT_CALLER_KEY` to Mothership, KOS, and Argoloth.
+   - The generated key was handed over in chat on 2026-09-19. It is deliberately not written down in any repo.
 
-This was flagged to the repo owner directly and is **awaiting a decision, not a technical blocker** — `doPost()` was deliberately left unauthenticated so a locally-opened HTML file (no `google.script.run` available) still works; a real fix needs a shared-secret/token check on that path, not a copy of the existing `_isAuthorizedOwner_` check (which would break that use case). **Do not fix this without checking with the repo owner first** — ask whether they want it fixed now, and if so, confirm the proposed approach before touching live auth on a system holding real student PII.
+**2. The KOS inference service on Render needs one env var before it will boot.** Everything else is set.
+   - Render dashboard -> `kos-inference-service` -> Environment -> **Add from Database** -> `kos-inference-db` -> **Internal Database URL**. Set Health Check Path to `/health` while there.
+   - Then it boots but is not yet functional: it still needs `ANTHROPIC_API_KEY`, `GOOGLE_CLIENT_ID`/`_SECRET`/`_REDIRECT_URI` (-> `https://kos-inference-service.onrender.com/auth/callback`), and the Stripe keys if billing is wanted.
+   - `TOKEN_ENCRYPTION_KEY` is already set in Render. **Back it up** — lose it and every stored OAuth token becomes undecryptable.
+   - Caveat worth a decision: free Render web services spin down after ~15 min without HTTP traffic. The job worker runs in-process, so on the free plan it stops whenever the service sleeps. Continuous operation means the Starter plan, not a code change.
+
+**3. One open decision: is Vercel still a deployment target?** PR #33 ("Real deployment pipeline") builds Vercel CD, but `main` has since moved the hub to Apps Script. It is 17 commits behind with five conflicting files, and the `self-reflect.yml` conflict is Vercel-vs-Apps-Script, not whitespace. Nobody should resolve that without an answer. Its Apps Script CD half (Phase 4) looks independently useful.
 
 ---
 
@@ -34,20 +47,42 @@ This was flagged to the repo owner directly and is **awaiting a decision, not a 
 
 ---
 
+## What the 2026-09-18 → 09-20 sessions did
+
+Grouped by what it changes for whoever reads this next.
+
+**Mothership's own `doPost()` had the same gap leader-hub's did, and it went live.** The multi-tenant caller-key mechanism was opt-in and the seeded `"default"` tenant had no key — fine while nothing was deployed, not fine once the Apps Script hub went live with access set to Anyone. Any unauthenticated caller could POST an arbitrary owner/repo and make the hub fetch that repo's diff with `GLOBAL_GITHUB_TOKEN`, private repos included. Fixed in [PR #43](https://github.com/adamberneche-afk/Mothership/pull/43) — and unlike leader-hub's, **the owner's decision was taken on the record before any code was written**, which is what item 1's own flag had asked for. Deployment of that fix is open item 11.
+
+**The KOS inference service ran on real infrastructure for the first time, and that found things tests could not.** Five defects, in the order they surfaced:
+  1. `getNextQueuedJob`'s `RETURNING` clause ended with a scalar subquery returning sixteen columns. Postgres rejects it at *parse* time, so it threw on every call — the worker never processed a single job. The fake-pool suite stayed green because it matches queries by substring and returns canned rows; **it structurally cannot know whether the SQL it matched is valid**. Fix `76c1cf5`, plus `test/db-sql.test.js` which runs every query against a real Postgres (skips when `DATABASE_URL` is unset; CI runs a `postgres:16` service).
+  2. `schema.sql` was idempotent everywhere except `CREATE TRIGGER`, which has no `IF NOT EXISTS`. First boot would migrate; every redeploy would die before `npm start`. Fix `2a4a53b`.
+  3. `.env.example` did not exist, though the deployment doc opens with `cp .env.example .env`. Written, all 25 variables.
+  4. `.env` was not gitignored — combined with (3), the next `git add -A` commits the Google client secret, Anthropic and Stripe keys, `DATABASE_URL` and `TOKEN_ENCRYPTION_KEY`. Fix `991d781`.
+  5. A missing `DATABASE_URL` failed silently: `pg` reads an undefined connection string as "use libpq defaults" and dials localhost, and `migrate.js` logged only `err.message` — which is empty on the AggregateError Node 26 throws. The operator's entire diagnostic was `[migrate] Failed:`. Fix `dc528c2`.
+
+**Every hub heartbeat was reporting success even when the hub refused it.** `self-reflect.yml`, `recursive-learning.yml` and both spokes' `call-hub.yml` used a bare `curl -X POST`, which exits 0 on any HTTP status. PR #43's new 403 — the one condition these workflows exist to surface — showed green. Reproduced against a local 403 server: bare curl exits 0, `curl --fail-with-body` exits 22. Fixed in all four, plus the three `gas/*.example.yml` templates. `recursive-learning.yml` was also still pointing at the retired Vercel URL and is now on Apps Script. On the Mothership branch, not yet merged.
+
+**The dependabot backlog cleared.** PRs #36-39 were all failing on the same thing, and it was never the dependency — see open item 13. All four are merged; `main` is green.
+
+---
+
 ## Open items, roughly in priority order
 
 | # | Item | Where | Status |
 |---|---|---|---|
-| 1 | Auth check on leader-hub's `doPost()` | KOS | **Awaiting a decision** — see "Start here" |
+| 1 | Auth check on leader-hub's `doPost()` | KOS | ✅ **Resolved (2026-09-18)** — real `Session.getActiveUser()` checks now gate every owner-only action and a same-domain check gates Org Sync, covered by `tests/leaderhub/webapp-auth.test.js`. **Flagged, not clean**: shipped by a Claude session with no human commit or review in between, which is exactly what the original flag asked for. Worth the owner's own eyes retroactively. |
 | 2 | Anchor/escape the prompt delimiter feeding forged SCR evidence | KOS, cas-ccps | Open, HIGH — Audit Docket II rec #2 |
-| 3 | Validate the intake email before it grants Drive access | KOS, cas-ccps | Open, HIGH — same gap since the *first* KOS audit |
+| 3 | Validate the intake email before it grants Drive access | KOS, cas-ccps | ✅ **Resolved (2026-09-19)** — `_studentIdPattern_()` now gates the submitted account before `shareToStudentDrive_()` calls `addEditor()`/`addViewer()`. 5 regression tests; commit `86a55b9`. |
 | 4 | Wire a real SCR confirm/override caller (or rescope the status table + disable the dead Weekly Parent Report section) | KOS, cas-ccps | Open |
 | 5 | Add `LockService` to `harvestStudioReturns()` and `_markAuditRetryPriority_()` | KOS, kos-personal | ✅ **Resolved (2026-09-14)** — both closed as a side effect of an unrelated lock-hardening commit (`7921cde`) wrapping `processInferenceQueue()`'s whole body in `LockService.getScriptLock()`; `harvestStudioReturns()` now takes the lock directly, and `_markAuditRetryPriority_()`'s one call site sits inside that same lock. Not a targeted fix for this item, but the race it named is genuinely closed. |
-| 6 | Encrypt OAuth refresh tokens at rest, narrow Drive scope to `drive.file` | KOS, kos-personal | Open since the *first* KOS audit — re-confirmed open 2026-09-14 |
-| 7 | Fix `tools/doc-currency/check.js:100`'s exclusion-path bug (root-only match, not any-depth) | KOS | Open, low severity, fully reproducible — re-confirmed open 2026-09-14 |
+| 6 | Encrypt OAuth refresh tokens at rest, narrow Drive scope to `drive.file` | KOS, kos-personal | 🟡 **Half resolved (2026-09-19)** — tokens are now AES-256-GCM encrypted at rest (`src/token-crypto.js`, commit `c53ed41`), fail-closed on a missing key, with legacy plaintext rows still readable so deploy day locks nobody out. 17 tests. **The `drive` → `drive.file` scope narrowing is still open** and still needs a deliberate pass against a live deployed script. |
+| 7 | Fix `tools/doc-currency/check.js:100`'s exclusion-path bug (root-only match, not any-depth) | KOS | ✅ **Resolved (2026-09-19)** — `isExcludedDir()` extracted and fixed to match any path segment. 5 regression tests including the nested `node_modules` case and an `archived_old`-vs-`archived` false-positive guard. Commit `34657fa`. |
 | 8 | Backport the actionlint-ENOENT watchdog fix | Argoloth, Mothership | ✅ **Resolved (2026-09-14)** — Argoloth's copy fixed incidentally during unrelated feature work (commit `35beb6e`); Mothership's copy fixed deliberately in a scoped one-item sprint (commit `751f8e0`), with a new regression test covering the spawn-failure path. All four repos with this watchdog (KOS, Mothership, Argoloth, TSO) are now consistent. |
 | 9 | Bring ThinkOS-Server and Tais up to the same CI/CD floor as the other 4 repos | ThinkOS-Server, Tais | Not started — re-confirmed via a live `git ls-remote` (not a stale clone) on 2026-09-14 — see Pivot Ledger status table |
 | 10 | School Store Sales Log's unescaped `innerHTML` sink | KOS, leader-hub | Open, low severity (single-owner data only) — re-confirmed open 2026-09-14 |
+| 11 | Deploy the merged Mothership auth fix to the live Apps Script hub | Mothership | **Owner-only** — see "Start here" step 1. The fix is merged; the running deployment is not. |
+| 12 | Finish standing up the KOS inference service on Render | KOS | **Owner-only for the credentials** — see "Start here" step 2. `DATABASE_URL` is one dashboard click; the API keys are yours to supply. |
+| 13 | Make `setup_hub.py`'s embedded file copies regenerable | Mothership | ✅ **Resolved (2026-09-20)** — `scripts/sync-installer-copies.py` regenerates them; `--check` reports drift, a bare run repairs it. ci.yml now takes its file list from `--list` (the two lists drifting apart was its own latent bug) and names the fix command in its error. The escaping is never trusted: every literal is parsed back with `ast.literal_eval` and compared to its source bytes before being written, so the script can refuse but cannot silently corrupt the installer. Covered by `scripts/dev-test-sync-installer-copies.mjs`, which was itself sabotaged to confirm it fails against the corruption it guards. Commit `56132ab`. |
 
 Items 2–4, 6, 7, and 10 are unchanged in substance from what Audit Docket II already recommends in more detail — that document is the source of truth for exact file:line citations, not this summary. Items 5 and 8 are the first two items on this list to actually close since it was written; see the 2026-09-14 update note at the top of this file for how each one closed.
 
@@ -59,10 +94,12 @@ All local clones are clean and pushed, `main` branch, no uncommitted changes:
 
 | Repo | Local path | HEAD | Sync |
 |---|---|---|---|
-| Mothership | `/home/user/Mothership` | `f953e93` | matches `origin/main` |
-| KOS | `/home/user/kos` | `c51224a` | matches `origin/main` |
-| Argoloth | `/home/user/argoloth` | `e1c70bd` | matches `origin/main` |
-| TSO | `/home/user/tso` | `cd339df` | 2 behind `origin/main` — both harmless bot-authored weekly issue-export commits, safe to `git pull` any time |
+| Mothership | `/home/user/Mothership` | `82e40c6` on `claude/mothership-docs-review-bpi391` | 9 ahead of `origin/main` (`c5f5413`), 0 behind — **pushed, no PR opened yet** |
+| KOS | `/home/user/kos` | `21d42a3` | matches `origin/main` |
+| Argoloth | `/home/user/argoloth` | `65d96e7` | matches `origin/main` |
+| TSO | *not cloned in this session* | — | Left alone deliberately — a concurrent Claude session was working TSO/Render at the time |
+
+All three present clones are clean, nothing uncommitted, everything pushed.
 
 **Lesson learned the hard way this session: don't trust a local clone's HEAD without checking.** `git fetch origin main && git log HEAD..origin/main` before assuming a clone reflects reality, especially for any repo more than one session or tool touches — KOS's clone silently missed ~100 real commits with no symptom until a push got rejected.
 
@@ -82,7 +119,9 @@ All local clones are clean and pushed, `main` branch, no uncommitted changes:
 
 ## Conventions this session established or relied on — worth preserving
 
-- **Direct-to-`main` pushes, no PRs**, across every repo — always run the repo's real tests + `actionlint` (or equivalent) before pushing, never push speculatively.
+- **Run the repo's real checks before pushing, never push speculatively** — the repo's own tests plus `actionlint` (or equivalent). This has held across every repo.
+- **Mothership now uses PRs; KOS and Argoloth still push direct to `main`.** PRs #43 and #44 both went through review and CI on Mothership, which is the right shape for a repo whose `ci.yml` has a drift guard. Update this line if that changes.
+- **Reproduce a breakage before believing a green run.** Twice this round a "passing" check proved nothing: an edit meant to break a query silently failed to apply, and `actionlint` without `shellcheck` on PATH cannot reproduce the SC2086 findings CI reports. Confirm the deliberate breakage actually applied, then trust the fix.
 - **`mothership-live-review` skill** for on-demand debug/hunt/refactor reviews against a spoke's latest commit(s), sidestepping the AI-backend endpoint (undeployed at the time this line was written; **update 2026-09-18: Mothership's own Apps Script backend is now live**, though no real spoke points at it yet and this skill's own value as an on-demand, no-Flow-needed path is unchanged). Dedup is by `(commitSha, mode)` in that spoke's own `ai_decision_log.json` — check it before re-reviewing a commit.
 - **The Pivot Ledger is the durable index** — when in doubt about "has this already been looked at / fixed," check it before re-deriving from scratch.
 - **A docket/audit is a dated filing, not a rolling document** — when a repo has moved substantially since its last audit, file a new, cross-referenced docket rather than editing the old one in place. The Pivot Ledger *is* the rolling document; audit dockets are snapshots.

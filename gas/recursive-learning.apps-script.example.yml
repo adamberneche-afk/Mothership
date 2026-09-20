@@ -16,6 +16,6 @@ jobs:
         env:
           APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
         run: |
-          curl -X POST "${APPS_SCRIPT_URL}?endpoint=recursive_learning" \
+          curl --fail-with-body -sS -X POST "${APPS_SCRIPT_URL}?endpoint=recursive_learning" \
             -H "Content-Type: application/json" \
             -d '{}'
