@@ -33,7 +33,7 @@ recorded below as a deliberate exemption with a reason.
 | 6 | **doc-currency** | Docs may not cite a file or a function that no longer exists in the repo. A line carrying a `doc-currency:ignore` marker is skipped, and a path that is legitimately never present here (a spoke's file, a gitignored one) is declared in `floor.json`'s `knownAbsentPaths` — a map, so each entry carries its written reason. |
 | 7 | **doc-link-check** | No dead relative links between Markdown files. |
 | 8 | **doc-placeholder-check** | No unedited template text (`[Your Company Name]`, lorem ipsum). A line carrying a `floor-allow-placeholder` marker is skipped — for docs that describe the check and therefore must contain its patterns. <!-- floor-allow-placeholder: this row documents the patterns --> |
-| 9 | **coverage-gaps** | Every scheduled job's script has test coverage CI can actually reach. |
+| 9 | **coverage-gaps** | Every scheduled job's script has test coverage CI can actually reach. Distinguishes "no test exists" from "a real test exists that `npm test` never runs" — the second is the one that reads green. A scheduled workflow invoking no local script is named in the report rather than silently dropped. |
 | 10 | **doctor** | Dispatch-only pre-flight that the secrets each workflow needs actually resolve. |
 
 ### Conventions that come with them
@@ -141,8 +141,8 @@ grows a key each time a check is adopted. The shape:
   },
   "docExcludePaths": ["node_modules"],
   "docCurrency": { "excludeDirs": [], "exemptDocs": [], "codeExtensions": [], "knownAbsentPaths": {} },
-  "placeholderPatterns": [],
-  "scheduledScriptDir": "scripts/"
+  "coverageGaps": { "testFilePatterns": [], "testCommandGlobs": [], "exemptScripts": {} },
+  "placeholderPatterns": []
 }
 ```
 
@@ -160,7 +160,7 @@ per CodeQL run is the price of keeping the YAML identical everywhere.
 ## Current compliance
 
 Verified 2026-09-21 by direct inspection, not by reading docs. Mothership's
-rows 6–8 were flipped by the work in this branch and each was proven per the
+rows 6–9 were flipped by the work in this branch and each was proven per the
 DoD above; the other four repos' columns are unchanged since that audit.
 
 | | Mothership | KOS | Argoloth | TSO | ThinkOS |
@@ -173,13 +173,13 @@ DoD above; the other four repos' columns are unchanged since that audit.
 | 6 doc-currency | ✅ | ✅ | ❌ | ✅ | ❌ |
 | 7 doc-link-check | ✅ | ❌ | ❌ | ✅ | ✅ |
 | 8 doc-placeholder-check | ✅ | ❌ | ❌ | ✅ | ✅ |
-| 9 coverage-gaps | ❌ | ✅ | ❌ | ✅ | ❌ |
+| 9 coverage-gaps | ✅ | ✅ | ❌ | ✅ | ❌ |
 | 10 doctor | ✅ | ❌ | ❌ | ✅ | ❌ |
 
 **The hub was not compliant, and that blocked everything.** A distributor
-can only distribute what it has, so bringing this repo to full compliance is
-the first implementation step, not a parity cleanup to be done later. Checks
-7, 8 and 6 are now in; **check 9 (`coverage-gaps`) is the last gap.**
+can only distribute what it has, so bringing this repo to full compliance was
+the first implementation step, not a parity cleanup to be done later. **The
+hub is now compliant on all ten.** The next step is the distributor itself.
 
 Where a check's mature implementation lives elsewhere, it is adopted here
 rather than rewritten. Which copy to adopt was decided by reading both, not
@@ -195,8 +195,23 @@ by reputation:
   unchanged in five repos. Porting the two checks it kept
   (`cited-file-missing`, `cited-function-missing`) is a deliberate floor,
   not a shortfall: a repo wanting KOS's other twelve can still have them.
-- **`coverage-gaps` from TSO**, whose require-graph resolution supersedes
-  KOS's VM-instrumented original.
+- **`coverage-gaps` from TSO**, whose module-graph resolution supersedes
+  KOS's VM-instrumented original. KOS's answers "was this Apps Script
+  trigger handler's body ever entered", using V8 coverage instrumentation
+  over files loaded into a `vm` sandbox — a real trick, needed because Apps
+  Script has no module system and every file in a project shares one global
+  scope. Neither TSO nor this repo has that problem, so the same question is
+  answerable by resolving the module graph directly. Two changes were forced
+  by this repo: it resolves ESM `import` as well as CJS `require` (Mothership
+  is `"type": "module"`, so a require-only scanner would resolve zero edges
+  and report every scheduled script as uncovered), and the `npm test`
+  reachability globs are **declared** in `floor.json` and verified against
+  `package.json` rather than parsed out of the test command. TSO parses its
+  own `node --test <globs>`; that parse is specific to one command shape,
+  this repo's test script is a shell for-loop, and a distributed copy would
+  meet a third shape in the next repo. A declared glob that no longer
+  appears in `package.json`'s test script is a hard failure, because every
+  reachability verdict is meaningless while those two disagree.
 
 ## Latent gap this surfaced
 

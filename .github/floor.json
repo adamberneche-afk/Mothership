@@ -18,6 +18,13 @@
       "meta/FLOW_DOCTRINE.md": "a KOS file, cited for attribution where this repo's queue-liveness checks were ported from. Attributed as KOS's in the surrounding prose."
     }
   },
+  "coverageGaps": {
+    "excludeDirs": ["node_modules", ".git", "__pycache__", "dist", "build", "coverage"],
+    "testFilePatterns": ["**/*.test.js", "**/*.test.mjs", "scripts/dev-test-*.mjs"],
+    "testCommandGlobs": ["scripts/dev-test-*.mjs"],
+    "scriptExtensions": [".js", ".mjs", ".cjs"],
+    "exemptScripts": {}
+  },
   "placeholderPatterns": [
     "\\[Your [A-Z][a-z]",
     "[Ll]orem ipsum",
@@ -25,6 +32,5 @@
     "\\(or your preferred [a-z]+\\)",
     "REPLACE[_ -]ME",
     "<your-[a-z-]+-here>"
-  ],
-  "scheduledScriptDir": "scripts/"
+  ]
 }
