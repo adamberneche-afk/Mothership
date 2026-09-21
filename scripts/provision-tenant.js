@@ -28,7 +28,7 @@
 // added safety.
 
 import { writeFileSync } from 'fs';
-import { loadTenantsRegistry, loadSpokesRegistry, resolveSecretRef } from '../lib/secrets.js';
+import { loadTenantsRegistry, loadSpokesRegistry, loadPlansRegistry, findPlan } from '../lib/secrets.js';
 
 const TENANT_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const CREDENTIAL_SCHEME_PATTERN = /^(env|ghapp|kv):(.*)$/;
@@ -81,7 +81,7 @@ function validateCredentialRefShape(ref, fieldName, errors) {
 
 // Pure validation, no I/O - takes the caller's already-loaded registries
 // so it's trivially testable and reusable from a dry-run.
-export function validateTenantInput(input, { existingTenants = [], existingSpokes = [] } = {}) {
+export function validateTenantInput(input, { existingTenants = [], existingSpokes = [], plans = [] } = {}) {
   const errors = [];
 
   if (!input.tenantId || !TENANT_ID_PATTERN.test(input.tenantId)) {
@@ -109,14 +109,30 @@ export function validateTenantInput(input, { existingTenants = [], existingSpoke
     errors.push('plan is required');
   }
 
+  // plan is validated against plans.json when it matches a known planId -
+  // its reviewsPerMonth auto-fills --quota unless explicitly overridden.
+  // An unrecognized plan name still isn't rejected outright - this CLI's
+  // whole design is "the operator is the trusted human," and a genuine
+  // custom/one-off deal is a real, supported use case - but with no known
+  // plan to inherit a quota from, --quota becomes required, so a typo'd
+  // plan name can't silently produce an unlimited-quota tenant nobody
+  // intended.
+  const planName = typeof input.plan === 'string' ? input.plan.trim() : '';
+  const matchedPlan = planName ? findPlan(planName, plans) : null;
+
+  const quotaExplicitlyProvided = input.quota !== undefined && input.quota !== null && input.quota !== '';
   let reviewsPerMonth = null;
-  if (input.quota !== undefined && input.quota !== null && input.quota !== '') {
+  if (quotaExplicitlyProvided) {
     const n = Number(input.quota);
     if (!Number.isInteger(n) || n < 1) {
       errors.push(`quota must be a positive integer or omitted for unlimited (got '${input.quota}')`);
     } else {
       reviewsPerMonth = n;
     }
+  } else if (matchedPlan) {
+    reviewsPerMonth = matchedPlan.reviewsPerMonth ?? null;
+  } else if (planName) {
+    errors.push(`plan '${planName}' is not a known plan in plans.json - pass --quota explicitly for a custom/one-off plan`);
   }
 
   validateCredentialRefShape(input.credentialRef, 'credential-ref', errors);
@@ -157,7 +173,7 @@ export function validateTenantInput(input, { existingTenants = [], existingSpoke
       tenantId: input.tenantId,
       name: input.name.trim(),
       status,
-      plan: input.plan.trim(),
+      plan: planName,
       quota: { reviewsPerMonth },
       githubCredentialRef: input.credentialRef,
       ...(input.callerKeyRef ? { callerKeyRef: input.callerKeyRef } : {}),
@@ -169,8 +185,8 @@ export function validateTenantInput(input, { existingTenants = [], existingSpoke
 
 // Pure - takes/returns data, never touches fs. The CLI block below does
 // the actual read-from-disk/write-to-disk.
-export function provisionTenant(input, { existingTenants = [], existingSpokes = [] } = {}) {
-  const validation = validateTenantInput(input, { existingTenants, existingSpokes });
+export function provisionTenant(input, { existingTenants = [], existingSpokes = [], plans = [] } = {}) {
+  const validation = validateTenantInput(input, { existingTenants, existingSpokes, plans });
   if (!validation.valid) return { status: 'Invalid', errors: validation.errors };
 
   const spokeEntries = validation.spokesToAdd.map((s) => ({
@@ -225,7 +241,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   if (input) {
     const existingTenants = loadTenantsRegistry();
     const existingSpokes = loadSpokesRegistry();
-    const result = provisionTenant(input, { existingTenants, existingSpokes });
+    const plans = loadPlansRegistry();
+    const result = provisionTenant(input, { existingTenants, existingSpokes, plans });
 
     if (result.status === 'Invalid') {
       console.error('Validation failed:');

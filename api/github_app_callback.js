@@ -26,9 +26,19 @@
 // regardless of WHICH check failed (bad state vs malformed id vs GitHub
 // unreachable all look the same from outside) - so probing this URL can't
 // be used to fingerprint which defense exists or tripped.
+//
+// Real multi-tier pricing: an optional planId carried in the verified
+// state claims (chosen back at api/onboard_start.js) selects which of
+// plans.json's Payment Links to redirect to next - re-validated against
+// the CURRENT plans.json here, not just trusted as a bare string. This is
+// a UX convenience only, never a trust boundary: it picks which link the
+// browser visits, not what price is actually charged - Stripe's own
+// hosted checkout enforces that, and api/stripe_webhook.js independently
+// re-derives the real purchased plan from the real Stripe price.
 
 import { verifyOnboardingToken, signOnboardingToken } from '../lib/onboarding_token.js';
 import { confirmInstallationExists } from '../lib/github_app.js';
+import { loadPlansRegistry, findPlan } from '../lib/secrets.js';
 
 const INSTALLATION_ID_PATTERN = /^[1-9][0-9]{0,15}$/;
 
@@ -40,7 +50,7 @@ function pendingApprovalResult(env) {
   return { httpStatus: 302, redirectUrl: env.ONBOARDING_PENDING_APPROVAL_URL || '/onboarding-pending-approval.html' };
 }
 
-export async function handleInstallCallback(query, { now = Date.now(), fetchImpl = fetch, env = process.env } = {}) {
+export async function handleInstallCallback(query, { now = Date.now(), fetchImpl = fetch, env = process.env, plans = loadPlansRegistry() } = {}) {
   const { installation_id: installationId, setup_action: setupAction, state } = query || {};
 
   // GitHub sends setup_action: 'request' (no installation_id at all) when
@@ -62,7 +72,23 @@ export async function handleInstallCallback(query, { now = Date.now(), fetchImpl
   });
   if (!account) return failureResult(env); // revoked, App suspended, GitHub down, malformed config - fail closed, never proceed to payment
 
-  const paymentLinkUrl = env.STRIPE_PAYMENT_LINK_URL;
+  // The plan chosen back at api/onboard_start.js (if any) travels forward
+  // in the verified state claims - re-looked-up against the CURRENT
+  // plans.json (not just trusted as a bare string) so a plan removed/
+  // renamed between the two hops fails closed rather than redirecting
+  // somewhere stale. No planId at all (a pre-multi-tier link, or a client
+  // that skipped ?plan=) falls back to STRIPE_PAYMENT_LINK_URL for
+  // backward compatibility. Either way, this only ever selects WHICH
+  // Payment Link the browser is sent to next - Stripe's own hosted
+  // checkout enforces the real price for that link, and
+  // api/stripe_webhook.js independently re-derives the actual purchased
+  // plan from the real Stripe price, never from this choice.
+  let paymentLinkUrl = env.STRIPE_PAYMENT_LINK_URL;
+  if (claims.planId) {
+    const plan = findPlan(claims.planId, plans);
+    if (!plan || !plan.stripePaymentLinkUrl) return failureResult(env);
+    paymentLinkUrl = plan.stripePaymentLinkUrl;
+  }
   if (!paymentLinkUrl) return failureResult(env);
 
   // Carries the CONFIRMED installation identity forward - never re-derived

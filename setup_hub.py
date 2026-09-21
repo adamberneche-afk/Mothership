@@ -30,6 +30,18 @@ def setup_hub():
             "path": "tenants.json",
             "content": "[]"
         },
+        {
+            # Real multi-tier pricing registry (see lib/secrets.js's
+            # loadPlansRegistry/findPlan/findPlanByStripePriceId). Starts
+            # empty - a fresh hub has no Stripe Prices/Payment Links
+            # created yet. The operator creates the real Stripe Prices/
+            # Payment Links by hand (a manual, business-side step, same
+            # pattern as GitHub App registration) and fills this file in to
+            # match before self-service onboarding can complete a checkout -
+            # see README's setup steps.
+            "path": "plans.json",
+            "content": "[]"
+        },
 
         # Canonical tenant-registry + credential-resolution helpers (see
         # lib/secrets.js's own header comment) - lives outside api/ and
@@ -65,6 +77,7 @@ import { mintInstallationToken } from './github_app.js';
 
 export const SPOKES_REGISTRY_PATH = 'spokes.json';
 export const TENANTS_REGISTRY_PATH = 'tenants.json';
+export const PLANS_REGISTRY_PATH = 'plans.json';
 export const DEFAULT_TENANT_ID = 'default';
 
 // Reads a hub-root JSON file straight off local disk (every Node caller of
@@ -90,6 +103,25 @@ export function loadSpokesRegistry() {
 
 export function loadTenantsRegistry() {
   return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
+}
+
+// plans.json (hub root, git-committed, non-secret - Stripe price IDs and
+// Payment Link URLs aren't sensitive, same reasoning tenants.json/
+// spokes.json already establish for config-as-committed-data) is the
+// source of truth for real multi-tier pricing: one entry per tier,
+// {planId, name, stripePriceId, stripePaymentLinkUrl, reviewsPerMonth}. The
+// operator creates the actual Stripe Prices/Payment Links by hand and fills
+// this in to match - see README's setup steps.
+export function loadPlansRegistry() {
+  return loadJsonArrayFromDisk(PLANS_REGISTRY_PATH);
+}
+
+export function findPlan(planId, plans) {
+  return plans.find(p => p && p.planId === planId) || null;
+}
+
+export function findPlanByStripePriceId(stripePriceId, plans) {
+  return plans.find(p => p && p.stripePriceId === stripePriceId) || null;
 }
 
 // Finds which tenant a given owner/repo belongs to. Falls back to
@@ -450,6 +482,59 @@ export async function updateJsonRegistryEntryWithRetry(octokit, owner, repo, pat
     }
   }
   throw lastError;
+}"""
+        },
+
+        # Transactional email (suspension notice, portal-link requests) -
+        # see lib/email.js's own header comment for the fail-soft contract.
+        {
+            "path": "lib/email.js",
+            "content": """// Transactional email, used for two things: notifying a customer when
+// api/github_app_webhook.js suspends their tenant (they'd otherwise only
+// discover it when Mothership silently stops working), and delivering a
+// fresh Customer Portal link on request (see api/request_portal_link.js).
+//
+// resend (official npm package, simple HTTP API, generous free tier) is
+// the one deliberate new dependency for this - flagged as swappable if the
+// operator already has a preferred provider, since the actual integration
+// surface is one API call (`resend.emails.send`).
+//
+// Fail-soft by design, matching this project's existing "decision-log
+// writes are best-effort" convention (ai_decision_log.json,
+// usage/{tenantId}.json): a failed or misconfigured send is logged and
+// swallowed here - it must NEVER fail the webhook/request it's attached
+// to. A suspended tenant not getting an email is a real, but lesser, gap
+// than a webhook 500ing because a third-party mail API had a bad day.
+
+import { Resend } from 'resend';
+
+// Returns { sent: true } on success, or { sent: false, reason } on any
+// failure - missing config, a Resend API error, a network error - never
+// throws.
+export async function sendEmail({ to, subject, html }, {
+  apiKey = process.env.RESEND_API_KEY,
+  fromEmail = process.env.NOTIFICATION_FROM_EMAIL,
+  resendClient
+} = {}) {
+  if (!to || !subject || !html) {
+    return { sent: false, reason: 'to/subject/html are all required' };
+  }
+  if (!apiKey || !fromEmail) {
+    console.warn(`lib/email.js: RESEND_API_KEY/NOTIFICATION_FROM_EMAIL not configured - email to ${to} ("${subject}") was not sent`);
+    return { sent: false, reason: 'not configured' };
+  }
+  const client = resendClient || new Resend(apiKey);
+  try {
+    const result = await client.emails.send({ from: fromEmail, to, subject, html });
+    if (result && result.error) {
+      console.warn(`lib/email.js: Resend rejected the send to ${to}: ${result.error.message || result.error}`);
+      return { sent: false, reason: result.error.message || String(result.error) };
+    }
+    return { sent: true };
+  } catch (e) {
+    console.warn(`lib/email.js: failed to send email to ${to}: ${e.message}`);
+    return { sent: false, reason: e.message };
+  }
 }"""
         },
 
@@ -1613,17 +1698,36 @@ export default async function handler(req, res) {
 // GitHub, not just trusted from the query string) and a real payment are
 // confirmed - see api/github_app_callback.js's header comment for the
 // full sequencing rationale.
+//
+// Accepts an optional ?plan=<planId>, validated against plans.json and
+// carried forward inside the signed state token so
+// api/github_app_callback.js can redirect to that tier's own Stripe
+// Payment Link. This is a UX convenience only, never a trust boundary: a
+// client-chosen planId just selects WHICH Payment Link the browser is
+// redirected to next - Stripe's own hosted checkout page enforces the real
+// price for whichever link that is, so tampering with ?plan= can't get a
+// cheaper tier. api/stripe_webhook.js never trusts this value either; it
+// independently re-derives the actual purchased plan from the Stripe price
+// the customer really paid for.
 
 import { randomUUID } from 'crypto';
 import { signOnboardingToken } from '../lib/onboarding_token.js';
+import { loadPlansRegistry, findPlan } from '../lib/secrets.js';
 
-export function buildInstallRedirect({ now = Date.now(), generateId = randomUUID, env = process.env } = {}) {
+export function buildInstallRedirect({ now = Date.now(), generateId = randomUUID, env = process.env, query = {}, plans = loadPlansRegistry() } = {}) {
   const appSlug = env.GITHUB_APP_SLUG;
   if (!appSlug) {
     return { httpStatus: 500, body: { error: 'GITHUB_APP_SLUG is not configured' } };
   }
+  const requestedPlanId = query.plan;
+  let planId;
+  if (requestedPlanId) {
+    const plan = findPlan(requestedPlanId, plans);
+    if (!plan) return { httpStatus: 400, body: { error: `unknown plan '${requestedPlanId}'` } };
+    planId = plan.planId;
+  }
   const onboardingId = generateId();
-  const state = signOnboardingToken({ onboardingId }, { now });
+  const state = signOnboardingToken({ onboardingId, ...(planId ? { planId } : {}) }, { now });
   const redirectUrl = `https://github.com/apps/${appSlug}/installations/new?state=${encodeURIComponent(state)}`;
   return { httpStatus: 302, redirectUrl };
 }
@@ -1633,7 +1737,7 @@ export default async function handler(req, res) {
     res.status(405).json({ error: 'Method not allowed' });
     return;
   }
-  const result = buildInstallRedirect({});
+  const result = buildInstallRedirect({ query: req.query || {} });
   if (result.httpStatus === 302) {
     res.writeHead(302, { Location: result.redirectUrl });
     res.end();
@@ -1675,9 +1779,19 @@ export default async function handler(req, res) {
 // regardless of WHICH check failed (bad state vs malformed id vs GitHub
 // unreachable all look the same from outside) - so probing this URL can't
 // be used to fingerprint which defense exists or tripped.
+//
+// Real multi-tier pricing: an optional planId carried in the verified
+// state claims (chosen back at api/onboard_start.js) selects which of
+// plans.json's Payment Links to redirect to next - re-validated against
+// the CURRENT plans.json here, not just trusted as a bare string. This is
+// a UX convenience only, never a trust boundary: it picks which link the
+// browser visits, not what price is actually charged - Stripe's own
+// hosted checkout enforces that, and api/stripe_webhook.js independently
+// re-derives the real purchased plan from the real Stripe price.
 
 import { verifyOnboardingToken, signOnboardingToken } from '../lib/onboarding_token.js';
 import { confirmInstallationExists } from '../lib/github_app.js';
+import { loadPlansRegistry, findPlan } from '../lib/secrets.js';
 
 const INSTALLATION_ID_PATTERN = /^[1-9][0-9]{0,15}$/;
 
@@ -1689,7 +1803,7 @@ function pendingApprovalResult(env) {
   return { httpStatus: 302, redirectUrl: env.ONBOARDING_PENDING_APPROVAL_URL || '/onboarding-pending-approval.html' };
 }
 
-export async function handleInstallCallback(query, { now = Date.now(), fetchImpl = fetch, env = process.env } = {}) {
+export async function handleInstallCallback(query, { now = Date.now(), fetchImpl = fetch, env = process.env, plans = loadPlansRegistry() } = {}) {
   const { installation_id: installationId, setup_action: setupAction, state } = query || {};
 
   // GitHub sends setup_action: 'request' (no installation_id at all) when
@@ -1711,7 +1825,23 @@ export async function handleInstallCallback(query, { now = Date.now(), fetchImpl
   });
   if (!account) return failureResult(env); // revoked, App suspended, GitHub down, malformed config - fail closed, never proceed to payment
 
-  const paymentLinkUrl = env.STRIPE_PAYMENT_LINK_URL;
+  // The plan chosen back at api/onboard_start.js (if any) travels forward
+  // in the verified state claims - re-looked-up against the CURRENT
+  // plans.json (not just trusted as a bare string) so a plan removed/
+  // renamed between the two hops fails closed rather than redirecting
+  // somewhere stale. No planId at all (a pre-multi-tier link, or a client
+  // that skipped ?plan=) falls back to STRIPE_PAYMENT_LINK_URL for
+  // backward compatibility. Either way, this only ever selects WHICH
+  // Payment Link the browser is sent to next - Stripe's own hosted
+  // checkout enforces the real price for that link, and
+  // api/stripe_webhook.js independently re-derives the actual purchased
+  // plan from the real Stripe price, never from this choice.
+  let paymentLinkUrl = env.STRIPE_PAYMENT_LINK_URL;
+  if (claims.planId) {
+    const plan = findPlan(claims.planId, plans);
+    if (!plan || !plan.stripePaymentLinkUrl) return failureResult(env);
+    paymentLinkUrl = plan.stripePaymentLinkUrl;
+  }
   if (!paymentLinkUrl) return failureResult(env);
 
   // Carries the CONFIRMED installation identity forward - never re-derived
@@ -1764,6 +1894,15 @@ export default async function handler(req, res) {
 // intentionally avoids new dependencies; this is the one deliberate
 // exception.
 //
+// Real multi-tier pricing: the actual purchased plan is re-derived from
+// what Stripe says was really paid for (stripe.checkout.sessions.
+// listLineItems, matched against plans.json by Stripe price ID) - never
+// trusted from anything client-supplied. An unrecognized price (e.g. the
+// operator added a new Payment Link but forgot to update plans.json) does
+// NOT silently default to any plan - it's surfaced as 'UnrecognizedPrice'
+// for manual reconciliation, the same "disclosed gap over silent one"
+// treatment as the 'Unlinked' case below.
+//
 // Idempotency: Stripe can and does redeliver the same event (retries on
 // any non-2xx, and can occasionally redeliver even after a 200). The new
 // tenant's tenantId is DETERMINISTIC (`ghapp-<installationId>`, never
@@ -1784,19 +1923,12 @@ export default async function handler(req, res) {
 import Stripe from 'stripe';
 import { verifyOnboardingToken } from '../lib/onboarding_token.js';
 import { mintInstallationToken } from '../lib/github_app.js';
-import { appendToJsonRegistryWithRetry } from '../lib/registry_writer.js';
+import { appendToJsonRegistryWithRetry, readJsonArrayFile } from '../lib/registry_writer.js';
+import { loadPlansRegistry, findPlanByStripePriceId } from '../lib/secrets.js';
 
 export const config = { api: { bodyParser: false } };
 
 const MAX_BODY_BYTES = 1_000_000;
-
-// v1 scope: exactly one plan tier, one Stripe Payment Link - matches this
-// sprint's deliberate "single Checkout gate, not a full billing platform"
-// scope. Extending to multiple plans needs a per-price lookup (e.g. via
-// stripe.checkout.sessions.listLineItems) and is real, disclosed follow-up
-// work, not built here.
-const DEFAULT_PLAN = 'standard';
-const DEFAULT_QUOTA = { reviewsPerMonth: null };
 
 export function readRawBody(req, { maxBytes = MAX_BODY_BYTES } = {}) {
   return new Promise((resolve, reject) => {
@@ -1820,10 +1952,29 @@ function tenantIdForInstallation(installationId) {
   return `ghapp-${installationId}`;
 }
 
-async function provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId, hubOctokit, hubOwner, hubRepo, now }) {
+// Looks up the real plan the customer actually paid for, from Stripe's own
+// record of the checkout session's line items - never from anything the
+// client supplied. Returns the matching plans.json entry, or null if the
+// session has no resolvable price or that price doesn't match any known
+// plan (a real, disclosed gap - see handleStripeWebhook's 'UnrecognizedPrice'
+// result - never silently defaulted).
+async function resolvePlanForSession(stripe, sessionId, plans) {
+  let lineItems;
+  try {
+    lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { expand: ['data.price'] });
+  } catch (e) {
+    return null;
+  }
+  const firstItem = lineItems && lineItems.data && lineItems.data[0];
+  const priceId = firstItem && firstItem.price && firstItem.price.id;
+  if (!priceId) return null;
+  return findPlanByStripePriceId(priceId, plans);
+}
+
+async function provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId, plan, hubOctokit, hubOwner, hubRepo, now }) {
   const tenantId = tenantIdForInstallation(installationId);
   return appendToJsonRegistryWithRetry(hubOctokit, hubOwner, hubRepo, 'tenants.json', {
-    message: `chore: provision tenant for GitHub App installation ${installationId} (self-service onboarding)`,
+    message: `chore: provision tenant for GitHub App installation ${installationId} (self-service onboarding, plan ${plan.planId})`,
     decide: (existingTenants) => {
       const existing = existingTenants.find((t) => t && t.tenantId === tenantId);
       if (existing) return { skip: true, result: { status: 'AlreadyProvisioned', tenantId } };
@@ -1831,8 +1982,8 @@ async function provisionTenantForInstallation({ installationId, accountLogin, st
         tenantId,
         name: accountLogin,
         status: 'active',
-        plan: DEFAULT_PLAN,
-        quota: DEFAULT_QUOTA,
+        plan: plan.planId,
+        quota: { reviewsPerMonth: plan.reviewsPerMonth ?? null },
         githubCredentialRef: `ghapp:${installationId}`,
         installationId: Number(installationId),
         // Recorded for operator support/reconciliation (looking a tenant up
@@ -1901,7 +2052,8 @@ export async function handleStripeWebhook(rawBody, signatureHeader, {
   stripeClient,
   githubAppId = process.env.GITHUB_APP_ID,
   githubAppPrivateKey = process.env.GITHUB_APP_PRIVATE_KEY,
-  githubAppRequest
+  githubAppRequest,
+  plans = loadPlansRegistry()
 } = {}) {
   if (!stripeWebhookSecret) {
     return { httpStatus: 500, body: { error: 'STRIPE_WEBHOOK_SECRET is not configured' } };
@@ -1935,7 +2087,35 @@ export async function handleStripeWebhook(rawBody, signatureHeader, {
   }
 
   const { installationId, accountLogin } = claims;
-  const provisionResult = await provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId: session.customer, hubOctokit, hubOwner, hubRepo, now });
+  const tenantId = tenantIdForInstallation(installationId);
+
+  // Cheap, best-effort idempotency pre-check BEFORE spending a Stripe API
+  // call to resolve the plan: a redelivered/duplicate event for a tenant
+  // that's already provisioned must report AlreadyProvisioned regardless
+  // of whether the plan lookup below would succeed right now (a session's
+  // line items are not guaranteed to stay resolvable forever) - the actual
+  // write-path idempotency check inside provisionTenantForInstallation
+  // still re-verifies this atomically against a fresh read, so a race
+  // landing between this check and that one is still handled correctly,
+  // just possibly with one redundant plan lookup.
+  const { entries: existingTenants } = await readJsonArrayFile(hubOctokit, hubOwner, hubRepo, 'tenants.json');
+  if (existingTenants.some((t) => t && t.tenantId === tenantId)) {
+    return { httpStatus: 200, body: { status: 'AlreadyProvisioned', tenantId } };
+  }
+
+  const plan = await resolvePlanForSession(stripe, session.id, plans);
+  if (!plan) {
+    // A payment Stripe genuinely confirmed, but for a price that doesn't
+    // match any entry in plans.json - most likely the operator added a new
+    // Payment Link/Price without updating plans.json to match. Acked (not
+    // retried by Stripe) but never provisioned under a guessed/default
+    // plan - surfaced for manual reconciliation instead, same treatment as
+    // the 'Unlinked' case above.
+    console.warn(`stripe_webhook: checkout.session.completed (session ${session.id}) has no price matching any plan in plans.json - needs manual reconciliation`);
+    return { httpStatus: 200, body: { status: 'UnrecognizedPrice', reason: 'no plan in plans.json matches this session\\'s Stripe price' } };
+  }
+
+  const provisionResult = await provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId: session.customer, plan, hubOctokit, hubOwner, hubRepo, now });
 
   if (provisionResult.status === 'Provisioned') {
     const spokeResult = await autoRegisterSpokesForInstallation({
@@ -1973,14 +2153,18 @@ export default async function handler(req, res) {
         {
             "path": "api/github_app_webhook.js",
             "content": """// GitHub's own App-level webhook - handles `installation` events
-// (deleted/suspend/unsuspend) to make credential revocation PROACTIVE
-// rather than only lazy. lib/github_app.js's mintInstallationToken/
-// lib/secrets.js's ghapp: scheme already fail closed the next time a
-// revoked installation's credential is resolved (a hard skip, never a
-// fallback) - this endpoint makes that immediate: as soon as GitHub tells
-// us an installation was removed or suspended, the matching tenant is
-// flipped to `status: 'suspended'` right away, before any request would
-// have hit the lazy failure path at all.
+// (deleted/suspend/unsuspend). lib/github_app.js's mintInstallationToken/
+// lib/secrets.js's ghapp: scheme already fail closed the moment a revoked
+// installation's credential is next resolved (a hard skip, never a
+// fallback) - so there is no functional security gap this endpoint closes;
+// that lazy path was already correct on its own. What this endpoint
+// actually adds is operator-facing clarity: without it, a revoked
+// installation just surfaces as a perpetual, ambiguous credential-
+// resolution failure (indistinguishable from a misconfigured App ID or a
+// transient GitHub outage) until someone investigates. With it, the
+// matching tenant is flipped to `status: 'suspended'` with a named
+// `suspendedReason` the moment GitHub reports the revocation - immediate
+// and legible, rather than eventually-and-unexplained.
 //
 // HMAC-verified via GITHUB_APP_WEBHOOK_SECRET, same raw-body/no-bodyParser
 // discipline as api/stripe_webhook.js (GitHub's signature is computed over
@@ -1991,9 +2175,23 @@ export default async function handler(req, res) {
 // (`github_app_uninstalled`) - never silently undoes a status an operator
 // set manually for an unrelated reason (e.g. non-payment, abuse). An
 // operator's manual suspension always wins.
+//
+// A suspended tenant otherwise gets zero notification of any kind - they'd
+// only discover it when Mothership silently stops working. On a genuinely
+// new suspension (never on AlreadySuspended - no point re-notifying), this
+// resolves the tenant's email via Stripe (their stripeCustomerId is
+// already recorded on the tenant record from api/stripe_webhook.js's
+// provisioning) and sends a calm, specific, actionable notice via
+// lib/email.js. Fail-soft throughout, matching that module's own
+// contract: a Stripe lookup failure or an email-send failure is logged and
+// swallowed, never turned into a failure of this webhook's own response -
+// a customer not getting an email is a real, but lesser, gap than this
+// webhook 500ing over a third-party API having a bad day.
 
 import { createHmac, timingSafeEqual } from 'crypto';
+import Stripe from 'stripe';
 import { updateJsonRegistryEntryWithRetry } from '../lib/registry_writer.js';
+import { sendEmail } from '../lib/email.js';
 
 export const config = { api: { bodyParser: false } };
 
@@ -2027,11 +2225,48 @@ export function verifyGithubWebhookSignature(rawBody, signatureHeader, secret) {
   return timingSafeEqual(provided, expectedBuf);
 }
 
+// Pure - the actual email content, built as its own function so it's
+// testable without a real Stripe client or mail send.
+export function buildSuspensionEmail(tenant, { dashboardBaseUrl = process.env.DASHBOARD_BASE_URL } = {}) {
+  const reinstallLine = dashboardBaseUrl
+    ? `Reinstall the GitHub App from <a href="${dashboardBaseUrl}/install.html">the install page</a> to restore access.`
+    : 'Reinstall the GitHub App on your GitHub organization to restore access.';
+  return {
+    subject: 'Your Mothership access has been suspended',
+    html: `<p>Hi${tenant.name ? ` ${tenant.name}` : ''},</p>
+<p>Mothership's access to your repositories was suspended because the GitHub App was uninstalled or suspended on GitHub's side.</p>
+<p>${reinstallLine} If this wasn't you, or you have questions, just reply to this email.</p>`
+  };
+}
+
+// Best-effort, never throws - see this file's header comment for the
+// fail-soft contract. Returns the same {sent, reason?} shape
+// lib/email.js's sendEmail already uses, plus a distinguishable
+// 'no stripeCustomerId'/'no email on file' reason for the cases that never
+// even reach sendEmail.
+async function notifySuspendedTenant(tenant, { stripeClient, sendEmailImpl = sendEmail, dashboardBaseUrl } = {}) {
+  if (!tenant.stripeCustomerId) return { sent: false, reason: 'tenant has no stripeCustomerId on record' };
+  try {
+    const customer = await stripeClient.customers.retrieve(tenant.stripeCustomerId);
+    if (!customer || customer.deleted || !customer.email) {
+      return { sent: false, reason: 'no email on file for this Stripe customer' };
+    }
+    const { subject, html } = buildSuspensionEmail(tenant, { dashboardBaseUrl });
+    return await sendEmailImpl({ to: customer.email, subject, html });
+  } catch (e) {
+    return { sent: false, reason: e.message };
+  }
+}
+
 export async function handleGithubAppWebhook(rawBody, signatureHeader, {
   webhookSecret = process.env.GITHUB_APP_WEBHOOK_SECRET,
   hubOctokit,
   hubOwner = process.env.HUB_GITHUB_OWNER || 'adamberneche-afk',
-  hubRepo = process.env.HUB_GITHUB_REPO || 'Mothership'
+  hubRepo = process.env.HUB_GITHUB_REPO || 'Mothership',
+  stripeClient,
+  stripeSecretKey = process.env.STRIPE_SECRET_KEY,
+  sendEmailImpl = sendEmail,
+  dashboardBaseUrl = process.env.DASHBOARD_BASE_URL
 } = {}) {
   if (!verifyGithubWebhookSignature(rawBody, signatureHeader, webhookSecret)) {
     return { httpStatus: 400, body: { error: 'invalid signature' } };
@@ -2062,7 +2297,15 @@ export async function handleGithubAppWebhook(rawBody, signatureHeader, {
       }
     });
     if (!result.found) return { httpStatus: 200, body: { status: 'Ignored', reason: `no tenant found for installation ${installationId}` } };
-    return { httpStatus: 200, body: { status: result.changed ? 'Suspended' : 'AlreadySuspended', tenantId } };
+    let notification;
+    if (result.changed) {
+      // Only on a genuinely NEW suspension - never re-notify on
+      // AlreadySuspended, and never let this delay or fail the response
+      // above (the tenants.json write already succeeded).
+      const stripe = stripeClient || new Stripe(stripeSecretKey || 'sk_missing');
+      notification = await notifySuspendedTenant(result.entry, { stripeClient: stripe, sendEmailImpl, dashboardBaseUrl });
+    }
+    return { httpStatus: 200, body: { status: result.changed ? 'Suspended' : 'AlreadySuspended', tenantId, ...(notification ? { notification } : {}) } };
   }
 
   // event.action === 'unsuspend'
@@ -2098,6 +2341,187 @@ export default async function handler(req, res) {
   const hubOctokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
   const result = await handleGithubAppWebhook(rawBody, signatureHeader, { hubOctokit });
   res.status(result.httpStatus).json(result.body);
+}"""
+        },
+
+        # Stripe Customer Portal - immediate post-checkout access via a
+        # session_id, plus ongoing access via email lookup.
+        {
+            "path": "api/customer_portal_link.js",
+            "content": """// Immediate post-checkout access to the Stripe Customer Portal. The
+// operator configures each Payment Link's after-payment redirect (in the
+// Stripe Dashboard) to
+// `https://<host>/onboarding-success.html?session_id={CHECKOUT_SESSION_ID}`
+// - Stripe's own documented templating for exactly this use case.
+// dashboard/onboarding-success.html's inline script calls this endpoint
+// with that session_id and, if it returns a portal link, redirects there.
+//
+// A session_id is a bearer credential for portal access once known - it's
+// only ever delivered via the success redirect URL itself, the same trust
+// model Stripe's own official Customer Portal integration guide uses. This
+// endpoint bounds that exposure explicitly: a portal link is only ever
+// minted for a session within ~24h of its own `created` timestamp (a
+// forwarded/bookmarked/logged old success URL stops working on its own,
+// the same "leaked-but-expired" defense lib/onboarding_token.js already
+// uses for the onboarding state token).
+//
+// Verifies real payment before minting anything - payment_status must be
+// 'paid', never just "the browser reached this URL" (the exact mistake
+// api/stripe_webhook.js's own header comment already warns against for
+// onboarding-success.html itself).
+
+export async function getPortalLinkForSession(sessionId, {
+  stripeClient,
+  now = Date.now(),
+  dashboardBaseUrl = process.env.DASHBOARD_BASE_URL,
+  maxAgeMs = 24 * 60 * 60 * 1000
+} = {}) {
+  if (!sessionId || typeof sessionId !== 'string') {
+    return { ok: false, reason: 'missing session_id' };
+  }
+  if (!dashboardBaseUrl) {
+    // A portal session requires a return_url - refusing loudly (via the
+    // caller's error response) rather than guessing one is the same
+    // "disclosed gap over silent one" choice as buildSuspensionEmail's
+    // fallback in api/github_app_webhook.js.
+    return { ok: false, reason: 'DASHBOARD_BASE_URL is not configured' };
+  }
+
+  let session;
+  try {
+    session = await stripeClient.checkout.sessions.retrieve(sessionId);
+  } catch (e) {
+    return { ok: false, reason: 'could not retrieve session' };
+  }
+  if (!session || session.payment_status !== 'paid') {
+    return { ok: false, reason: 'session is not a paid checkout' };
+  }
+  if (!session.customer) {
+    return { ok: false, reason: 'session has no associated customer' };
+  }
+
+  const createdMs = (session.created || 0) * 1000; // Stripe timestamps are in seconds
+  if (now - createdMs > maxAgeMs) {
+    return { ok: false, reason: 'session_id has expired for portal access' };
+  }
+
+  try {
+    const portalSession = await stripeClient.billingPortal.sessions.create({
+      customer: session.customer,
+      return_url: `${dashboardBaseUrl}/install.html`
+    });
+    return { ok: true, url: portalSession.url };
+  } catch (e) {
+    return { ok: false, reason: 'could not create a portal session' };
+  }
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'GET') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  const sessionId = req.query && req.query.session_id;
+  const { default: Stripe } = await import('stripe');
+  const stripeClient = new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_missing');
+  const result = await getPortalLinkForSession(sessionId, { stripeClient });
+  if (!result.ok) {
+    res.status(400).json({ error: result.reason });
+    return;
+  }
+  res.status(200).json({ url: result.url });
+}"""
+        },
+        {
+            "path": "api/request_portal_link.js",
+            "content": """// Ongoing Customer Portal access for a returning customer who no longer
+// has their original success-redirect link (see
+// api/customer_portal_link.js's header comment for that immediate path).
+// dashboard/manage.html posts a plain email address here.
+//
+// The core anti-enumeration property, stated explicitly: this ALWAYS
+// returns the identical response regardless of whether the email matches
+// a real Stripe customer - never turning "check if this address has an
+// account" into a working customer-existence oracle. A match silently
+// gets a fresh portal link emailed to them (reusing lib/email.js, the same
+// fail-soft capability api/github_app_webhook.js's suspension notice
+// already uses); a non-match gets nothing, and neither case is
+// distinguishable from the response alone.
+//
+// Rate-limited by email, best-effort only - an in-memory Map keyed by
+// normalized email, scoped to a single warm serverless instance. Disclosed
+// limitation, not overclaimed: this does NOT protect against a burst
+// spread across multiple cold-started instances or multiple IPs. A real,
+// distributed rate limiter is real follow-up work if abuse is observed;
+// this is a cheap first layer, not a promise of one.
+
+import { sendEmail } from '../lib/email.js';
+
+const DEFAULT_RATE_LIMIT_STATE = new Map();
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 request per email per minute, best-effort
+
+const GENERIC_RESPONSE = {
+  status: 'Requested',
+  message: "If that email has an account, we've sent a link to manage your subscription."
+};
+
+export async function handleRequestPortalLink({ email }, {
+  stripeClient,
+  sendEmailImpl = sendEmail,
+  dashboardBaseUrl = process.env.DASHBOARD_BASE_URL,
+  now = Date.now(),
+  rateLimitState = DEFAULT_RATE_LIMIT_STATE,
+  rateLimitWindowMs = RATE_LIMIT_WINDOW_MS
+} = {}) {
+  // Malformed/missing input still gets the identical generic response -
+  // there's nothing more specific to leak here either, and it keeps the
+  // "one response, always" property simple to reason about.
+  if (!email || typeof email !== 'string' || !email.includes('@')) {
+    return GENERIC_RESPONSE;
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const lastRequestAt = rateLimitState.get(normalizedEmail);
+  if (lastRequestAt !== undefined && now - lastRequestAt < rateLimitWindowMs) {
+    return GENERIC_RESPONSE; // rate-limited - still the identical response, nothing leaked
+  }
+  rateLimitState.set(normalizedEmail, now);
+
+  if (!dashboardBaseUrl) return GENERIC_RESPONSE; // nothing to build a return_url from - fail soft
+
+  try {
+    const customers = await stripeClient.customers.list({ email: normalizedEmail, limit: 1 });
+    const customer = customers && customers.data && customers.data[0];
+    if (customer) {
+      const portalSession = await stripeClient.billingPortal.sessions.create({
+        customer: customer.id,
+        return_url: `${dashboardBaseUrl}/install.html`
+      });
+      await sendEmailImpl({
+        to: normalizedEmail,
+        subject: 'Manage your Mothership subscription',
+        html: `<p>Here's your link to manage your Mothership subscription:</p><p><a href="${portalSession.url}">Manage subscription</a></p><p>This link is personal and time-limited - don't share it. If you didn't request this, you can ignore this email.</p>`
+      });
+    }
+  } catch (e) {
+    // Fail-soft, and deliberately no different a response than "not found"
+    // - a Stripe/email failure must not be distinguishable from a genuine
+    // non-match either.
+  }
+
+  return GENERIC_RESPONSE;
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  const { default: Stripe } = await import('stripe');
+  const stripeClient = new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_missing');
+  const result = await handleRequestPortalLink(req.body || {}, { stripeClient });
+  res.status(200).json(result);
 }"""
         },
 
@@ -2915,7 +3339,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 // added safety.
 
 import { writeFileSync } from 'fs';
-import { loadTenantsRegistry, loadSpokesRegistry, resolveSecretRef } from '../lib/secrets.js';
+import { loadTenantsRegistry, loadSpokesRegistry, loadPlansRegistry, findPlan } from '../lib/secrets.js';
 
 const TENANT_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const CREDENTIAL_SCHEME_PATTERN = /^(env|ghapp|kv):(.*)$/;
@@ -2968,7 +3392,7 @@ function validateCredentialRefShape(ref, fieldName, errors) {
 
 // Pure validation, no I/O - takes the caller's already-loaded registries
 // so it's trivially testable and reusable from a dry-run.
-export function validateTenantInput(input, { existingTenants = [], existingSpokes = [] } = {}) {
+export function validateTenantInput(input, { existingTenants = [], existingSpokes = [], plans = [] } = {}) {
   const errors = [];
 
   if (!input.tenantId || !TENANT_ID_PATTERN.test(input.tenantId)) {
@@ -2996,14 +3420,30 @@ export function validateTenantInput(input, { existingTenants = [], existingSpoke
     errors.push('plan is required');
   }
 
+  // plan is validated against plans.json when it matches a known planId -
+  // its reviewsPerMonth auto-fills --quota unless explicitly overridden.
+  // An unrecognized plan name still isn't rejected outright - this CLI's
+  // whole design is "the operator is the trusted human," and a genuine
+  // custom/one-off deal is a real, supported use case - but with no known
+  // plan to inherit a quota from, --quota becomes required, so a typo'd
+  // plan name can't silently produce an unlimited-quota tenant nobody
+  // intended.
+  const planName = typeof input.plan === 'string' ? input.plan.trim() : '';
+  const matchedPlan = planName ? findPlan(planName, plans) : null;
+
+  const quotaExplicitlyProvided = input.quota !== undefined && input.quota !== null && input.quota !== '';
   let reviewsPerMonth = null;
-  if (input.quota !== undefined && input.quota !== null && input.quota !== '') {
+  if (quotaExplicitlyProvided) {
     const n = Number(input.quota);
     if (!Number.isInteger(n) || n < 1) {
       errors.push(`quota must be a positive integer or omitted for unlimited (got '${input.quota}')`);
     } else {
       reviewsPerMonth = n;
     }
+  } else if (matchedPlan) {
+    reviewsPerMonth = matchedPlan.reviewsPerMonth ?? null;
+  } else if (planName) {
+    errors.push(`plan '${planName}' is not a known plan in plans.json - pass --quota explicitly for a custom/one-off plan`);
   }
 
   validateCredentialRefShape(input.credentialRef, 'credential-ref', errors);
@@ -3044,7 +3484,7 @@ export function validateTenantInput(input, { existingTenants = [], existingSpoke
       tenantId: input.tenantId,
       name: input.name.trim(),
       status,
-      plan: input.plan.trim(),
+      plan: planName,
       quota: { reviewsPerMonth },
       githubCredentialRef: input.credentialRef,
       ...(input.callerKeyRef ? { callerKeyRef: input.callerKeyRef } : {}),
@@ -3056,8 +3496,8 @@ export function validateTenantInput(input, { existingTenants = [], existingSpoke
 
 // Pure - takes/returns data, never touches fs. The CLI block below does
 // the actual read-from-disk/write-to-disk.
-export function provisionTenant(input, { existingTenants = [], existingSpokes = [] } = {}) {
-  const validation = validateTenantInput(input, { existingTenants, existingSpokes });
+export function provisionTenant(input, { existingTenants = [], existingSpokes = [], plans = [] } = {}) {
+  const validation = validateTenantInput(input, { existingTenants, existingSpokes, plans });
   if (!validation.valid) return { status: 'Invalid', errors: validation.errors };
 
   const spokeEntries = validation.spokesToAdd.map((s) => ({
@@ -3112,7 +3552,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   if (input) {
     const existingTenants = loadTenantsRegistry();
     const existingSpokes = loadSpokesRegistry();
-    const result = provisionTenant(input, { existingTenants, existingSpokes });
+    const plans = loadPlansRegistry();
+    const result = provisionTenant(input, { existingTenants, existingSpokes, plans });
 
     if (result.status === 'Invalid') {
       console.error('Validation failed:');
@@ -3441,7 +3882,7 @@ jobs:
         # 5. INFRASTRUCTURE
         {
             "path": "package.json",
-            "content": "{\n  \"name\": \"ai-cto-hub\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"test\": \"for f in scripts/dev-test-*.mjs; do node \\\"$f\\\" || exit 1; done\"\n  },\n  \"dependencies\": {\n    \"@octokit/auth-app\": \"^6.1.4\",\n    \"@octokit/rest\": \"^19.0.0\",\n    \"stripe\": \"^17.7.0\"\n  }\n}",
+            "content": "{\n  \"name\": \"ai-cto-hub\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"test\": \"for f in scripts/dev-test-*.mjs; do node \\\"$f\\\" || exit 1; done\"\n  },\n  \"dependencies\": {\n    \"@octokit/auth-app\": \"^6.1.4\",\n    \"@octokit/rest\": \"^19.0.0\",\n    \"resend\": \"^4.8.0\",\n    \"stripe\": \"^17.7.0\"\n  }\n}",
         },
         {
             "path": ".gitignore",

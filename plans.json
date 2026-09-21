@@ -1,0 +1,23 @@
+[
+  {
+    "planId": "starter",
+    "name": "Starter",
+    "stripePriceId": "price_REPLACE_WITH_STARTER_PRICE_ID",
+    "stripePaymentLinkUrl": "https://buy.stripe.com/REPLACE_WITH_STARTER_LINK",
+    "reviewsPerMonth": 50
+  },
+  {
+    "planId": "standard",
+    "name": "Standard",
+    "stripePriceId": "price_REPLACE_WITH_STANDARD_PRICE_ID",
+    "stripePaymentLinkUrl": "https://buy.stripe.com/REPLACE_WITH_STANDARD_LINK",
+    "reviewsPerMonth": 200
+  },
+  {
+    "planId": "pro",
+    "name": "Pro",
+    "stripePriceId": "price_REPLACE_WITH_PRO_PRICE_ID",
+    "stripePaymentLinkUrl": "https://buy.stripe.com/REPLACE_WITH_PRO_LINK",
+    "reviewsPerMonth": null
+  }
+]
