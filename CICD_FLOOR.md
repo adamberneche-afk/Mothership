@@ -167,10 +167,24 @@ environment is `true` or `false` rather than a credential.
 | `--sync` | rewrites the env block from the names the workflow files reference |
 | `--check` | fails if that block has fallen behind, in **either** direction |
 
-`--check` runs on every pull request through the test suite, so a workflow
-that starts needing a new secret turns a PR red until the block is
-regenerated. Same generate-then-verify shape
-`scripts/sync-installer-copies.py` already uses for `setup_hub.py`.
+Same generate-then-verify shape `scripts/sync-installer-copies.py` already
+uses for `setup_hub.py`.
+
+The workflow splits into two jobs by what each needs to see:
+
+| job | trigger | secrets context | does |
+|---|---|---|---|
+| `drift` | pull request **and** dispatch | none at all | `--check` |
+| `probe` | dispatch only | one boolean per secret | the verdicts |
+
+That split is what catches the drift half **before merge**: a workflow that
+starts needing a new secret turns a PR red until the block is regenerated.
+Crucially it needs no test suite to do it — ThinkOS-Server has no Node test
+suite at all, so wiring the gate through a harness would have left the list
+unguarded in the one repo least able to notice. `probe` carries
+`if: github.event_name == 'workflow_dispatch'` because on a fork PR the
+secrets context is empty and every secret would report missing — a false red
+trains people to ignore the check.
 
 This answers the real objection to a hand-written list. The problem was
 never that the list lived in a file — it was that a human had to remember
