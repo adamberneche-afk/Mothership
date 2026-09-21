@@ -1,0 +1,51 @@
+name: Coverage Gaps
+
+# Floor check 9 (see CICD_FLOOR.md). Finds a scheduled job's script that
+# either has no test anywhere in the repo, or has one that exists on disk
+# but which `npm test` never actually runs.
+#
+# PR-gated, not scheduled - unlike watchdog/deploy-drift/doctor, this checks
+# static config (which scheduled scripts have real, CI-reachable tests), not
+# live state, so it belongs where a regression is caught before it merges.
+# The failure it exists for is "a new scheduled script ships with no test,
+# or a real test gets written and never wired into `npm test`" - both are
+# introduced by a diff, so a PR check catches them at the right moment
+# rather than a clock noticing days later.
+#
+# DELIBERATELY NO `paths:` FILTER, for the same reason doc-currency has
+# none: coverage is a joint property of the workflows, the scripts, the test
+# files AND package.json's test command. Adding a scheduled workflow,
+# deleting a test, or editing one glob in package.json each breaks it
+# without touching the others, so any path list would be a way to merge the
+# regression unseen. A `paths:` list is also evaluated at workflow-parse
+# time, so it could not be driven from .github/floor.json anyway. The check
+# is a pure filesystem walk with no network and no dependency install.
+#
+# Per-repo settings live in .github/floor.json under `coverageGaps`, read at
+# runtime - see CICD_FLOOR.md's "why runtime config instead of templating"
+# section.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  coverage-gaps:
+    runs-on: ubuntu-latest
+    # A read-only checkout is all this needs: no network, no credentials, no
+    # dependency install. Safe on a pull_request opened from a fork.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      # No `npm ci` - scripts/coverage-gaps.js imports only node builtins, on
+      # purpose, so this check cannot be taken down by a dependency install
+      # failing.
+      - name: Check every scheduled job's script has real, CI-reachable test coverage
+        run: node scripts/coverage-gaps.js

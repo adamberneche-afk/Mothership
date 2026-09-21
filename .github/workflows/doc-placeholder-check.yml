@@ -1,0 +1,73 @@
+name: Documentation Placeholder Check
+
+# Floor check 8 (see CICD_FLOOR.md). Catches unedited template scaffolding
+# left in shipped docs - a "[Your Company Name]"-style field, unmodified
+# boilerplate, a `<your-url-here>` nobody replaced. Adopted from the copy
+# already running in TSO/ThinkOS-Server, where a docs audit found several,
+# including a fictitious address sitting in a live Privacy Policy.
+#
+# This deliberately does NOT grep for generic "TODO" markers. Ordinary TODOs
+# are normal and not what this check is for; a check that fires on them
+# would be noise, and noise gets ignored. Only patterns matching actual
+# unedited template text belong in the list.
+#
+# The patterns and exclude paths come from .github/floor.json rather than
+# being written here, so this file stays byte-identical across every repo
+# the floor is distributed to - see CICD_FLOOR.md's "why runtime config
+# instead of templating" section.
+#
+# The `floor-allow-placeholder` marker exists because of a self-reference
+# trap found while installing this check: any doc that *documents* this
+# check necessarily contains the strings it greps for, so CICD_FLOOR.md and
+# README.md both matched their own documentation on the first run. A line
+# carrying that marker is skipped.
+#
+# Deliberately line-scoped rather than file-scoped. Exempting a whole file
+# would stop it catching a real placeholder elsewhere in that same file,
+# and README.md is exactly where one would hide. The marker also has to be
+# visible on the offending line, where a reviewer reading the diff will see
+# it, rather than buried in a config file nobody opens.
+
+on:
+  pull_request:
+    paths:
+      - '**/*.md'
+      - '.github/workflows/doc-placeholder-check.yml'
+      - '.github/floor.json'
+  workflow_dispatch:
+
+jobs:
+  placeholder-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Grep for unedited template/placeholder markers
+        run: |
+          set -euo pipefail
+
+          pattern=$(jq -r '.placeholderPatterns | join("|")' .github/floor.json)
+          # `// []` so a floor.json that omits an optional key degrades to
+          # "nothing excluded" rather than hard-failing the step - the
+          # distributed copy of this file has to tolerate a spoke whose
+          # config predates a key being added.
+          readarray -t exclude_args < <(jq -r '
+            (.docExcludePaths // [])[] | "--exclude-dir=" + .
+          ' .github/floor.json)
+
+          matches=$(grep -rniE "$pattern" --include='*.md' "${exclude_args[@]}" . \
+            | grep -v 'floor-allow-placeholder' || true)
+
+          if [ -n "$matches" ]; then
+            echo "::error::Found unedited template/placeholder text in docs:"
+            echo "$matches"
+            echo ""
+            echo "If this is a real, intentional value, edit it to say what's actually true."
+            echo "If it's a template field nobody filled in, either fill it in or remove it."
+            echo "If the pattern itself is wrong, fix it in .github/floor.json."
+            exit 1
+          fi
+
+          echo "No placeholder markers found."
