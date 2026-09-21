@@ -1,5 +1,7 @@
 # Session Handoff — 2026-09-06
 
+*Last updated 2026-09-21 (CI/CD floor session). The dated update notes below are cumulative — read them in order; the original 09-06 body is kept as the record of what prompted all of it, not as current status.*
+
 Written for whoever (human or a fresh Claude Code session) picks this up next. Read the "Start here" section first — everything else is context for *why*, not things to do before that.
 
 > **Update (2026-09-14):** A later session re-verified this handoff's entire open-items list, plus every finding in KOS Audit Docket II, against then-current code across every repo in the account, then ran a scoped one-item sprint against Mothership specifically. **Items 5 and 8 below have since closed** — marked inline. Item 5 closed incidentally, as a side effect of an unrelated lock-hardening commit in kos-personal. Item 8 closed in two steps: Argoloth's half closed incidentally too (found mid-feature-work), but **Mothership's own copy was fixed deliberately, as its own scoped sprint** — the account's first case of an item actually getting pulled off this list on purpose rather than by accident. Every other item, including item 1, was re-confirmed exactly as open as described below. Full detail: [The Pivot Ledger](https://claude.ai/code/artifact/324d94db-64b1-4e3d-904f-16de245a2f79)'s "Auditing the audit" section — leaving this table's original claims uncorrected here would repeat the exact mistake that section exists to catch.
@@ -7,6 +9,8 @@ Written for whoever (human or a fresh Claude Code session) picks this up next. R
 > **Update (2026-09-20):** Two further sessions landed real work. **Items 3, 6 (half), and 7 have since closed**, and item 1 closed on 2026-09-18 — all marked inline below. New in this round: the KOS inference service was stood up on real infrastructure for the first time, which found five defects no test suite had caught; Mothership's own `doPost()` auth gap was found and fixed; and the dependabot backlog was cleared. **Three new items (11-13) are appended to the table** — 11 and 12 are things only the repo owner can do; 13 was found and closed the same day. The "Start here" section has been rewritten: leader-hub's `doPost()` is fixed, so it is no longer the top item.
 
 > **Update (2026-09-21):** A session working through KOS's Open Items list (Flow 2 prompt-injection fix, SCR confirm/override, the inference service's Drive scope, leader-hub's Sales Log escaping — all merged: KOS PRs #23-25, #27) also got a real answer on "Start here" item 3 below, straight from the repo owner: **keep Vercel as an open deployment option, but do not deploy into it until there's a concrete reason to expand the account's surface area.** PR #33 stays open, unmerged — it's the record of that option, not a queued task. See item 3's own entry for what this does and doesn't resolve.
+
+> **Update (2026-09-21, later session):** The CI/CD floor was specified, completed on the hub, and distributed. It is now **ten checks**, written down in [`CICD_FLOOR.md`](CICD_FLOOR.md); Mothership has all ten and every one has been proven by watching it go red. Checks 6–9 went to Argoloth; check 10 went to Argoloth, KOS and TSO. **Open item 9 has therefore moved, not closed** — and Tais is out of scope for good (archived). The consequential part is not the checks, though: **check 10's first real run proved that "Start here" item 1's last bullet was never done.** `APPS_SCRIPT_URL` and `TENANT_CALLER_KEY` are unset in all three repos, and the spoke heartbeats built on them have failed **33 consecutive runs with zero successes**. That had been sitting in this file as a one-line to-do since 2026-09-06. See "What the 2026-09-21 floor session did" below.
 
 ---
 
@@ -19,6 +23,16 @@ Nothing below is a technical blocker — all of it is code that is merged and wa
    - `clasp push`, then `clasp deploy -i <existing deployment id> -V <n>` — reusing the deployment id is what preserves the `/exec` URL and its access setting. A bare `clasp deploy` creates a *new* deployment defaulting to "Only myself".
    - Add repo secrets `APPS_SCRIPT_URL` and `TENANT_CALLER_KEY` to Mothership, KOS, and Argoloth.
    - The generated key was handed over in chat on 2026-09-19. It is deliberately not written down in any repo.
+
+> ⚠️ **This bullet is now measured, not assumed (2026-09-21).** `secrets-doctor` (floor check 10) was dispatched against all four repos and reports both secrets **unset in Mothership, KOS and Argoloth** — the exact three named above. The cost is not hypothetical:
+>
+> | workflow | repo | runs | successes |
+> |---|---|---|---|
+> | `call-hub.yml` | Argoloth | 16 (since 2026-09-19) | **0** |
+> | `call-hub.yml` | KOS | 17 (since 2026-09-19) | **0** |
+> | `self-reflect.yml` | Mothership | green to 2026-09-13 | failing since 2026-09-20 |
+>
+> Every spoke run dies on `curl: (3) URL rejected: No host part in the URL` — `APPS_SCRIPT_URL` expands to nothing, so the heartbeat curls a bare `?endpoint=autonomous_agent`. Both spokes' heartbeats have **never once worked**. `recursive-learning.yml` is monthly (`0 0 1 * *`), last succeeded 2026-09-01, and will fail on its next run for the same reason. This is the single highest-value item in this file: it is two console clicks per repo, and until it is done, the live hub this account spent three sessions standing up has no spoke actually reaching it.
 
 **2. The KOS inference service on Render needs one env var before it will boot.** Everything else is set.
    - Render dashboard -> `kos-inference-service` -> Environment -> **Add from Database** -> `kos-inference-db` -> **Internal Database URL**. Set Health Check Path to `/health` while there.
@@ -69,6 +83,39 @@ Grouped by what it changes for whoever reads this next.
 
 ---
 
+## What the 2026-09-21 floor session did
+
+**The CI/CD floor is now a written spec with ten checks, not an oral tradition.** [`CICD_FLOOR.md`](CICD_FLOOR.md) names all ten, the "prove it fails" rule, the constraints a distributed artifact has to satisfy, and the exemptions. Checks 1–5 already existed across the portfolio; this session built 6–10 on the hub and distributed what applied.
+
+| # | check | Mothership | Argoloth | KOS | TSO | ThinkOS-Server |
+|---|---|---|---|---|---|---|
+| 1–5 | CodeQL, Dependabot, watchdog, tests-in-CI, docs-check | ✅ | ⛔ CodeQL (private, no GHAS) | ✅ | ⚠️ docs-check | partial |
+| 6 | doc-currency | ✅ | ✅ | pre-existing own | pre-existing own | ❌ |
+| 7 | doc-link-check | ✅ | ✅ | ✅ | ✅ | non-canonical |
+| 8 | doc-placeholder-check | ✅ | ✅ | ✅ | ✅ | non-canonical |
+| 9 | coverage-gaps | ✅ | ✅ | pre-existing own | ✅ | ❌ |
+| 10 | secrets-doctor | ✅ | ✅ | ✅ | ✅ | PR #6, draft |
+
+Merged: Mothership #48–#52, Argoloth #13–#14, KOS #30, TSO #2054.
+
+**Two design decisions worth not re-litigating.** Per-repo variation lives in a committed `.github/floor.json` read at *runtime*, never in generated-code templating — templating would break the `ast.literal_eval` round-trip invariant `sync-installer-copies.py` depends on (open item 13). And every distributed script is `.mjs`, not `.js`, so it loads in a CommonJS repo like Argoloth regardless of the host `package.json`'s `type`. Every distributed file is byte-identical across repos, verified by `diff` after every edit.
+
+**Every check was proven by watching it go red on a planted violation** — except check 10's `probe` half, which is `workflow_dispatch`-only and so cannot be dispatched until it exists on the default branch. That proof was completed after merge and is recorded in `CICD_FLOOR.md` and on each of the four PRs.
+
+**What the checks found on their first real runs.** This is the part worth reading; the checks themselves are plumbing.
+
+1. **The hub secrets were never set** — see the flagged block under "Start here" item 1. 33 failed spoke runs, zero successes.
+2. **Mothership's `watchdog.yml` is itself failing silently.** Its last two scheduled runs (2026-09-08, 2026-09-15) died on a GitHub API call authenticated with `GLOBAL_GITHUB_TOKEN`, with no open watchdog issue to show for it. `secrets-doctor` reports that token as *configured* — so it is present but not valid. The tool built because a bad token let `health-report.yml` fail silently is now failing silently on a bad token. That is open item 14.
+3. **TSO has never had a successful database backup.** `db-backup.yml` has run exactly once (2026-09-21) and failed; `BACKUP_DATABASE_URL` and `BACKUP_PASSPHRASE` are unset. Both were invisible to TSO's own `tools/doctor`, which checks three secrets while its workflows reference five — the exact drift that motivated deriving the list from the workflow files instead of hand-writing it.
+4. **TSO's `call-hub.yml` has stopped firing without failing.** `state: active`, definition unchanged since 2026-03-23, 2,157 runs, and **its last run was 2026-08-05** — six weeks dormant, no error, no signal. Nothing in the floor catches a schedule that simply stops. That is open item 15, and it is a genuine hole in check 3.
+5. **Argoloth's `DEPLOY_GUIDE.md` documented a deleted workflow**, and its `CLAUDE.md` claimed 139 tests across 7 files when the real numbers were 147 across 8. Both caught by check 6 on its first run; both fixed in Argoloth #13.
+
+**Three bugs the floor found in itself before anything else did**, recorded because the pattern matters more than the fixes: `doc-currency`'s directory walk skipped every dotfile, so it falsely reported a real `gas/.clasp.json.example` missing; `coverage-gaps` counted an import that appeared only as a *string fixture* inside a test as real coverage, which meant it could certify its own blind spot (fixed with a code-position scanner that skips comments and consumes strings whole); and `secrets-doctor`'s expected set was self-fulfilling until its own workflow was excluded from the reference scan, because that workflow's generated block necessarily names every secret it checks. The first was caught by a real false positive, the second by reading its own output, the third by a failing test.
+
+**Three CodeQL findings on `secrets-doctor`, and one of my own replies to them was wrong.** The first design passed `toJSON(secrets)`; the second indexed `secrets[matrix.secret]`. I initially defended the second on the grounds that no secret value reached any runner — **that was false**, and worth recording as the lesson: a *dynamic* index is unresolvable before dispatch, so the Actions service ships the job *every* secret, even though the step's environment shows only one. Only a static `${{ secrets.NAME != '' }}` is resolved up front. The shipped design is static references in a generated block, with a `--check` drift gate so the block cannot fall behind the workflows in either direction.
+
+---
+
 ## Open items, roughly in priority order
 
 | # | Item | Where | Status |
@@ -81,28 +128,34 @@ Grouped by what it changes for whoever reads this next.
 | 6 | Encrypt OAuth refresh tokens at rest, narrow Drive scope to `drive.file` | KOS, kos-personal | 🟡 **Half resolved (2026-09-19)** — tokens are now AES-256-GCM encrypted at rest (`src/token-crypto.js`, commit `c53ed41`), fail-closed on a missing key, with legacy plaintext rows still readable so deploy day locks nobody out. 17 tests. **The `drive` → `drive.file` scope narrowing is still open** and still needs a deliberate pass against a live deployed script. |
 | 7 | Fix `tools/doc-currency/check.js:100`'s exclusion-path bug (root-only match, not any-depth) | KOS | ✅ **Resolved (2026-09-19)** — `isExcludedDir()` extracted and fixed to match any path segment. 5 regression tests including the nested `node_modules` case and an `archived_old`-vs-`archived` false-positive guard. Commit `34657fa`. |
 | 8 | Backport the actionlint-ENOENT watchdog fix | Argoloth, Mothership | ✅ **Resolved (2026-09-14)** — Argoloth's copy fixed incidentally during unrelated feature work (commit `35beb6e`); Mothership's copy fixed deliberately in a scoped one-item sprint (commit `751f8e0`), with a new regression test covering the spawn-failure path. All four repos with this watchdog (KOS, Mothership, Argoloth, TSO) are now consistent. |
-| 9 | Bring ThinkOS-Server and Tais up to the same CI/CD floor as the other 4 repos | ThinkOS-Server, Tais | Not started — re-confirmed via a live `git ls-remote` (not a stale clone) on 2026-09-14 — see Pivot Ledger status table |
+| 9 | Bring the remaining repos up to the CI/CD floor | ThinkOS-Server | 🟡 **Moved and narrowed (2026-09-21)** — **Tais is out of scope permanently: it is archived.** The floor is now a written ten-check spec (`CICD_FLOOR.md`) and Mothership, Argoloth, KOS and TSO are at or near it. ThinkOS-Server is the only repo left: its check 10 sits in **PR #6, deliberately parked as a draft** at the owner's request, and checks 3, 4, 6 and 9 are unstarted. Its `doc-link-check`/`doc-placeholder-check` exist but are not the canonical copies. |
 | 10 | School Store Sales Log's unescaped `innerHTML` sink | KOS, leader-hub | Open, low severity (single-owner data only) — re-confirmed open 2026-09-14 |
 | 11 | Deploy the merged Mothership auth fix to the live Apps Script hub | Mothership | **Owner-only** — see "Start here" step 1. The fix is merged; the running deployment is not. |
 | 12 | Finish standing up the KOS inference service on Render | KOS | **Owner-only for the credentials** — see "Start here" step 2. `DATABASE_URL` is one dashboard click; the API keys are yours to supply. |
 | 13 | Make `setup_hub.py`'s embedded file copies regenerable | Mothership | ✅ **Resolved (2026-09-20)** — `scripts/sync-installer-copies.py` regenerates them; `--check` reports drift, a bare run repairs it. ci.yml now takes its file list from `--list` (the two lists drifting apart was its own latent bug) and names the fix command in its error. The escaping is never trusted: every literal is parsed back with `ast.literal_eval` and compared to its source bytes before being written, so the script can refuse but cannot silently corrupt the installer. Covered by `scripts/dev-test-sync-installer-copies.mjs`, which was itself sabotaged to confirm it fails against the corruption it guards. Commit `56132ab`. |
+| 14 | `GLOBAL_GITHUB_TOKEN` looks configured but invalid — the watchdog is failing silently on it | Mothership | **Owner-only.** `watchdog.yml`'s last two scheduled runs (2026-09-08, 2026-09-15) failed on a GitHub API call using it, with no watchdog issue opened. `secrets-doctor` confirms the secret is *set and non-empty*, so this is an expired or under-scoped value, not a missing one — the one failure mode check 10 explicitly cannot see. Rotate it. |
+| 15 | A scheduled workflow that stops firing produces no signal at all | TSO (found), all repos (class) | Open — TSO's `call-hub.yml` is `state: active`, unchanged since 2026-03-23, 2,157 runs, **last run 2026-08-05**. Six weeks dormant, silently. Check 3 (watchdog) asks whether the *last run* succeeded, which a workflow with no recent runs passes vacuously. Needs a staleness dimension: a `schedule:` workflow whose last run is older than its own cron interval is a finding. |
+| 16 | Remove TSO's superseded `tools/doctor/` | TSO | Open, low risk — floor check 10 now covers a strict superset (5 secrets vs 3, derived rather than hand-listed). Deliberately left in place during TSO #2054 so the two could be compared on real output; that comparison is done and check 10 won. **7 files reference `tools/doctor`**, so removal needs a `doc-currency` re-run in the same PR. |
+| 17 | Generalize the distributor so the floor stops being hand-copied | Mothership | Open — every floor script is byte-identical across repos today, but only because each copy was `diff`ed by hand. `scripts/sync-installer-copies.py` already solves this shape for `setup_hub.py`; generalizing it plus a `floor-drift` check would make divergence a red build instead of a thing someone notices. This is what keeps the floor a floor. |
 
-Items 2–4, 6, 7, and 10 are unchanged in substance from what Audit Docket II already recommends in more detail — that document is the source of truth for exact file:line citations, not this summary. Items 5 and 8 are the first two items on this list to actually close since it was written; see the 2026-09-14 update note at the top of this file for how each one closed.
+Items 2, 4, 6 and 10 are unchanged in substance from what Audit Docket II already recommends in more detail — that document is the source of truth for exact file:line citations, not this summary. Items 11–14 are **owner-only**: every one is a credential or a console click, not code. Items 15–17 came out of the 2026-09-21 floor work and are the only items on this list that are straightforwardly mine to pick up next.
 
 ---
 
 ## Repo state as of this handoff
 
-All local clones are clean and pushed, `main` branch, no uncommitted changes:
+**Updated 2026-09-21.** Everything this session touched is merged; one docs commit is pushed and unmerged.
 
-| Repo | Local path | HEAD | Sync |
-|---|---|---|---|
-| Mothership | `/home/user/Mothership` | `82e40c6` on `claude/mothership-docs-review-bpi391` | 9 ahead of `origin/main` (`c5f5413`), 0 behind — **pushed, no PR opened yet** |
-| KOS | `/home/user/kos` | `21d42a3` | matches `origin/main` |
-| Argoloth | `/home/user/argoloth` | `65d96e7` | matches `origin/main` |
-| TSO | *not cloned in this session* | — | Left alone deliberately — a concurrent Claude session was working TSO/Render at the time |
+| Repo | `main` | Open work from this session |
+|---|---|---|
+| Mothership | `1876b85` (#52 merged) | `claude/mothership-handoff-review-5k8plk` is **1 commit ahead, pushed, no PR opened** — `CICD_FLOOR.md`'s dispatch proof plus this handoff update. Open a PR or cherry-pick it; do not let it rot on the branch. |
+| Argoloth | `114e2c7` (#14 merged) | none |
+| KOS | `2fbc5a4` (#30 merged) | none |
+| TSO | `75498c9` (#2054 merged) | none |
+| ThinkOS-Server | — | **PR #6 open as a draft, parked at the owner's request.** Revive when asked; see open item 9. |
+| Tais | — | **Archived. Out of scope permanently** — do not re-add it to any floor status table. |
 
-All three present clones are clean, nothing uncommitted, everything pushed.
+Only Mothership is cloned locally in this session (`/home/user/Mothership`). The other four were worked entirely through the GitHub API, so there is no stale local clone to distrust for them — but the lesson below still applies the moment one is cloned.
 
 **Lesson learned the hard way this session: don't trust a local clone's HEAD without checking.** `git fetch origin main && git log HEAD..origin/main` before assuming a clone reflects reality, especially for any repo more than one session or tool touches — KOS's clone silently missed ~100 real commits with no symptom until a push got rejected.
 
