@@ -22,6 +22,15 @@ name: Deploy to Google Apps Script
 # Known, disclosed limitation: a pull_request from a fork doesn't receive
 # repository secrets, so a staging deploy only works for PRs from branches
 # within this same repository.
+#
+# Degrades to a clean, honest skip - not a red failure - until an operator
+# has actually provisioned the real infrastructure this depends on (the
+# Apps Script project, its two deployments, CLASPRC_JSON/GAS_SCRIPT_ID as
+# repository secrets): the first step checks for CLASPRC_JSON/GAS_SCRIPT_ID
+# and every later step is gated on that, rather than letting `clasp push`
+# fail against an empty/missing credential. Otherwise this workflow would
+# be permanently red on every single push/PR to this repo today, which
+# reflects nothing about whether the code change itself is good.
 
 on:
   push:
@@ -52,14 +61,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This CD pipeline needs real, operator-provisioned infrastructure
+      # (a live Apps Script project, two existing deployments, a clasp
+      # OAuth credential) that a fresh clone of this repo does not have -
+      # see README's "Alternative: Deploy Without Vercel" setup steps.
+      # Every step below is gated on this rather than letting `clasp push`
+      # fail on a missing/empty credential: until an operator has done that
+      # one-time setup and added the secrets, this job should report a
+      # clean, honest skip on every push/PR, not a perpetual red X that
+      # never reflects anything about the actual code change.
+      - name: Check required secrets are configured
+        id: configured
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          GAS_SCRIPT_ID: ${{ secrets.GAS_SCRIPT_ID }}
+        run: |
+          if [ -n "$CLASPRC_JSON" ] && [ -n "$GAS_SCRIPT_ID" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLASPRC_JSON and/or GAS_SCRIPT_ID are not configured yet - skipping the actual deploy. See README's Apps Script setup steps."
+          fi
+
       - uses: actions/setup-node@v4
+        if: steps.configured.outputs.ready == 'true'
         with:
           node-version: '20'
 
       - name: Install clasp
+        if: steps.configured.outputs.ready == 'true'
         run: npm install --global @google/clasp@latest
 
       - name: Restore clasp credentials
+        if: steps.configured.outputs.ready == 'true'
         env:
           CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
         run: |
@@ -68,6 +102,7 @@ jobs:
           echo "$CLASPRC_JSON" | base64 -d > "$HOME/.config/clasp/.clasprc.json"
 
       - name: Write .clasp.json for this run
+        if: steps.configured.outputs.ready == 'true'
         env:
           GAS_SCRIPT_ID: ${{ secrets.GAS_SCRIPT_ID }}
         run: |
@@ -83,6 +118,7 @@ jobs:
       # land on staging too, same as a real PR would - only a dispatch run
       # against main itself, or an actual push to main, is production.
       - name: Determine deploy target
+        if: steps.configured.outputs.ready == 'true'
         id: target
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ github.ref }}" != "refs/heads/main" ]; then
@@ -96,14 +132,17 @@ jobs:
           fi
 
       - name: Push source to the Apps Script project
+        if: steps.configured.outputs.ready == 'true'
         working-directory: gas
         run: clasp push --force
 
       - name: Update the target deployment in place
+        if: steps.configured.outputs.ready == 'true'
         working-directory: gas
         run: clasp deploy -i "${{ steps.target.outputs.deployment_id }}" -d "Deployed from ${{ github.sha }} (${{ steps.target.outputs.label }})"
 
       - name: Smoke test the deployment
+        if: steps.configured.outputs.ready == 'true'
         # No expected-commit check here - Apps Script's health response has
         # no commit field to compare against (see gas/Code.js's
         # renderHealthResponse comment), and scripts/smoke-test.js already
@@ -112,7 +151,7 @@ jobs:
         run: node scripts/smoke-test.js "${{ steps.target.outputs.web_app_url }}?endpoint=health"
 
       - name: Comment the staging URL on the PR
-        if: github.event_name == 'pull_request'
+        if: steps.configured.outputs.ready == 'true' && github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
