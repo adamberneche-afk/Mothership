@@ -21,7 +21,9 @@ compliant?" a question with an answer.
 ## The floor
 
 A compliant repo has all ten. Anything absent is either scaffolded or
-recorded below as a deliberate exemption with a reason.
+recorded below as a deliberate exemption with a reason. In the matrix, ❌
+means missing and ⛔ means exempt with a recorded reason — the difference
+between work outstanding and a decision already made.
 
 | # | Check | What it gates |
 |---|---|---|
@@ -105,6 +107,32 @@ Reusing that beats introducing a second mechanism alongside it.
    self-report-then-compare shape as `deploy-drift`, which already works in
    three repos.
 
+### Constraints a distributed artifact must satisfy
+
+Both were discovered by attempting the first shipment (Argoloth), not by
+design, and both are load-bearing rather than stylistic.
+
+1. **A script artifact is `.mjs`, never `.js`.** Mothership is
+   `"type": "module"`, so `.js` is already ESM here — but the same bytes
+   have to load in a repo that is not. Argoloth has a CommonJS root
+   `package.json` and CommonJS tests, where a `.js` file carrying `import`
+   fails to parse at all. `.mjs` is ESM regardless of the host
+   `package.json`, so one set of bytes runs in both kinds of repo.
+2. **A script artifact lives at `scripts/<name>.mjs`, and says so out
+   loud.** It computes the repo root as one level up, which is correct only
+   at that path — and wrong *quietly*, because a walk rooted in the wrong
+   directory finds nothing and prints "clean". Argoloth keeps its own
+   tooling at `tools/<name>/check.js`, one level deeper, where the root
+   would have resolved to `tools/`. Each script therefore asserts `.github/`
+   exists under its computed root and exits 2 if not, turning a vacuous
+   green into a loud refusal. The fixed path is also what lets `floor-drift`
+   know where to look.
+
+Harnesses are **not** floor artifacts and are not byte-identical: each repo
+tests in its own idiom (Mothership's `scripts/dev-test-*.mjs`, Argoloth's
+`tests/*.test.js` under `node --test`). The floor is the ten checks, not a
+test style.
+
 ### Why runtime config instead of templating
 
 The floor is not byte-identical by nature: `docs-check` watches different
@@ -133,18 +161,20 @@ grows a key each time a check is adopted. The shape:
 ```json
 {
   "floorVersion": "1",
-  "codeqlLanguages": ["actions", "javascript-typescript"],
-  "testCommand": "npm test",
-  "docsCheck": {
-    "watchedPaths": ["api/", "gas/", "dashboard/", ".github/workflows/"],
-    "requiredDocs": ["README.md"]
-  },
   "docExcludePaths": ["node_modules"],
   "docCurrency": { "excludeDirs": [], "exemptDocs": [], "codeExtensions": [], "knownAbsentPaths": {} },
   "coverageGaps": { "testFilePatterns": [], "testCommandGlobs": [], "exemptScripts": {} },
   "placeholderPatterns": []
 }
 ```
+
+**Only keys something reads today.** `codeqlLanguages`, `testCommand` and
+`docsCheck` were written into this file ahead of the code that would consume
+them, and removed once it was clear nothing did — the same mistake as
+`scheduledScriptDir`. Their designs are still described here (CodeQL's matrix
+job below, `docs-check` above); the key comes back in the change that adds
+the reader, not before. A key nobody reads is a key that eventually gets
+trusted wrongly.
 
 Every key is read defensively — a missing one degrades to a documented
 default rather than hard-failing the check. That matters because a spoke's
@@ -165,7 +195,7 @@ DoD above; the other four repos' columns are unchanged since that audit.
 
 | | Mothership | KOS | Argoloth | TSO | ThinkOS |
 |---|---|---|---|---|---|
-| 1 CodeQL | ✅ | ✅ | ❌ | ✅ | ✅ |
+| 1 CodeQL | ✅ | ✅ | ⛔ | ✅ | ✅ |
 | 2 Dependabot | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 3 watchdog | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 4 tests in CI | ✅ | ✅ | ✅ | ✅ | ❌ |
@@ -224,5 +254,34 @@ newly introduced by the floor work.
 
 ## Exemptions
 
-None recorded yet. An exemption names the repo, the check, and the reason;
-"not done yet" is not an exemption.
+An exemption names the repo, the check, and the reason; "not done yet" is not
+an exemption.
+
+### Argoloth — check 1 (CodeQL)
+
+**Exempt. Structurally cannot run, verified independently of the claim.**
+
+CodeQL was added to Argoloth and then deliberately removed in `8215271`,
+because code scanning is a repo-Settings gate, not a workflow setting:
+Argoloth is a **private** repo (confirmed via the API, `"private": true`),
+and this account's plan does not carry GitHub Advanced Security for private
+repos — Settings → Code security shows Dependency graph and Dependabot and
+no Code scanning section at all. There is no toggle to flip. The check had
+failed every run since it was added, always on the same
+"Code scanning is not enabled for this repository" wall.
+
+Removing it was right, and it is the floor's own
+**"graceful degradation, not perpetual red"** convention applied correctly:
+a check that can structurally never pass was sitting red forever and
+masking the two that matter (`test`, `check`) under it. The audit table
+below recorded Argoloth's ❌ without a reason, which is precisely the
+"decision or oversight?" ambiguity this document exists to end. It was a
+decision.
+
+**Restore condition:** making the repo public, or the account's plan gaining
+GHAS for private repos. The original file is in history — restoring it is a
+one-file `git checkout`, not a rebuild.
+
+Mothership by contrast is a public repo, which is why the identical check
+runs there for free. Nothing about this exemption generalizes to the other
+four repos; each private repo has to be checked on its own facts.

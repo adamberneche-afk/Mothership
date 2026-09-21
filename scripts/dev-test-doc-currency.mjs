@@ -1,4 +1,4 @@
-// Local verification harness for scripts/doc-currency.js (floor check 6 -
+// Local verification harness for scripts/doc-currency.mjs (floor check 6 -
 // see CICD_FLOOR.md). Adapted from TSO's tools/doc-currency test file to
 // this repo's plain check()-based harness convention.
 //
@@ -25,6 +25,7 @@
 import {
   IGNORE_MARKER,
   loadConfig,
+  repoRootLooksValid,
   stripIgnoredLines,
   isCheckableDoc,
   listDocFiles,
@@ -36,7 +37,7 @@ import {
   checkFunctionCitation,
   runDocCurrency,
   renderReport
-} from './doc-currency.js';
+} from './doc-currency.mjs';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join } from 'path';
@@ -418,11 +419,28 @@ function testThisRepoIsCurrent() {
   check('no stale citations in this repo', !result.hasFindings);
 }
 
+// A floor artifact is copied verbatim into other repos, so the one failure
+// it cannot have is computing the wrong repo root and then printing "clean"
+// about a tree it never walked. Pinned because the first shipment nearly
+// produced exactly that: the target spoke keeps its own tooling at
+// tools/<name>/check.js, one level deeper than the canonical
+// scripts/<name>.mjs, where ROOT would have resolved to tools/.
+function testRepoRootGuard() {
+  console.log('\nrepoRootLooksValid - refuses to answer for a tree that is not a repo');
+  check('this repo\'s real root passes', repoRootLooksValid() === true);
+  const notARepo = mkdtempSync(join(tmpdir(), 'floor-not-a-repo-'));
+  check('a directory with no .github/ fails', repoRootLooksValid(notARepo) === false);
+  mkdirSync(join(notARepo, '.github'));
+  check('the same directory passes once .github/ exists', repoRootLooksValid(notARepo) === true);
+  rmSync(notARepo, { recursive: true, force: true });
+}
+
 // --- main --------------------------------------------------------------
 
 function main() {
   console.log('doc-currency (floor check 6) - local verification\n');
 
+  testRepoRootGuard();
   testLoadConfigFallsBackWhenTheFileIsMissing();
   testLoadConfigFallsBackOnMalformedJson();
   testLoadConfigReadsTheDocCurrencyBlock();

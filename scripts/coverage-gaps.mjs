@@ -52,6 +52,14 @@
 // nobody happens to look; a dispatch-only tool fails in front of whoever
 // ran it.
 //
+//
+// WHY .mjs AND NOT .js. This repo is "type": "module", so .js here is
+// already ESM - but a floor artifact has to load unchanged in a repo that
+// is not. The first spoke it shipped to has a CommonJS root package.json
+// and CommonJS tests, where a .js file carrying `import` fails to parse at
+// all. The .mjs extension is ESM regardless of the host package.json, so
+// one set of bytes runs in both kinds of repo. That is the whole reason for
+// the extension, and it is load-bearing for distribution rather than style.
 // Per-repo settings come from .github/floor.json under `coverageGaps`, so
 // this file stays byte-identical in every repo the floor is distributed to -
 // see CICD_FLOOR.md's "why runtime config instead of templating" section.
@@ -85,6 +93,22 @@ export function loadConfig(configPath = FLOOR_CONFIG_PATH) {
     scriptExtensions: raw.scriptExtensions || ['.js', '.mjs', '.cjs'],
     exemptScripts: raw.exemptScripts || {}
   };
+}
+
+// A floor artifact reaches another repo by being copied verbatim, so the
+// one thing it must never do is guess wrong about where the repo root is
+// and then report a confident answer about a tree it never walked. ROOT is
+// "one level above this file", which is right at the canonical path
+// scripts/<name>.mjs and wrong anywhere else - and wrong QUIETLY, because a
+// walk rooted at the wrong directory finds nothing and prints "clean".
+// That is a vacuous green, the exact failure this floor exists to remove.
+//
+// Found while shipping this file to its first spoke, whose own tooling
+// lives at tools/<name>/check.js: at that depth ROOT would have resolved to
+// tools/ and the check would have passed by seeing almost nothing.
+// Asserting .github/ is present turns that silence into a loud refusal.
+export function repoRootLooksValid(root = ROOT) {
+  return existsSync(join(root, '.github'));
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +203,7 @@ export function findScheduledWorkflows(dir = join(ROOT, '.github', 'workflows'),
 // the repo root, so a predicate applied mid-recursion would be matching
 // against the wrong base - a quiet way to make the match narrower than it
 // reads. excludeDirs is the only thing that prunes, the same choice
-// doc-currency.js makes and for the same reason.
+// doc-currency.mjs makes and for the same reason.
 function walkAllFiles(dir, excludeDirs, results = []) {
   if (!existsSync(dir)) return results;
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -469,6 +493,14 @@ export function renderReport({ results, scheduledWorkflowsWithNoLocalScript, con
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
+  if (!repoRootLooksValid()) {
+    console.error(
+      `::error::coverage-gaps: computed repo root ${ROOT} contains no .github/ directory, so this is ` +
+        'probably not the repository root. This file belongs at <repo>/scripts/coverage-gaps.mjs - ' +
+        'see CICD_FLOOR.md. Refusing to report a result for a tree that may not be the repo.'
+    );
+    process.exit(2);
+  }
   const result = runCoverageGaps();
   console.log(process.argv.includes('--json') ? JSON.stringify(result, null, 2) : renderReport(result));
   process.exitCode = result.hasFindings ? 1 : 0;

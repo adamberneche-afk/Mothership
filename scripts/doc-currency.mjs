@@ -30,6 +30,14 @@
 // completely while leaving every existing claim in the doc stale. This asks
 // the other question.
 //
+//
+// WHY .mjs AND NOT .js. This repo is "type": "module", so .js here is
+// already ESM - but a floor artifact has to load unchanged in a repo that
+// is not. The first spoke it shipped to has a CommonJS root package.json
+// and CommonJS tests, where a .js file carrying `import` fails to parse at
+// all. The .mjs extension is ESM regardless of the host package.json, so
+// one set of bytes runs in both kinds of repo. That is the whole reason for
+// the extension, and it is load-bearing for distribution rather than style.
 // Per-repo settings (which directories to skip, which docs are exempt,
 // which extensions count as code) come from .github/floor.json, so this
 // file stays byte-identical in every repo the floor is distributed to -
@@ -59,6 +67,22 @@ export function loadConfig(configPath = FLOOR_CONFIG_PATH) {
     codeExtensions: new Set(raw.codeExtensions || ['.js', '.mjs', '.cjs', '.ts', '.py']),
     knownAbsentPaths: new Set(Object.keys(raw.knownAbsentPaths || {}))
   };
+}
+
+// A floor artifact reaches another repo by being copied verbatim, so the
+// one thing it must never do is guess wrong about where the repo root is
+// and then report a confident answer about a tree it never walked. ROOT is
+// "one level above this file", which is right at the canonical path
+// scripts/<name>.mjs and wrong anywhere else - and wrong QUIETLY, because a
+// walk rooted at the wrong directory finds nothing and prints "clean".
+// That is a vacuous green, the exact failure this floor exists to remove.
+//
+// Found while shipping this file to its first spoke, whose own tooling
+// lives at tools/<name>/check.js: at that depth ROOT would have resolved to
+// tools/ and the check would have passed by seeing almost nothing.
+// Asserting .github/ is present turns that silence into a loud refusal.
+export function repoRootLooksValid(root = ROOT) {
+  return existsSync(join(root, '.github'));
 }
 
 // A filename carrying a 4-digit year (POST_MORTEM_2026-09.md) is as strong
@@ -237,6 +261,14 @@ export function renderReport({ findings, hasFindings }) {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
+  if (!repoRootLooksValid()) {
+    console.error(
+      `::error::doc-currency: computed repo root ${ROOT} contains no .github/ directory, so this is ` +
+        'probably not the repository root. This file belongs at <repo>/scripts/doc-currency.mjs - ' +
+        'see CICD_FLOOR.md. Refusing to report a result for a tree that may not be the repo.'
+    );
+    process.exit(2);
+  }
   const result = runDocCurrency();
   console.log(process.argv.includes('--json') ? JSON.stringify(result, null, 2) : renderReport(result));
   process.exitCode = result.hasFindings ? 1 : 0;
