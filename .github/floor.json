@@ -1,11 +1,30 @@
 {
   "_comment": "Per-repo configuration for the portfolio CI/CD floor - see CICD_FLOOR.md. The floor's workflows and scripts are byte-identical in every repo; everything that legitimately differs between repos lives here instead, so a repo can change its own settings without regenerating anything and the installer's copies stay verifiably identical. A pull request CAN weaken its own checks by editing this file, which is why changes to it want the same review attention as a change to a workflow - the floor-drift check is what catches divergence that nobody approved. Every key here is read by something today: codeqlLanguages, testCommand and docsCheck were removed because nothing read them - they were written ahead of the code that would, the same way scheduledScriptDir was, and a key nobody reads is a key that eventually gets trusted wrongly. CICD_FLOOR.md still documents the design for each; add the key back in the change that adds the reader.",
   "floorVersion": "1",
-  "docExcludePaths": ["node_modules"],
+  "docExcludePaths": [
+    "node_modules"
+  ],
   "docCurrency": {
-    "excludeDirs": ["node_modules", ".git", "__pycache__", "dist", "build", "coverage"],
-    "exemptDocs": ["lessons.md", "hub_lessons.md", "session_handoff.md", "docs_vs_codebase.md"],
-    "codeExtensions": [".js", ".mjs", ".cjs", ".py"],
+    "excludeDirs": [
+      "node_modules",
+      ".git",
+      "__pycache__",
+      "dist",
+      "build",
+      "coverage"
+    ],
+    "exemptDocs": [
+      "lessons.md",
+      "hub_lessons.md",
+      "session_handoff.md",
+      "docs_vs_codebase.md"
+    ],
+    "codeExtensions": [
+      ".js",
+      ".mjs",
+      ".cjs",
+      ".py"
+    ],
     "knownAbsentPaths": {
       ".github/workflows/call-hub.yml": "a SPOKE's file, not the hub's - this repo documents it extensively because managing spokes is its whole job, and setup_spoke.py generates it. Cited on ~7 README lines and will keep growing, which is why this belongs here rather than as per-line markers.",
       "gas/.clasp.json": "gitignored by design - it carries a scriptId tied to one person's Google account. gas/.clasp.json.example is the checked-in template, and that one does resolve.",
@@ -13,18 +32,39 @@
     }
   },
   "coverageGaps": {
-    "excludeDirs": ["node_modules", ".git", "__pycache__", "dist", "build", "coverage"],
-    "testFilePatterns": ["**/*.test.js", "**/*.test.mjs", "scripts/dev-test-*.mjs"],
-    "testCommandGlobs": ["scripts/dev-test-*.mjs"],
-    "scriptExtensions": [".js", ".mjs", ".cjs"],
+    "excludeDirs": [
+      "node_modules",
+      ".git",
+      "__pycache__",
+      "dist",
+      "build",
+      "coverage"
+    ],
+    "testFilePatterns": [
+      "**/*.test.js",
+      "**/*.test.mjs",
+      "scripts/dev-test-*.mjs"
+    ],
+    "testCommandGlobs": [
+      "scripts/dev-test-*.mjs"
+    ],
+    "scriptExtensions": [
+      ".js",
+      ".mjs",
+      ".cjs"
+    ],
     "exemptScripts": {}
   },
   "doctor": {
     "optionalSecrets": {
       "AI_API_KEY": "normally lives only as a Vercel env var, not an Actions secret - an Actions runner cannot read Vercel's env either way, so its absence here is expected unless it has been deliberately mirrored. doctor.js's own AI check degrades to a clean skip for the same reason.",
       "AI_BASE_URL": "same as AI_API_KEY - a Vercel env var, mirrored to Actions only if someone chose to.",
+      "CLASPRC_JSON": "deploy-apps-script.yml gates every step that uses this behind its \"Check required secrets are configured\" step, which reports a clean skip when CLASPRC_JSON/GAS_SCRIPT_ID are unset - the floor's \"graceful degradation, not perpetual red\" convention. Absent until a real Apps Script deployment exists, and harmless until then.",
+      "GAS_PROD_DEPLOYMENT_ID": "deploy-apps-script.yml gates every step that uses this behind its \"Check required secrets are configured\" step, which reports a clean skip when CLASPRC_JSON/GAS_SCRIPT_ID are unset - the floor's \"graceful degradation, not perpetual red\" convention. Absent until a real Apps Script deployment exists, and harmless until then.",
+      "GAS_SCRIPT_ID": "deploy-apps-script.yml gates every step that uses this behind its \"Check required secrets are configured\" step, which reports a clean skip when CLASPRC_JSON/GAS_SCRIPT_ID are unset - the floor's \"graceful degradation, not perpetual red\" convention. Absent until a real Apps Script deployment exists, and harmless until then.",
       "GAS_STAGING_DEPLOYMENT_ID": "deploy-apps-script.yml treats the staging deployment as optional and reports a clean skip without it - see that workflow's secrets gate.",
-      "GAS_STAGING_WEB_APP_URL": "same as GAS_STAGING_DEPLOYMENT_ID - only needed once a staging deployment exists."
+      "GAS_STAGING_WEB_APP_URL": "same as GAS_STAGING_DEPLOYMENT_ID - only needed once a staging deployment exists.",
+      "GAS_WEB_APP_URL": "deploy-apps-script.yml gates every step that uses this behind its \"Check required secrets are configured\" step, which reports a clean skip when CLASPRC_JSON/GAS_SCRIPT_ID are unset - the floor's \"graceful degradation, not perpetual red\" convention. Absent until a real Apps Script deployment exists, and harmless until then."
     }
   },
   "placeholderPatterns": [
