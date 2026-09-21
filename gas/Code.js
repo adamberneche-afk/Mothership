@@ -29,9 +29,24 @@ function doGet(e) {
   if (endpoint === 'settings') {
     return renderSettingsPage((e && e.parameter && e.parameter.token) || '');
   }
+  if (endpoint === 'health') {
+    return renderHealthResponse();
+  }
   return HtmlService.createHtmlOutput(
     '<!doctype html><html><body><p>Mothership hub webhook endpoint. POST requests only.</p></body></html>'
   );
+}
+
+// Minimal liveness endpoint for scripts/smoke-test.js to hit right after a
+// CD deploy - zero PropertiesService/UrlFetchApp/GitHub/AI calls,
+// deliberately, so it can't itself be the thing that's broken. Doesn't
+// carry a deployed-commit identifier - clasp/Apps Script has no equivalent
+// automatic value to read (a real platform difference, not an oversight);
+// the smoke test that hits this only ever checks `status === 'ok'`.
+function renderHealthResponse() {
+  return ContentService
+    .createTextOutput(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 function doPost(e) {
