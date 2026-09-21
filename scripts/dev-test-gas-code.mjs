@@ -81,6 +81,17 @@ function makeFakeContentService() {
   };
 }
 
+// Only doGet's plain-info-page fallback needs this - the real HtmlService
+// API is much larger, but nothing here exercises more than
+// createHtmlOutput(text).
+function makeFakeHtmlService() {
+  return {
+    createHtmlOutput(text) {
+      return { _text: text };
+    }
+  };
+}
+
 function makeFakeUtilities() {
   return {
     Charset: { UTF_8: 'UTF-8' },
@@ -111,6 +122,7 @@ function loadCodeWithFakes({ props = {}, aiJsonContent = NO_FINDING_JSON, github
     UrlFetchApp: urlFetchApp,
     PropertiesService: makeFakePropertiesService(props),
     ContentService: makeFakeContentService(),
+    HtmlService: makeFakeHtmlService(),
     Utilities: makeFakeUtilities(),
     SpreadsheetApp: trackedSpreadsheetApp,
     Logger: { log: () => {} }
@@ -206,12 +218,33 @@ function testConfigIsReadFromScriptPropertiesNotHardcoded() {
   check('a real row landed in the ReviewQueue tab of that spreadsheet', reviewQueue.getSheetByName('ReviewQueue')?._rows?.length === 2); // header + 1 row
 }
 
+function testHealthEndpointRespondsOkWithNoOtherCallsAtAll() {
+  console.log('doGet(?endpoint=health) responds { status: "ok" } without touching GitHub, the AI, PropertiesService config, or the spreadsheet - it cannot itself be the thing that is broken');
+  const { context, urlFetchApp } = loadCodeWithFakes({ props: {} });
+  const e = { parameter: { endpoint: 'health' } };
+  const output = context.doGet(e);
+  const body = JSON.parse(output._text);
+  check('status is ok', body.status === 'ok');
+  check('a timestamp is present', typeof body.timestamp === 'string' && body.timestamp.length > 0);
+  check('mime type is set to JSON', output._mimeType === 'JSON');
+  check('no UrlFetchApp call was made - GitHub/AI reachability is not what this checks', urlFetchApp.calls.length === 0);
+}
+
+function testGetWithNoRecognizedEndpointStillReturnsAPlainInfoPage() {
+  console.log('doGet with no endpoint (or an unrecognized one) still falls through to the plain info page, unaffected by the new health route');
+  const { context } = loadCodeWithFakes({ props: {} });
+  const output = context.doGet({ parameter: {} });
+  check('returns the generic HtmlService page, not JSON', typeof output._text === 'string' && output._text.includes('webhook endpoint'));
+}
+
 function main() {
   testDefaultsToAutonomousAgentWhenNoEndpointGiven();
   testExplicitEndpointRoutesToRecursiveLearning();
   testResponseBodyCarriesHttpStatusSinceApsScriptCannotSetARealOne();
   testMissingPostDataDoesNotThrow();
   testConfigIsReadFromScriptPropertiesNotHardcoded();
+  testHealthEndpointRespondsOkWithNoOtherCallsAtAll();
+  testGetWithNoRecognizedEndpointStillReturnsAPlainInfoPage();
 
   console.log('');
   if (failures > 0) {
