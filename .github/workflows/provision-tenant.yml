@@ -49,6 +49,11 @@ on:
 jobs:
   provision-tenant:
     runs-on: ubuntu-latest
+    # contents: write - this job commits and pushes tenants.json/spokes.json
+    # itself (see the header comment above); nothing else here needs any
+    # other permission, so GITHUB_TOKEN is scoped no wider than that.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 

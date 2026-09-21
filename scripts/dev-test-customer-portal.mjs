@@ -160,7 +160,15 @@ async function testMatchingEmailSendsAPortalLinkButResponseIsGeneric() {
   const sendEmailImpl = makeFakeSendEmail();
   const result = await handleRequestPortalLink({ email: 'real@customer.com' }, { stripeClient, sendEmailImpl, dashboardBaseUrl: 'https://mothership.example', rateLimitState: new Map() });
   check('an email was sent', sendEmailImpl.calls.length === 1 && sendEmailImpl.calls[0].to === 'real@customer.com');
-  check('the email contains the real portal link', sendEmailImpl.calls[0].html.includes('https://billing.stripe.com/p/match'));
+  // Exact href-attribute match, not a loose substring check - the URL is
+  // caller-controlled test fixture data, not attacker input, but a bare
+  // `.includes(url)` is still the wrong tool: it would also "pass" for a
+  // spoofed URL that merely contains this one as a substring elsewhere in
+  // its own host/path/query (CodeQL flags this exact pattern as
+  // incomplete-url-substring-sanitization). Extracting and comparing the
+  // real href value is both more precise and a stronger assertion.
+  const hrefMatch = sendEmailImpl.calls[0].html.match(/href="([^"]+)"/);
+  check('the email contains the real portal link', hrefMatch !== null && hrefMatch[1] === 'https://billing.stripe.com/p/match');
   check('the response has the generic status', result.status === 'Requested');
   return result;
 }
