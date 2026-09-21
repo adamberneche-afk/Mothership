@@ -24,14 +24,19 @@ import {
   extractSecretReferences,
   listWorkflowFiles,
   collectReferencedSecrets,
-  CONTROL_SECRET,
-  buildProbePlan,
-  renderPlan,
-  probeSecret,
-  renderProbe,
-  probeFailed
+  BLOCK_BEGIN,
+  BLOCK_END,
+  envVarNameFor,
+  renderEnvBlock,
+  parseWiredSecrets,
+  expectedSecrets,
+  diffWiring,
+  syncWorkflow,
+  judgeSecret,
+  runSecretsDoctor,
+  renderReport
 } from './secrets-doctor.mjs';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -164,123 +169,198 @@ function testCollectReferencedSecrets() {
   rmSync(dir, { recursive: true, force: true });
 }
 
-// --- buildProbePlan ----------------------------------------------------
+// --- the generated env block ------------------------------------------
 
-function testBuildProbePlan() {
-  console.log('\nbuildProbePlan - what to probe, derived from the workflows');
-  const dir = makeWorkflows({
-    'a.yml': '${{ secrets.TOKEN_B }}\n${{ secrets.TOKEN_A }}',
-    'b.yml': '${{ secrets.GITHUB_TOKEN }}'
-  });
-  const plan = buildProbePlan(dir, testConfig());
-  check('the control leg comes first', plan.matrix[0] === CONTROL_SECRET);
-  check('referenced secrets follow, sorted', plan.matrix.slice(1).join() === 'TOKEN_A,TOKEN_B');
+function testRenderEnvBlock() {
+  console.log('\nrenderEnvBlock - static references only');
+  const block = renderEnvBlock(['TOKEN_A', 'TOKEN_B']);
+  check('carries the begin marker', block.includes(BLOCK_BEGIN));
+  check('carries the end marker', block.includes(BLOCK_END));
+  check('one env var per secret', block.includes('CONFIGURED_TOKEN_A:') && block.includes('CONFIGURED_TOKEN_B:'));
   check(
-    'GITHUB_TOKEN appears once - as the control, not also as a referenced secret',
-    plan.matrix.filter((n) => n === CONTROL_SECRET).length === 1
+    'each reference is STATIC - the whole point, since a dynamic index makes Actions ship every secret',
+    block.includes("secrets.TOKEN_A != ''") && block.includes("secrets.TOKEN_B != ''")
   );
-  check('the plan carries which workflow needs each', plan.referenced.get('TOKEN_A').join() === 'a.yml');
-  check('and how many workflows it scanned', plan.workflowFiles.length === 2);
-
-  const optional = buildProbePlan(dir, testConfig({ optionalSecrets: { TOKEN_A: 'why' } }));
-  check('optional names are identified for the plan output', optional.optionalNames.join() === 'TOKEN_A');
-  rmSync(dir, { recursive: true, force: true });
+  check('no dynamic index appears anywhere', !/secrets\[/.test(block));
+  check('the comparison is inside the expression, so only a boolean lands in env', !/\$\{\{\s*secrets\.[A-Z_]+\s*\}\}/.test(block));
+  check('an empty list still produces a valid block', renderEnvBlock([]).includes('No workflow in this repo references a secret'));
 }
 
-function testPlanIsNeverEmptyAndNeverSilent() {
-  console.log('\nbuildProbePlan - a repo with nothing to probe still runs the control');
-  const empty = makeWorkflows({ 'a.yml': 'name: X\non: push\n' });
-  const plan = buildProbePlan(empty, testConfig());
-  check('the matrix is never empty, so the probe job is never skipped', plan.matrix.length === 1);
-  check('and the plan says so rather than looking like success', renderPlan(plan).includes('Only the control leg will run'));
-  rmSync(empty, { recursive: true, force: true });
-
-  // No workflow files at all means the scan covered nothing, which is not
-  // the same as finding nothing wrong.
-  const none = makeWorkflows({});
+function testParseWiredSecrets() {
+  console.log('\nparseWiredSecrets - reads back what the workflow actually wires');
+  const wf = `jobs:\n  x:\n    steps:\n      - env:\n${renderEnvBlock(['A', 'B'])}\n        run: node x\n`;
+  check('round-trips the generated block', parseWiredSecrets(wf).sort().join() === 'A,B');
+  check('a workflow with no block yields null, not an empty list', parseWiredSecrets('jobs:\n  x:\n') === null);
   check(
-    'no workflow files is reported as an ::error::',
-    renderPlan(buildProbePlan(none, testConfig())).includes('::error::No workflow files found')
-  );
-  rmSync(none, { recursive: true, force: true });
-}
-
-// --- probeSecret -------------------------------------------------------
-
-function testProbeVerdicts() {
-  console.log('\nprobeSecret - one secret, one verdict');
-  const dir = makeWorkflows({ 'deploy.yml': '${{ secrets.NEEDED }}\n${{ secrets.MAYBE }}' });
-  const config = testConfig({ optionalSecrets: { MAYBE: 'only once staging exists' } });
-
-  const present = probeSecret({ name: 'NEEDED', configuredRaw: 'true', config, workflowsDir: dir });
-  check('configured -> present', present.status === 'present');
-  check('and passes', !probeFailed(present));
-  check('the detail names the workflow that needs it', present.detail.includes('deploy.yml'));
-  check('and discloses that the value is not checked', present.detail.includes('the value itself is not checked'));
-
-  const missing = probeSecret({ name: 'NEEDED', configuredRaw: 'false', config, workflowsDir: dir });
-  check('not configured, not declared optional -> missing', missing.status === 'missing');
-  check('and fails', probeFailed(missing));
-  check('the report emits ::error:: naming it', renderProbe(missing).includes('::error::NEEDED'));
-  check('and points at the remedy', renderProbe(missing).includes('doctor.optionalSecrets'));
-
-  const optional = probeSecret({ name: 'MAYBE', configuredRaw: 'false', config, workflowsDir: dir });
-  check('not configured but declared optional -> optional-missing', optional.status === 'optional-missing');
-  check('and does NOT fail', !probeFailed(optional));
-  check('the declared reason is carried through', optional.detail.includes('only once staging exists'));
-  check(
-    'and WITHOUT the declaration the same input fails',
-    probeFailed(probeSecret({ name: 'MAYBE', configuredRaw: 'false', config: testConfig(), workflowsDir: dir }))
-  );
-  rmSync(dir, { recursive: true, force: true });
-}
-
-// The control leg is the anti-vacuity guard for the whole mechanism: if
-// `secrets[matrix.secret]` ever stops resolving, every leg reports missing,
-// which looks identical to a repo that lost all its credentials at once.
-function testControlLeg() {
-  console.log('\nprobeSecret - the control leg distinguishes a broken mechanism from a real gap');
-  const ok = probeSecret({ name: CONTROL_SECRET, configuredRaw: 'true', config: testConfig() });
-  check('control configured -> control-ok', ok.status === 'control-ok');
-  check('and passes', !probeFailed(ok));
-
-  const broken = probeSecret({ name: CONTROL_SECRET, configuredRaw: 'false', config: testConfig() });
-  check('control NOT configured -> broken, not missing', broken.status === 'broken');
-  check('and fails', probeFailed(broken));
-  check('it says the mechanism is at fault, not the secrets', broken.detail.includes('Fix the workflow, not the secrets'));
-  check(
-    'and it cannot be silenced by an optionalSecrets entry',
-    probeSecret({
-      name: CONTROL_SECRET,
-      configuredRaw: 'false',
-      config: testConfig({ optionalSecrets: { [CONTROL_SECRET]: 'try to mute the control' } })
-    }).status === 'broken'
+    'a CONFIGURED_ var OUTSIDE the block is not counted - only the generated region is authoritative',
+    parseWiredSecrets(`CONFIGURED_OUTSIDE: x\n${renderEnvBlock(['A'])}`).join() === 'A'
   );
 }
 
-// An unreadable probe input must never be read as "configured" - that is
-// the one wrong answer that turns this check into a rubber stamp.
-function testUnreadableProbeIsAFailure() {
-  console.log('\nprobeSecret - an unreadable input fails closed');
-  for (const raw of [undefined, '', 'TRUE', 'yes', '1', 'null']) {
-    const r = probeSecret({ name: 'X', configuredRaw: raw, config: testConfig() });
-    check(`SECRET_CONFIGURED=${JSON.stringify(raw)} -> broken`, r.status === 'broken' && probeFailed(r));
+function testDiffWiring() {
+  console.log('\ndiffWiring');
+  check('in sync', diffWiring(['A', 'B'], ['B', 'A']).inSync === true);
+  const missing = diffWiring(['A', 'B'], ['A']);
+  check('a newly referenced secret shows as missing', missing.missing.join() === 'B');
+  check('and is not in sync', missing.inSync === false);
+  const stale = diffWiring(['A'], ['A', 'OLD']);
+  check('a no-longer-referenced secret shows as stale', stale.stale.join() === 'OLD');
+  check('and is not in sync', stale.inSync === false);
+  check('a null wiring (no block at all) is never in sync', diffWiring([], null).inSync === false);
+}
+
+function testSyncWorkflow() {
+  console.log('\nsyncWorkflow - regenerates the block in place');
+  const before = `prefix\n${renderEnvBlock(['OLD'])}\nsuffix\n`;
+  const after = syncWorkflow(before, ['NEW_A', 'NEW_B']);
+  check('the old entry is gone', !after.includes('CONFIGURED_OLD'));
+  check('the new entries are present', after.includes('CONFIGURED_NEW_A') && after.includes('CONFIGURED_NEW_B'));
+  check('surrounding content is untouched', after.startsWith('prefix\n') && after.endsWith('suffix\n'));
+  check('and it round-trips through the parser', parseWiredSecrets(after).sort().join() === 'NEW_A,NEW_B');
+  check('syncing twice is idempotent', syncWorkflow(after, ['NEW_A', 'NEW_B']) === after);
+
+  let threw = false;
+  try {
+    syncWorkflow('no markers here', ['A']);
+  } catch (e) {
+    threw = true;
   }
-  const noName = probeSecret({ name: undefined, configuredRaw: 'true', config: testConfig() });
-  check('a probe with no secret name -> broken', noName.status === 'broken' && probeFailed(noName));
-  check('and renders without throwing on the missing name', renderProbe(noName).includes('(no name)'));
+  check('a workflow with no markers throws rather than silently writing nothing', threw);
 }
 
-function testNoValueIsEverHandled() {
-  console.log('\nprobeSecret - the contract: no code path receives a secret value');
-  // The workflow collapses the secret to a boolean inside the expression,
-  // so there is no value for this script to hold. This pins the shape:
-  // the only secret-derived input is the true/false string, and nothing
-  // the script returns carries a value field.
-  const r = probeSecret({ name: 'TOKEN', configuredRaw: 'true', config: testConfig() });
-  check('the verdict carries no value field', !('value' in r));
-  check('the verdict carries only name, status and detail', Object.keys(r).sort().join() === 'detail,name,status');
-  check('and the rendered line is name plus prose only', renderProbe(r) === `  ok   TOKEN - ${r.detail}`);
+// --- judgeSecret -------------------------------------------------------
+
+function testJudgeSecret() {
+  console.log('\njudgeSecret - one secret, one verdict');
+  const config = testConfig({ optionalSecrets: { MAYBE: 'only once staging exists' } });
+  check('true -> present', judgeSecret('A', 'true', config).status === 'present');
+  check('and discloses the value is unchecked', judgeSecret('A', 'true', config).detail.includes('the value itself is not checked'));
+  check('false, not declared optional -> missing', judgeSecret('A', 'false', config).status === 'missing');
+  check('false, declared optional -> optional-missing', judgeSecret('MAYBE', 'false', config).status === 'optional-missing');
+  check('the declared reason is carried through', judgeSecret('MAYBE', 'false', config).detail.includes('only once staging exists'));
+  check('the verdict carries no value field', !('value' in judgeSecret('A', 'true', config)));
+}
+
+// An unreadable input must never read as "configured" - that is the one
+// wrong answer that would turn this check into a rubber stamp.
+function testUnreadableInputFailsClosed() {
+  console.log('\njudgeSecret - an unreadable input fails closed');
+  for (const raw of [undefined, '', 'TRUE', 'True', 'yes', '1', 'null', 'false ']) {
+    const r = judgeSecret('A', raw, testConfig());
+    check(`${envVarNameFor('A')}=${JSON.stringify(raw)} -> broken`, r.status === 'broken');
+  }
+  check(
+    'and an optionalSecrets entry cannot silence a broken probe',
+    judgeSecret('A', 'garbage', testConfig({ optionalSecrets: { A: 'try to mute it' } })).status === 'broken'
+  );
+}
+
+// --- runSecretsDoctor, end to end -------------------------------------
+
+function scratchRepo(workflows, wiredSecrets) {
+  const dir = makeWorkflows({
+    ...workflows,
+    'secrets-doctor.yml': `jobs:\n  d:\n    steps:\n      - env:\n${renderEnvBlock(wiredSecrets)}\n        run: node x\n`
+  });
+  return dir;
+}
+
+function testEndToEndGreen() {
+  console.log('\nrunSecretsDoctor - everything referenced, wired and configured');
+  const dir = scratchRepo({ 'a.yml': "${{ secrets.TOKEN_A }}" }, ['TOKEN_A']);
+  const r = runSecretsDoctor({
+    config: testConfig(),
+    workflowsDir: dir,
+    workflowFile: join(dir, 'secrets-doctor.yml'),
+    env: { CONFIGURED_TOKEN_A: 'true' }
+  });
+  check('no findings', r.hasFindings === false);
+  check('no problems', r.problems.length === 0);
+  check('the secret is reported present', r.checks[0].status === 'present');
+  rmSync(dir, { recursive: true, force: true });
+}
+
+function testEndToEndMissingSecret() {
+  console.log('\nrunSecretsDoctor - a wired secret that is not configured goes red');
+  const dir = scratchRepo({ 'a.yml': "${{ secrets.TOKEN_A }}" }, ['TOKEN_A']);
+  const r = runSecretsDoctor({
+    config: testConfig(),
+    workflowsDir: dir,
+    workflowFile: join(dir, 'secrets-doctor.yml'),
+    env: { CONFIGURED_TOKEN_A: 'false' }
+  });
+  check('hasFindings', r.hasFindings === true);
+  check('reported missing', r.checks[0].status === 'missing');
+  check('the report emits ::error::', renderReport(r).includes('::error::TOKEN_A'));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// The failure mode the generate-then-verify shape exists to remove: a
+// workflow starts needing a secret and the doctor never learns about it.
+// TSO's hand-written doctor is in exactly this state for two secrets.
+function testUnwiredSecretIsNotSilentlySkipped() {
+  console.log('\nrunSecretsDoctor - a referenced-but-unwired secret is a finding, not a silent skip');
+  const dir = scratchRepo({ 'a.yml': "${{ secrets.WIRED }}\n${{ secrets.FORGOTTEN }}" }, ['WIRED']);
+  const r = runSecretsDoctor({
+    config: testConfig(),
+    workflowsDir: dir,
+    workflowFile: join(dir, 'secrets-doctor.yml'),
+    env: { CONFIGURED_WIRED: 'true' }
+  });
+  check('hasFindings even though every WIRED secret is configured', r.hasFindings === true);
+  check('the unwired one is named', r.problems.some((p) => p.includes('FORGOTTEN')));
+  check('and it says it was NOT checked', r.problems.some((p) => p.includes('NOT checked')));
+  check('and points at --sync', r.problems.some((p) => p.includes('--sync')));
+  check('the wired one still reports present', r.checks.find((c) => c.name === 'WIRED').status === 'present');
+  rmSync(dir, { recursive: true, force: true });
+}
+
+function testStaleWiringIsAFinding() {
+  console.log('\nrunSecretsDoctor - a wired secret no workflow references any more is a finding');
+  const dir = scratchRepo({ 'a.yml': "${{ secrets.STILL_USED }}" }, ['STILL_USED', 'REMOVED_LAST_MONTH']);
+  const r = runSecretsDoctor({
+    config: testConfig(),
+    workflowsDir: dir,
+    workflowFile: join(dir, 'secrets-doctor.yml'),
+    env: { CONFIGURED_STILL_USED: 'true', CONFIGURED_REMOVED_LAST_MONTH: 'false' }
+  });
+  check('hasFindings', r.hasFindings === true);
+  check('the stale entry is named', r.problems.some((p) => p.includes('REMOVED_LAST_MONTH')));
+  check(
+    'and it is NOT also reported as a missing secret - that would be two findings for one cause',
+    !r.checks.some((c) => c.name === 'REMOVED_LAST_MONTH')
+  );
+  rmSync(dir, { recursive: true, force: true });
+}
+
+function testVacuousRunsAreFailures() {
+  console.log('\nrunSecretsDoctor - a run that checked nothing is a failure, not a pass');
+  const noBlock = makeWorkflows({ 'a.yml': "${{ secrets.TOKEN }}", 'secrets-doctor.yml': 'jobs:\n  d:\n' });
+  const r1 = runSecretsDoctor({
+    config: testConfig(),
+    workflowsDir: noBlock,
+    workflowFile: join(noBlock, 'secrets-doctor.yml'),
+    env: {}
+  });
+  check('no generated block -> hasFindings', r1.hasFindings === true);
+  check('and it says there is nothing to read verdicts from', r1.problems.some((p) => p.includes('no generated env block')));
+  rmSync(noBlock, { recursive: true, force: true });
+
+  const none = scratchRepo({}, []);
+  // Only secrets-doctor.yml itself exists, so there IS a workflow file -
+  // the interesting empty case is no files at all.
+  rmSync(none, { recursive: true, force: true });
+
+  const empty = makeWorkflows({});
+  const r2 = runSecretsDoctor({
+    config: testConfig(),
+    workflowsDir: empty,
+    workflowFile: join(empty, 'nope.yml'),
+    env: {}
+  });
+  check('no workflow files -> hasFindings', r2.hasFindings === true);
+  check('and it says the scan covered nothing', r2.problems.some((p) => p.includes('scanned nothing')));
+  rmSync(empty, { recursive: true, force: true });
 }
 
 // --- the one test against the real repo --------------------------------
@@ -293,19 +373,37 @@ function testThisRepoPlansNonVacuously() {
   // control - which is also why check 10's planted-violation proof is a
   // post-merge dispatch rather than something this file can stand in for.
   const config = loadConfig();
-  const plan = buildProbePlan(ROOT_WORKFLOWS, config);
-  check(`scanned this repo's workflows (${plan.workflowFiles.length})`, plan.workflowFiles.length > 5);
-  check(`derived real secrets to probe (${plan.matrix.length - 1})`, plan.matrix.length - 1 > 5);
-  check('the control leg is present', plan.matrix[0] === CONTROL_SECRET);
+  const expected = expectedSecrets(ROOT_WORKFLOWS, config);
+  check(`derived real secrets from this repo's workflows (${expected.length})`, expected.length > 5);
   check(
     'GLOBAL_GITHUB_TOKEN is among them - the credential whose silent invalidity started all this',
-    plan.matrix.includes('GLOBAL_GITHUB_TOKEN')
+    expected.includes('GLOBAL_GITHUB_TOKEN')
   );
   check(
     'every optionalSecrets entry in floor.json is actually referenced by some workflow',
-    Object.keys(config.optionalSecrets).every((n) => plan.matrix.includes(n))
+    Object.keys(config.optionalSecrets).every((n) => expected.includes(n))
   );
-  check('no phantom secret named X or outputs (the KOS false positives)', !plan.matrix.includes('X') && !plan.matrix.includes('outputs'));
+  check('no phantom secret named X or outputs (the KOS false positives)', !expected.includes('X') && !expected.includes('outputs'));
+
+  // THE DRIFT GATE. This is the assertion that makes the generated list
+  // trustworthy: it fails the suite, on every pull request, the moment a
+  // workflow starts referencing a secret secrets-doctor.yml does not wire.
+  // Without it the generated block is just a hand-written list with extra
+  // steps, which is the state TSO's doctor is in.
+  const selfPath = join(ROOT_WORKFLOWS, 'secrets-doctor.yml');
+  const wiring = diffWiring(expected, parseWiredSecrets(readFileSync(selfPath, 'utf8')));
+  if (!wiring.inSync) {
+    console.error(`  missing from secrets-doctor.yml: ${wiring.missing.join(', ') || '(none)'}`);
+    console.error(`  stale in secrets-doctor.yml:    ${wiring.stale.join(', ') || '(none)'}`);
+    console.error('  fix with: node scripts/secrets-doctor.mjs --sync');
+  }
+  check("secrets-doctor.yml wires exactly what this repo's workflows reference", wiring.inSync);
+
+  // And the file must contain no dynamic index, which is what CodeQL
+  // flagged twice - a regression here is a security regression.
+  const selfSource = readFileSync(selfPath, 'utf8');
+  check('secrets-doctor.yml uses no dynamic secrets index', !/secrets\[/.test(selfSource));
+  check('and does not pass the whole secrets context', !/toJSON\(\s*secrets\s*\)/.test(selfSource));
 }
 
 // --- main ---------------------------------------------------------------
@@ -319,12 +417,17 @@ function main() {
   testExtractSecretReferences();
   testExtractorFalsePositives();
   testCollectReferencedSecrets();
-  testBuildProbePlan();
-  testPlanIsNeverEmptyAndNeverSilent();
-  testProbeVerdicts();
-  testControlLeg();
-  testUnreadableProbeIsAFailure();
-  testNoValueIsEverHandled();
+  testRenderEnvBlock();
+  testParseWiredSecrets();
+  testDiffWiring();
+  testSyncWorkflow();
+  testJudgeSecret();
+  testUnreadableInputFailsClosed();
+  testEndToEndGreen();
+  testEndToEndMissingSecret();
+  testUnwiredSecretIsNotSilentlySkipped();
+  testStaleWiringIsAFinding();
+  testVacuousRunsAreFailures();
   testThisRepoPlansNonVacuously();
 
   console.log('');

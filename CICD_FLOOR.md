@@ -36,7 +36,7 @@ between work outstanding and a decision already made.
 | 7 | **doc-link-check** | No dead relative links between Markdown files. |
 | 8 | **doc-placeholder-check** | No unedited template text (`[Your Company Name]`, lorem ipsum). A line carrying a `floor-allow-placeholder` marker is skipped — for docs that describe the check and therefore must contain its patterns. <!-- floor-allow-placeholder: this row documents the patterns --> |
 | 9 | **coverage-gaps** | Every scheduled job's script has test coverage CI can actually reach. Distinguishes "no test exists" from "a real test exists that `npm test` never runs" — the second is the one that reads green. A scheduled workflow invoking no local script is named in the report rather than silently dropped. |
-| 10 | **secrets-doctor** | Dispatch-only pre-flight that every secret the repo's workflows reference is configured and non-empty. The expected set is **derived from the workflow files**, never written down, and no secret value ever reaches a runner — see below. |
+| 10 | **secrets-doctor** | Dispatch-only pre-flight that every secret the repo's workflows reference is configured and non-empty, using **static** references so a job receives only the secret it names. Its list is generated from the workflow files and drift-gated on every PR — see below. |
 
 ### Conventions that come with them
 
@@ -140,45 +140,50 @@ tests in its own idiom (Mothership's `scripts/dev-test-*.mjs`, Argoloth's
 `tests/*.test.js` under `node --test`). The floor is the ten checks, not a
 test style.
 
-### How `secrets-doctor` checks a secret without ever holding one
+### How `secrets-doctor` checks a secret, and why its list is generated
 
-Worth writing down, because the obvious implementation is the wrong one and
-CodeQL caught it.
+Worth writing down, because the two designs that look right are both wrong
+and CodeQL caught each of them.
 
 GitHub gives a repo **no way to list its own secrets**. The REST endpoint
 needs a PAT, and `GITHUB_TOKEN` has no permission scope that covers it —
-there is no `secrets:` key in a workflow's `permissions` block. The only
-enumerable thing is the `secrets` context, as JSON, which carries **values**.
+there is no `secrets:` key in a workflow's `permissions` block.
 
-The first revision did exactly that and reduced it to names with `jq`.
-CodeQL's `js/excessive-secrets-exposure` rule flagged it on the PR that
-introduced it: every organization and repository secret value handed to a
-runner, to learn a list of names. The mitigations were real — names
-extracted before Node started, `env:` rather than `run:`, no `set -x` — and
-the exposure was real too, and a narrower design existed. **The rule was
-right and the design changed.**
-
-Two jobs now:
-
-| job | sees | does |
+| attempt | what it did | why `js/excessive-secrets-exposure` was right |
 |---|---|---|
-| `plan` | no secrets context at all | derives the referenced names from the workflow files, emits them as a matrix |
-| `probe` | one boolean per leg | `secrets[matrix.secret] != ''`, compared **inside the expression** |
+| 1 | passed the whole context as JSON, reduced to names with `jq` | hands every secret value to the runner, to learn a list of names |
+| 2 | a matrix over the derived names, with a **dynamic** `secrets[…]` index collapsed to a boolean inside the expression | looked airtight and was not. With a dynamic index the Actions service cannot know before dispatch which secret a job will read, so it ships the job every secret it might need. Only the boolean reached the step; the values were in the job payload |
 
-What crosses into a runner is the string `true` or `false`. No secret value
-enters any runner, for any secret, at any point — and it upgraded the check
-from "a secret with this name exists" to "and it is non-empty".
+A **static** `${{ secrets.NAME != '' }}` is resolvable before dispatch, so
+the job receives that secret and nothing else. It is what Mothership's own
+`doctor.yml` has always used and what CodeQL has never flagged there. The
+comparison still happens inside the expression, so what lands in the
+environment is `true` or `false` rather than a credential.
 
-**The control leg.** The matrix always carries `GITHUB_TOKEN`, which Actions
-mints on every run. If `secrets[matrix.secret]` indexing ever stops
-resolving, every leg reports missing — which looks identical to a repo that
-lost all its credentials at once. The control makes a broken mechanism say
-so. It cannot be silenced by an `optionalSecrets` entry.
+**That puts the list back in the workflow, and nothing human maintains it:**
 
-**What this cost.** The first version could also list a *configured* secret
-that no workflow references — what a rename leaves behind. That needed the
-enumeration, so it is gone. An informational nicety against a real exposure
-is not a close call.
+| command | does |
+|---|---|
+| `--sync` | rewrites the env block from the names the workflow files reference |
+| `--check` | fails if that block has fallen behind, in **either** direction |
+
+`--check` runs on every pull request through the test suite, so a workflow
+that starts needing a new secret turns a PR red until the block is
+regenerated. Same generate-then-verify shape
+`scripts/sync-installer-copies.py` already uses for `setup_hub.py`.
+
+This answers the real objection to a hand-written list. The problem was
+never that the list lived in a file — it was that a human had to remember
+to extend it, and nobody did. It also splits the check by what can be
+answered when: *is the list current?* is a question about files, caught
+before merge; *are the secrets set?* needs the secrets context, so it stays
+on dispatch.
+
+**One subtlety, found by a failing test.** The doctor's own workflow is
+excluded from the reference scan. Its generated block necessarily names
+every secret it checks, so counting those as uses would make the expected
+set self-fulfilling: a secret would stay "referenced" forever once wired,
+and a stale entry could never be found.
 
 **A real, disclosed limit.** This confirms a secret exists and is non-empty,
 never that its value is correct. It would have caught every incident that
@@ -187,6 +192,12 @@ motivated it — a `VERCEL_URL` never set, a `VERCEL_TOKEN` that never existed
 hub doctor exercises a few credentials live for exactly that reason; doing
 the same generically would mean firing real side effects (a hub review, an
 email) to validate a credential, which is worse than the gap it closes.
+
+**Not byte-identical, and that is the point.** `secrets-doctor.yml` carries
+a per-repo generated block, so unlike checks 6–9 it is not the same bytes
+everywhere. The *script* is. A generated file with a drift gate is a
+stronger guarantee than an identical one, because it cannot be correct-
+looking and stale at the same time.
 
 ### Why runtime config instead of templating
 

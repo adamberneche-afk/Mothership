@@ -28,47 +28,53 @@
 // compares it against the set actually available at runtime. Adding a
 // workflow that needs a new secret makes this check notice on its own.
 //
-// HOW IT LEARNS WHETHER A SECRET IS SET, WITHOUT EVER HOLDING ONE
+// HOW IT LEARNS WHETHER A SECRET IS SET, AND WHY THE LIST IS GENERATED
 //
 // GitHub gives a repo no API for listing its own secrets: the REST endpoint
 // needs a PAT, and GITHUB_TOKEN has no permission scope that covers it -
-// there is no `secrets:` key in a workflow's permissions block.
+// there is no `secrets:` key in a workflow's permissions block. The only
+// thing a workflow can consult is the `secrets` context.
 //
-// The obvious move is `toJSON(secrets)`, reduced to names with jq. That is
-// what this did first, and CodeQL's js/excessive-secrets-exposure rule
-// flagged it on the very PR that introduced it: every organization and
-// repository secret VALUE is handed to the runner, to learn a list of
-// names. The mitigations were real (names extracted before Node started,
-// env: rather than run:, no set -x) but the exposure was real too, and a
-// narrower design existed.
+// Two designs were tried and rejected by CodeQL's
+// js/excessive-secrets-exposure rule, both correctly:
 //
-// So it never sees a value now. secrets-doctor.yml runs in two jobs:
+//   1. Pass the whole context as JSON and reduce it to names with jq. This
+//      obviously hands every value to the runner.
+//   2. A matrix over the derived names, with `secrets[<dynamic index>]`
+//      collapsed to a boolean inside the expression. This looked airtight
+//      and was not: with a DYNAMIC index, the Actions service cannot know
+//      at dispatch time which secret a job will read, so it must ship the
+//      job every secret it might need. The boolean is all that reaches the
+//      step's environment, but the values are in the job payload. The
+//      exposure was in a place I had not looked.
 //
-//   plan   - no secrets context at all. Derives the referenced names from
-//            the workflow files and emits them as a matrix.
-//   probe  - one matrix leg per name, whose only secret-derived input is
-//            `${{ secrets[matrix.secret] != '' }}` - a BOOLEAN. The
-//            comparison happens inside the expression; what reaches the
-//            runner is "true" or "false".
+// A STATIC reference - `${{ secrets.NAME != '' }}` - is resolvable before
+// dispatch, so the job receives that secret and no other. It is what
+// Mothership's own doctor.yml has always used, and what CodeQL has never
+// flagged there. So the workflow names its secrets statically after all.
 //
-// No secret value enters any runner, for any secret, at any point. That is
-// strictly better than the first design rather than a compromise with it,
-// and it removed a disclosed limitation as a side effect: `!= ''` tests
-// non-emptiness, where a name-list could only test presence.
+// WHICH LOOKS LIKE THE HAND-MAINTAINED LIST THIS SET OUT TO AVOID, AND IS
+// NOT, because nothing human maintains it:
 //
-// It also costs something honest: this can no longer report a CONFIGURED
-// secret that no workflow references, which the first version did. Seeing
-// what a rename left behind was worth having, and it required enumerating
-// every secret, which is precisely the exposure. Informational nicety
-// against a real exposure is not a close call.
+//   --sync   rewrites the env block in secrets-doctor.yml from the names
+//            the workflow files actually reference.
+//   --check  verifies that block still matches, and FAILS if it does not.
+//            It runs on every pull request via this repo's test suite, not
+//            on dispatch, so adding a workflow that needs a new secret
+//            turns a PR red until the block is regenerated.
 //
-// THE CONTROL LEG. A mechanism that silently evaluated to empty for every
-// secret would report every one of them missing - loud, but wrong, and
-// wrong in a way that looks like a real emergency. So the matrix always
-// carries GITHUB_TOKEN, which Actions mints on every run and which must
-// therefore always come back configured. If the control reports missing,
-// the indexing itself is broken and this says so instead of accusing the
-// repo of losing its credentials.
+// That is the same generate-then-verify shape scripts/sync-installer-copies.py
+// already uses for setup_hub.py's embedded files, and it answers the real
+// objection to TSO's version. The problem there was never that the list
+// lived in a file; it was that a human had to remember to extend it, and
+// nobody did - TSO's doctor still checks three secrets while its workflows
+// reference six. A generated list with a drift gate cannot fall behind
+// quietly.
+//
+// It also moves half the check earlier. "Is the list current?" is a
+// question about files, answerable on every PR. "Are the secrets actually
+// set?" needs the secrets context, so it stays on dispatch. Splitting them
+// means the half that can be caught before merge is.
 //
 // A REAL, DISCLOSED LIMIT: this confirms a secret exists and is non-empty.
 // It cannot confirm the VALUE is correct. It would have caught every
@@ -86,7 +92,7 @@
 // this should be. Run it when provisioning a repo, rotating a credential,
 // or diagnosing a broken step.
 
-import { appendFileSync, existsSync, readdirSync, readFileSync } from 'fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -96,12 +102,6 @@ const FLOOR_CONFIG_PATH = join(ROOT, '.github', 'floor.json');
 // GITHUB_TOKEN is minted per run by Actions itself and is always present,
 // so a workflow referencing it can never be the failure this looks for.
 const ALWAYS_PROVIDED = new Set(['GITHUB_TOKEN']);
-
-// The control leg - see the file header. GITHUB_TOKEN is minted by Actions
-// on every run, so a probe reporting it absent proves the mechanism broke,
-// not that a credential went missing.
-const CONTROL_SECRET = 'GITHUB_TOKEN';
-export { CONTROL_SECRET };
 
 export function loadConfig(configPath = FLOOR_CONFIG_PATH) {
   let raw = {};
@@ -174,6 +174,14 @@ export function extractSecretReferences(workflowContent) {
   return [...new Set(names)];
 }
 
+// This check's own workflow is excluded from the reference scan. Its
+// generated block necessarily names every secret it checks, so counting
+// those as uses would make the expected set self-fulfilling: a secret would
+// stay "referenced" forever once wired, even after the workflow that
+// actually needed it was deleted, and stale entries could never be
+// detected. Found by a test asserting exactly that, which failed.
+export const SELF_WORKFLOW = 'secrets-doctor.yml';
+
 export function listWorkflowFiles(dir) {
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
@@ -183,9 +191,10 @@ export function listWorkflowFiles(dir) {
 
 // Every secret any workflow references, with the workflows that reference
 // it - so a finding names where to go rather than just what is missing.
-export function collectReferencedSecrets(workflowsDir) {
+export function collectReferencedSecrets(workflowsDir, { excludeSelf = true } = {}) {
   const byName = new Map();
   for (const file of listWorkflowFiles(workflowsDir)) {
+    if (excludeSelf && file === SELF_WORKFLOW) continue;
     const content = readFileSync(join(workflowsDir, file), 'utf8');
     for (const name of extractSecretReferences(content)) {
       if (!byName.has(name)) byName.set(name, []);
@@ -196,114 +205,164 @@ export function collectReferencedSecrets(workflowsDir) {
 }
 
 // ---------------------------------------------------------------------------
-// plan: what to probe, derived from the workflows
+// The generated env block
 // ---------------------------------------------------------------------------
 
-// The control leg is first so a broken mechanism surfaces before any real
-// secret is judged by it.
-export function buildProbePlan(workflowsDir, config = loadConfig()) {
+// Each referenced secret becomes one static reference. The comparison
+// happens inside the expression, so the step's environment carries a
+// boolean rather than a credential - and because the reference is static,
+// the job is shipped only the secrets it names.
+export const BLOCK_BEGIN = '          # >>> generated by scripts/secrets-doctor.mjs --sync - do not edit by hand';
+export const BLOCK_END = '          # <<< end generated block';
+
+export function envVarNameFor(secretName) {
+  return `CONFIGURED_${secretName}`;
+}
+
+export function renderEnvBlock(secretNames) {
+  const lines = [BLOCK_BEGIN];
+  if (secretNames.length === 0) {
+    lines.push('          # No workflow in this repo references a secret.');
+  }
+  for (const name of secretNames) {
+    lines.push(`          ${envVarNameFor(name)}: \${{ secrets.${name} != '' }}`);
+  }
+  lines.push(BLOCK_END);
+  return lines.join('\n');
+}
+
+// The secrets the workflow is currently wired to check, read back out of
+// its own generated block - so drift is detected against the file that
+// actually runs, not against an assumption about it.
+export function parseWiredSecrets(workflowContent) {
+  const begin = workflowContent.indexOf(BLOCK_BEGIN);
+  const end = workflowContent.indexOf(BLOCK_END);
+  if (begin === -1 || end === -1 || end < begin) return null;
+  const body = workflowContent.slice(begin + BLOCK_BEGIN.length, end);
+  return [...body.matchAll(/^\s*CONFIGURED_([A-Za-z_][A-Za-z0-9_]*)\s*:/gm)].map((m) => m[1]);
+}
+
+export function expectedSecrets(workflowsDir, config = loadConfig()) {
+  void config;
   const referenced = collectReferencedSecrets(workflowsDir);
-  const names = [...referenced.keys()].filter((n) => !ALWAYS_PROVIDED.has(n)).sort();
+  return [...referenced.keys()].filter((n) => !ALWAYS_PROVIDED.has(n)).sort();
+}
+
+export function diffWiring(expected, wired) {
+  const e = new Set(expected);
+  const w = new Set(wired || []);
   return {
-    // CONTROL_SECRET always rides along - see the file header on why a
-    // mechanism that evaluates to empty for everything must be detectable.
-    matrix: [CONTROL_SECRET, ...names],
-    referenced,
-    workflowFiles: listWorkflowFiles(workflowsDir),
-    optionalNames: names.filter((n) => Object.prototype.hasOwnProperty.call(config.optionalSecrets, n))
+    missing: expected.filter((n) => !w.has(n)),
+    stale: [...w].filter((n) => !e.has(n)).sort(),
+    inSync: wired !== null && expected.length === w.size && expected.every((n) => w.has(n))
   };
 }
 
-export function renderPlan({ matrix, referenced, workflowFiles, optionalNames }) {
-  const lines = ["secrets-doctor - plan (no secret value is read in this job)", ''];
-  if (workflowFiles.length === 0) {
-    lines.push('::error::No workflow files found. This check scanned nothing, which is not the same as finding nothing wrong.');
+export function syncWorkflow(workflowContent, expected) {
+  const begin = workflowContent.indexOf(BLOCK_BEGIN);
+  const end = workflowContent.indexOf(BLOCK_END);
+  if (begin === -1 || end === -1 || end < begin) {
+    throw new Error(
+      'secrets-doctor.yml has no generated block to replace. It must contain the BEGIN and END marker ' +
+        'comments exactly as scripts/secrets-doctor.mjs emits them.'
+    );
   }
-  if (matrix.length === 1) {
-    lines.push('No workflow references any secret. Only the control leg will run.');
-  }
-  for (const name of matrix) {
-    if (name === CONTROL_SECRET) {
-      lines.push(`  ctl  ${CONTROL_SECRET} - control leg: Actions mints this every run, so it must come back configured`);
-      continue;
-    }
-    const where = (referenced.get(name) || []).join(', ');
-    const optional = optionalNames.includes(name) ? ' (declared optional)' : '';
-    lines.push(`  ->   ${name}${optional} - referenced by ${where}`);
-  }
-  lines.push('');
-  lines.push(`Scanned ${workflowFiles.length} workflow file(s); ${matrix.length - 1} secret(s) to probe.`);
-  return lines.join('\n');
+  return workflowContent.slice(0, begin) + renderEnvBlock(expected) + workflowContent.slice(end + BLOCK_END.length);
 }
 
 // ---------------------------------------------------------------------------
-// probe: the verdict for one secret
+// The dispatch-time verdicts
 // ---------------------------------------------------------------------------
 
-// `configured` is the boolean the workflow computed inside the expression -
-// the only secret-derived value that ever reaches a runner. Anything other
-// than a clean "true"/"false" means the workflow did not wire this leg
-// correctly, and that is reported rather than guessed at: an unparseable
-// input must never read as "configured".
-export function probeSecret({ name, configuredRaw, config = loadConfig(), workflowsDir }) {
-  if (!name) {
-    return { name: null, status: 'broken', detail: 'no secret name was passed to this probe - secrets-doctor.yml must set SECRET_NAME' };
-  }
-  if (configuredRaw !== 'true' && configuredRaw !== 'false') {
+// `env` is the process environment the workflow built: one CONFIGURED_<NAME>
+// per wired secret, each already reduced to "true"/"false" by the
+// expression. Anything else means the wiring is wrong, and an unreadable
+// input is reported rather than guessed at - reading it as "configured"
+// is the one wrong answer that would make this a rubber stamp.
+export function judgeSecret(name, raw, config) {
+  if (raw !== 'true' && raw !== 'false') {
     return {
       name,
       status: 'broken',
-      detail: `expected SECRET_CONFIGURED to be "true" or "false", got ${JSON.stringify(configuredRaw ?? null)}. ` +
+      detail:
+        `expected ${envVarNameFor(name)} to be "true" or "false", got ${JSON.stringify(raw ?? null)}. ` +
         'Treating an unreadable probe as a failure rather than as "configured".'
     };
   }
-  const configured = configuredRaw === 'true';
-
-  if (name === CONTROL_SECRET) {
-    return configured
-      ? { name, status: 'control-ok', detail: 'control leg passed - secret indexing works on this runner' }
-      : {
-          name,
-          status: 'broken',
-          detail:
-            'CONTROL LEG FAILED. Actions mints this secret on every run, so it cannot genuinely be absent. ' +
-            'The `secrets[matrix.secret]` indexing is not working, which means every other leg in this run is ' +
-            'reporting "missing" for a mechanical reason and not a real one. Fix the workflow, not the secrets.'
-        };
-  }
-
-  const files = workflowsDir ? (collectReferencedSecrets(workflowsDir).get(name) || []) : [];
-  const where = files.length > 0 ? ` - referenced by ${files.join(', ')}` : '';
-
-  if (configured) {
-    return { name, status: 'present', detail: `configured and non-empty (the value itself is not checked)${where}` };
+  if (raw === 'true') {
+    return { name, status: 'present', detail: 'configured and non-empty (the value itself is not checked)' };
   }
   const reason = Object.prototype.hasOwnProperty.call(config.optionalSecrets, name) ? config.optionalSecrets[name] : null;
-  if (reason) {
-    return { name, status: 'optional-missing', detail: `not configured, declared optional: ${reason}${where}` };
-  }
-  return { name, status: 'missing', detail: `referenced by a workflow but not configured on this repo${where}` };
+  return reason
+    ? { name, status: 'optional-missing', detail: `not configured, declared optional: ${reason}` }
+    : { name, status: 'missing', detail: 'referenced by a workflow but not configured on this repo' };
 }
 
-export function renderProbe(result) {
-  const lines = [];
-  if (result.status === 'present' || result.status === 'control-ok') {
-    lines.push(`  ok   ${result.name} - ${result.detail}`);
-  } else if (result.status === 'optional-missing') {
-    lines.push(`  warn ${result.name} - ${result.detail}`);
-  } else {
-    lines.push(`::error::${result.name || '(no name)'} - ${result.detail}`);
-    if (result.status === 'missing') {
-      lines.push(
-        "If this secret may legitimately be unset, declare it in .github/floor.json's doctor.optionalSecrets with the reason."
-      );
-    }
+export function runSecretsDoctor({ config = loadConfig(), root = ROOT, workflowsDir, workflowFile, env = process.env } = {}) {
+  const dir = workflowsDir || join(root, '.github', 'workflows');
+  const selfPath = workflowFile || join(dir, 'secrets-doctor.yml');
+  const workflowFiles = listWorkflowFiles(dir);
+  const referenced = collectReferencedSecrets(dir);
+  const expected = expectedSecrets(dir, config);
+
+  let wired = null;
+  try {
+    wired = parseWiredSecrets(readFileSync(selfPath, 'utf8'));
+  } catch (e) {
+    wired = null;
   }
+  const wiring = diffWiring(expected, wired);
+
+  const problems = [];
+  if (workflowFiles.length === 0) {
+    problems.push('No workflow files found. This check scanned nothing, which is not the same as finding nothing wrong.');
+  }
+  if (wired === null) {
+    problems.push(
+      'secrets-doctor.yml has no generated env block, so there is nothing to read verdicts from. ' +
+        'Run `node scripts/secrets-doctor.mjs --sync`.'
+    );
+  }
+  for (const name of wiring.missing) {
+    problems.push(
+      `${name} is referenced by ${(referenced.get(name) || []).join(', ')} but is not wired into ` +
+        'secrets-doctor.yml, so it was NOT checked. Run `node scripts/secrets-doctor.mjs --sync`.'
+    );
+  }
+  for (const name of wiring.stale) {
+    problems.push(
+      `${name} is wired into secrets-doctor.yml but no workflow references it any more. ` +
+        'Run `node scripts/secrets-doctor.mjs --sync`.'
+    );
+  }
+
+  const checks = (wired || []).filter((n) => !wiring.stale.includes(n)).map((n) => judgeSecret(n, env[envVarNameFor(n)], config));
+
+  const hasFindings = problems.length > 0 || checks.some((c) => c.status === 'missing' || c.status === 'broken');
+  return { checks, problems, wiring, referenced, workflowCount: workflowFiles.length, hasFindings };
+}
+
+export function renderReport({ checks, problems, workflowCount, hasFindings }) {
+  const lines = ["secrets-doctor - every secret this repo's workflows reference", ''];
+  for (const p of problems) lines.push(`::error::${p}`);
+  if (problems.length > 0) lines.push('');
+
+  if (checks.length === 0) lines.push('No secret is wired for checking.');
+  for (const c of checks) {
+    if (c.status === 'present') lines.push(`  ok   ${c.name} - ${c.detail}`);
+    else if (c.status === 'optional-missing') lines.push(`  warn ${c.name} - ${c.detail}`);
+    else lines.push(`::error::${c.name} - ${c.detail}`);
+  }
+
+  lines.push('');
+  lines.push(`Scanned ${workflowCount} workflow file(s); checked ${checks.length} secret(s).`);
+  lines.push('');
+  lines.push(
+    hasFindings
+      ? "One or more secrets a workflow needs are not configured, or this check could not do its job - see above. A secret that may legitimately be unset belongs in .github/floor.json's doctor.optionalSecrets, with the reason."
+      : "Every secret this repo's workflows reference is configured and non-empty."
+  );
   return lines.join('\n');
-}
-
-export function probeFailed(result) {
-  return result.status === 'missing' || result.status === 'broken';
 }
 
 // ---------------------------------------------------------------------------
@@ -321,25 +380,32 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   }
 
   const workflowsDir = join(ROOT, '.github', 'workflows');
-  const mode = process.argv.includes('--probe') ? 'probe' : 'plan';
+  const selfPath = join(workflowsDir, 'secrets-doctor.yml');
+  const expected = expectedSecrets(workflowsDir);
 
-  if (mode === 'plan') {
-    const plan = buildProbePlan(workflowsDir);
-    console.log(renderPlan(plan));
-    // Consumed by the probe job's strategy.matrix. A matrix needs its
-    // values at workflow-parse time and so cannot read a file, which is the
-    // same constraint CICD_FLOOR.md records for CodeQL's language matrix.
-    if (process.env.GITHUB_OUTPUT) {
-      appendFileSync(process.env.GITHUB_OUTPUT, `secrets=${JSON.stringify(plan.matrix)}\n`);
+  if (process.argv.includes('--sync')) {
+    const before = readFileSync(selfPath, 'utf8');
+    const after = syncWorkflow(before, expected);
+    if (after === before) {
+      console.log(`secrets-doctor.yml already wires all ${expected.length} referenced secret(s).`);
+    } else {
+      writeFileSync(selfPath, after);
+      console.log(`Rewrote secrets-doctor.yml's generated block with ${expected.length} referenced secret(s).`);
     }
-    process.exitCode = plan.workflowFiles.length === 0 ? 1 : 0;
+  } else if (process.argv.includes('--check')) {
+    const wiring = diffWiring(expected, parseWiredSecrets(readFileSync(selfPath, 'utf8')));
+    if (wiring.inSync) {
+      console.log(`secrets-doctor.yml wires exactly the ${expected.length} secret(s) this repo's workflows reference.`);
+      process.exitCode = 0;
+    } else {
+      for (const n of wiring.missing) console.error(`::error::${n} is referenced by a workflow but not wired into secrets-doctor.yml.`);
+      for (const n of wiring.stale) console.error(`::error::${n} is wired into secrets-doctor.yml but referenced by no workflow.`);
+      console.error('Fix with: node scripts/secrets-doctor.mjs --sync');
+      process.exitCode = 1;
+    }
   } else {
-    const result = probeSecret({
-      name: process.env.SECRET_NAME,
-      configuredRaw: process.env.SECRET_CONFIGURED,
-      workflowsDir
-    });
-    console.log(renderProbe(result));
-    process.exitCode = probeFailed(result) ? 1 : 0;
+    const result = runSecretsDoctor();
+    console.log(process.argv.includes('--json') ? JSON.stringify(result, null, 2) : renderReport(result));
+    process.exitCode = result.hasFindings ? 1 : 0;
   }
 }
