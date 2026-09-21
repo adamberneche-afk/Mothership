@@ -16,7 +16,14 @@
 #   - No x-vercel-protection-bypass header, no VERCEL_BYPASS_TOKEN secret -
 #     Apps Script Web Apps have no equivalent forced auth wall, so there's
 #     nothing to bypass.
-#   - The POST body (owner/repo/mode) is completely unchanged.
+#   - The POST body now carries "callerKey", resolved from a new
+#     TENANT_CALLER_KEY secret. gas/autonomous_agent.js's tenant-resolution
+#     fix (see README.md's Multi-Tenancy section) made this required, not
+#     optional, for every spoke - they all map to the "default" tenant,
+#     which now has a callerKeyRef configured. A request missing this
+#     field (or carrying the wrong value) gets a 401 from the hub. Ask
+#     whoever operates the hub for the current value; it must match the
+#     DEFAULT_TENANT_CALLER_KEY Script Property on the live deployment.
 name: Ping CTO Hub
 on:
   schedule:
@@ -40,11 +47,13 @@ jobs:
       - name: Send Payload to Hub
         env:
           APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          TENANT_CALLER_KEY: ${{ secrets.TENANT_CALLER_KEY }}
         run: |
-          curl -X POST "${APPS_SCRIPT_URL}?endpoint=autonomous_agent" \
+          curl --fail-with-body -sS -X POST "${APPS_SCRIPT_URL}?endpoint=autonomous_agent" \
             -H "Content-Type: application/json" \
             -d '{
               "owner": "${{ github.repository_owner }}",
               "repo": "${{ github.event.repository.name }}",
-              "mode": "${{ steps.mode.outputs.mode }}"
+              "mode": "${{ steps.mode.outputs.mode }}",
+              "callerKey": "${{ secrets.TENANT_CALLER_KEY }}"
             }'

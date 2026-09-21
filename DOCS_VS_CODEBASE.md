@@ -34,7 +34,9 @@ The pattern at the time was different from TSO and ThinkOS-Server, where most of
 
 ## Rollup (Updated 2026-08-07)
 
-**8 BUILT · 1 PARTIAL (blocked on a manual deployment step, not a code gap) · 0 NOT BUILT** (out of 9 capabilities catalogued)
+**Update (2026-09-18):** capability #7's Apps Script path went live for the first time - see its updated row below.
+
+**9 BUILT · 0 PARTIAL · 0 NOT BUILT** (out of 9 capabilities catalogued)
 
 | # | Capability | Status (original) | Status (now) | Evidence (now) |
 |---|---|---|---|---|
@@ -44,7 +46,7 @@ The pattern at the time was different from TSO and ThinkOS-Server, where most of
 | 4 | Recursive Learning Loop | NOT BUILT | **BUILT** | `api/recursive_learning.js` runs monthly, looks for patterns across every spoke registered in `spokes.json`, and opens a PR (never a direct commit) proposing updates to the global standards files. Aggregation and drafting are automatic; merging the proposal is still a human decision. |
 | 5 | Maintenance script: log pruning | NOT BUILT (dead stub) | **BUILT** | `scripts/prune-logs.js` archives decision-log entries past a retention window into `ai_decision_log_archive.json` on a weekly schedule, with retry-on-conflict against concurrent heartbeat writes. |
 | 6 | Daily/automated health reporting | NOT BUILT (misattributed) | **BUILT** | `scripts/health-report.js` is a real, Mothership-native replacement reporting on the hub/swarm's own health (issues filed, skip rate, inferred live/dry-run status per spoke), published to a single pinned issue updated in place. |
-| 7 | Hub self-analysis (`self-reflect.yml`) | PARTIAL | **PARTIAL (unchanged on the Vercel path — genuinely blocked, not a code gap)** | Still requires a human to set the `HUB_VERCEL_URL`/`VERCEL_BYPASS_TOKEN` secrets and obtain a Vercel Deployment Protection bypass token from the Vercel dashboard. Documented in `README.md`; nothing left to fix in code. A tested, unblocked alternative (Google Apps Script, no equivalent auth wall) is now merged and live in this repo — see README's "Alternative: Deploy Without Vercel" section. Verified locally only so far; no real `clasp` deployment or live dispatch has happened yet, so this is still the one blocker left, just with a second path to clear it. |
+| 7 | Hub self-analysis (`self-reflect.yml`) | PARTIAL | **BUILT (Apps Script path, live 2026-09-18) — Vercel path still blocked, unchanged, not a code gap** | The Vercel path still requires a human to set the `HUB_VERCEL_URL`/`VERCEL_BYPASS_TOKEN` secrets and obtain a Vercel Deployment Protection bypass token; that part is unchanged. But the Apps Script alternative (README's "Alternative: Deploy Without Vercel") is now genuinely deployed and live: a real `clasp push`+deploy exists, a real `doPost()` round trip returned `{"status":"Queued",...}`, and a real canary run wrote genuine commits to this hub's own `ai_decision_log.json`/`usage/default.json` (`b9d7d2c`/`6ff175e`) — proof the request/response plumbing, credential handling, and decision/usage logging all work end to end against a live deployment, not just fakes. Still open: no Workspace Flow has been built by hand yet (the one step nothing can automate), and no real spoke points its `call-hub.yml` at this URL yet — so a genuine AI-answered review hasn't happened live yet, only the surrounding pipeline has been proven. |
 | 8 | "Hunt" mode | PARTIAL (unreachable) | **BUILT** | `setup_spoke.py`'s generated workflow — and all three live spokes (`tso`, `thinkos-server`, `tais`) — now schedule a weekly `hunt` run via a step-output `case` statement instead of the old two-branch inline expression. |
 | 9 | Core "ping hub → get an issue" mechanism | BUILT (mechanically) | **BUILT (and now trustworthy)** | Same request/response plumbing as before, but gated by real validation, a dry-run default, and a rate cap — it no longer produces fabricated output by default. |
 

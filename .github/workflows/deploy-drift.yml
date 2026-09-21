@@ -1,0 +1,45 @@
+name: Deploy drift
+
+# Reacts to gas/ self-reporting its live deployed version. See
+# scripts/deploy-drift.js and gas/deploy_version_report.js's own header
+# comments for why this is push-based (gas/ calling OUT to this repo via
+# repository_dispatch) rather than this repo polling the live web app -
+# ported from the same pattern proven in this account's KOS repo
+# (tools/deploy-drift/README.md).
+#
+# event_type must match whatever gas/deploy_version_report.js's
+# UrlFetchApp call sends as "event_type" in its JSON body.
+on:
+  repository_dispatch:
+    types: [gas-version-report]
+
+jobs:
+  deploy-drift:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history - deploy-drift-expected-marker.js needs `git log` over gas/'s tracked files, not just the latest commit
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compare the reported version against what git expects
+        # The payload is UNTRUSTED input (see scripts/deploy-drift.js's
+        # header) - it's passed through env:, never interpolated directly
+        # into this run: script's text, so a hostile payload value can't
+        # inject shell syntax. deploy-drift.js re-validates the sha itself
+        # before using it for anything, including in an issue body.
+        env:
+          GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
+          DEPLOY_DRIFT_SHA: ${{ github.event.client_payload.sha }}
+          DEPLOY_DRIFT_REPORTED_AT: ${{ github.event.client_payload.reportedAt }}
+        run: node scripts/deploy-drift.js

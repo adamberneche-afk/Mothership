@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Root package.json - the hub's own runtime (autonomous_agent.js,
+  # health-report.js, watchdog.js, etc) and its @octokit/rest dependency.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # GitHub Actions itself (actions/checkout, actions/setup-node, etc.) -
+  # covers .github/workflows/*.yml.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

@@ -7,6 +7,44 @@ import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findT
 // size and API cost bounded.
 const MAX_DIFF_CHARS = 12000;
 
+// File extensions treated as documentation/config rather than source logic,
+// for the code-first ordering below (issue #34) - sorted to the END of the
+// diff, never dropped outright, so MAX_DIFF_CHARS's limited budget is spent
+// on code before these. Found via a real 122,293-char merge diff that got
+// cut off inside a data-seed file while 19 of 26 changed files - including
+// every one a full manual audit had found real bugs in - never reached the
+// prompt at all, because file order (not relevance) decided what fit.
+const DOC_LIKE_EXTENSIONS = new Set(['.md', '.json', '.yml', '.yaml', '.txt']);
+
+function isDocLikeFile(filename) {
+  const idx = filename.lastIndexOf('.');
+  return idx !== -1 && DOC_LIKE_EXTENSIONS.has(filename.slice(idx).toLowerCase());
+}
+
+// Caps any SINGLE file's own patch text, so one huge file at the front of
+// the (now code-first) order can't still consume the whole MAX_DIFF_CHARS
+// budget and starve every file after it - the second half of issue #34's
+// finding: reordering alone isn't enough if the first file in the new order
+// is itself bigger than the whole budget.
+const PER_FILE_MAX_CHARS = 2000;
+
+function truncateFilePatch(patch, filename) {
+  if (patch.length <= PER_FILE_MAX_CHARS) return patch;
+  return patch.slice(0, PER_FILE_MAX_CHARS) + `\n[... ${filename} truncated at ${PER_FILE_MAX_CHARS} chars ...]`;
+}
+
+// A commit authored by one of these carries nothing a debug/hunt/refactor
+// review can meaningfully judge - a scheduled export, a dependency bump
+// commit. EXCLUDED_DIFF_PATH_PREFIXES catches the same class by content
+// instead of author, for a generated-data commit a human happened to push.
+// Both found via issue #35: a spoke's actual latest commit was a
+// `github-actions[bot]` weekly issue-export dump under exports/ - every
+// mode correctly said "no findings," but only because there was,
+// coincidentally, nothing unsafe in the JSON, not because this was ever
+// recognized as an unreviewable commit shape.
+const BOT_AUTHOR_LOGINS = new Set(['github-actions[bot]', 'dependabot[bot]']);
+const EXCLUDED_DIFF_PATH_PREFIXES = ['exports/'];
+
 // Every issue this handler files is tagged with this label. GitHub creates
 // the label automatically on first use. It's how the rate cap below counts
 // "issues the hub created" without confusing them with anything a human
@@ -218,11 +256,12 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   // carried ZERO credential before this - any caller who knew the hub URL
   // could trigger a review for any registered owner/repo. The check below
   // is deliberately opt-in per tenant: a tenant with no `callerKeyRef` set
-  // (true for "default" today) skips verification entirely, preserving
-  // today's exact zero-auth behavior for anything not yet migrated. A
-  // tenant that HAS set one gets it strictly enforced. Migrating a tenant
-  // to enforced caller-auth is then just a config change, not a breaking
-  // flag day for spokes that were already working.
+  // skips verification entirely. "default" now has one set (tenants.json),
+  // since it's the tenant every registered spoke currently maps to and this
+  // hub has a live, publicly-reachable deployment (the gas/ twin) - a
+  // tenant with no key configured at all would otherwise stay silently
+  // open. Migrating a NEW tenant to enforced caller-auth is then just a
+  // config change, not a breaking flag day for spokes already working.
   //
   // spokesOverride/tenantsOverride let tests inject a registry instead of
   // reading this checkout's real spokes.json/tenants.json - same
@@ -230,7 +269,7 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   const spokes = spokesOverride || loadSpokesRegistry();
   const tenants = tenantsOverride || loadTenantsRegistry();
   const tenantId = resolveTenantIdForSpoke(owner, repo, spokes);
-  const tenant = findTenant(tenantId, tenants);
+  const tenant = tenantId ? findTenant(tenantId, tenants) : null;
 
   // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
   // env var never files a real issue by accident - DRY_RUN_MODE has to be
@@ -243,40 +282,54 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
     ? dryRunOverride
     : process.env.DRY_RUN_MODE !== 'false';
 
-  // TENANT STATUS GATE: an explicitly non-'active' tenant (suspended, e.g.
-  // for a failed payment) must never be served, checked before any
-  // GitHub call - including the credential resolution below - so a
-  // suspended tenant costs nothing, not even a failed auth attempt.
-  // `status` is optional for backward compat: a record with no `status`
-  // field, or the "default" tenant's seeded "active", is always served -
-  // only an EXPLICIT non-'active' value skips. (Found while building the
-  // GitHub App credential path: `status` was defined in tenants.json's own
-  // schema but never actually read anywhere in this handler until now.)
-  if (tenant && tenant.status && tenant.status !== 'active') {
-    return { httpStatus: 200, body: { status: 'Skipped', reason: `Tenant status is '${tenant.status}', not 'active'`, dryRun } };
+  // Reject an owner/repo that isn't a registered spoke outright, before any
+  // GitHub call runs with GLOBAL_GITHUB_TOKEN under it. owner/repo is
+  // caller-supplied and spoofable, so this alone doesn't stop someone
+  // claiming to BE a registered spoke - the requiredCallerKey check right
+  // below is what actually gates that. What this closes is the blast
+  // radius of a leaked/guessed caller key: even with it, a caller can only
+  // target this hub's own registered spokes, never an arbitrary repo on
+  // GitHub that GLOBAL_GITHUB_TOKEN happens to be able to read.
+  if (!tenant) {
+    return { httpStatus: 403, body: { error: 'owner/repo is not a registered spoke of this hub' } };
   }
 
-  const requiredCallerKey = tenant ? await resolveSecretRef(tenant.callerKeyRef) : null;
+  // CALLER-KEY AUTH runs before the tenant-status gate below, not after: an
+  // unauthenticated caller who names/spoofs a real owner+repo pair must not
+  // be able to learn anything about that tenant (e.g. that it's suspended)
+  // from a request it never proved it was allowed to make.
+  const requiredCallerKey = await resolveSecretRef(tenant.callerKeyRef);
   if (requiredCallerKey && callerKey !== requiredCallerKey) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
 
+  // TENANT STATUS GATE: an explicitly non-'active' tenant (suspended, e.g.
+  // for a failed payment) must never be served, checked before any
+  // GitHub call - including the credential resolution below - so a
+  // suspended tenant costs nothing beyond the caller-key check above.
+  // `status` is optional for backward compat: a record with no `status`
+  // field, or the "default" tenant's seeded "active", is always served -
+  // only an EXPLICIT non-'active' value skips. `tenant` is guaranteed
+  // non-null past the reject above. (Found while building the GitHub App
+  // credential path: `status` was defined in tenants.json's own schema but
+  // never actually read anywhere in this handler until now.)
+  if (tenant.status && tenant.status !== 'active') {
+    return { httpStatus: 200, body: { status: 'Skipped', reason: `Tenant status is '${tenant.status}', not 'active'`, dryRun } };
+  }
+
   // Credential for this request's SPOKE operations - the tenant's own
   // token (decision #1), resolved via the same env:/kv: scheme as the
-  // caller key above. GLOBAL_GITHUB_TOKEN is used ONLY for the true
-  // legacy/pre-migration case: no tenant record matched this spoke at all
-  // (mirrors resolveTenantIdForSpoke's own backward-compatibility
-  // fallback). A tenant that DID match but whose credential ref fails to
-  // resolve (unset env var, revoked/misconfigured ref) is a hard skip, not
-  // a fallback - silently widening to the hub's own broad
-  // GLOBAL_GITHUB_TOKEN here would be exactly backwards: a tenant whose
-  // credential is broken or was just revoked should lose access, not gain
-  // the operator's own token against their repo. (Inert while only one
-  // tenant with one credential path existed; a real, live bug the moment a
-  // second, revocable per-tenant credential does - fixed here before that
-  // becomes true.)
+  // caller key above. A tenant with no githubCredentialRef configured at
+  // all (e.g. the seeded "default"/test tenants) falls back to
+  // GLOBAL_GITHUB_TOKEN, same as before real per-tenant credentials
+  // existed. A tenant that DID configure one but whose ref fails to
+  // resolve (unset env var, revoked/misconfigured ref) is a hard skip
+  // instead - silently widening to the hub's own broad GLOBAL_GITHUB_TOKEN
+  // here would be exactly backwards: a tenant whose credential is broken
+  // or was just revoked should lose access, not gain the operator's own
+  // token against their repo.
   let spokeToken;
-  if (tenant) {
+  if (tenant.githubCredentialRef) {
     spokeToken = await resolveSecretRef(tenant.githubCredentialRef);
     if (!spokeToken) {
       return { httpStatus: 200, body: { status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun } };
@@ -301,18 +354,29 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
     ? readFileSync(hubLessonsPath, 'utf8')
     : "";
 
-  // Fetch Local Context from the Spoke repo
-  let localContext = "No local context found.";
-  try {
-    const { data: lsData } = await octokit.repos.getContent({ owner, repo, path: 'lessons.md' });
-    const { data: nsData } = await octokit.repos.getContent({ owner, repo, path: 'NORTH_STAR.md' });
-    localContext = `
-      LOCAL LESSONS: ${Buffer.from(lsData.content, 'base64').toString()}
-      LOCAL NORTH STAR: ${Buffer.from(nsData.content, 'base64').toString()}
-    `;
-  } catch (e) {
-    localContext = "No local context found.";
-  }
+  // Fetch Local Context from the Spoke repo. lessons.md and NORTH_STAR.md are
+  // fetched independently (issue #35) - this used to be one try/catch around
+  // both reads, so a spoke whose NORTH_STAR.md has moved off-root (confirmed
+  // on a real spoke that keeps a genuine, current lessons.md but only an
+  // archived NORTH_STAR.md) silently lost its otherwise-valid lessons.md too.
+  const fetchOptionalRepoFile = async (path) => {
+    try {
+      const { data } = await octokit.repos.getContent({ owner, repo, path });
+      return Buffer.from(data.content, 'base64').toString();
+    } catch (e) {
+      return null;
+    }
+  };
+  const [localLessons, localNorthStar] = await Promise.all([
+    fetchOptionalRepoFile('lessons.md'),
+    fetchOptionalRepoFile('NORTH_STAR.md'),
+  ]);
+  const localContext = (localLessons !== null || localNorthStar !== null)
+    ? `
+      LOCAL LESSONS: ${localLessons !== null ? localLessons : '(none found)'}
+      LOCAL NORTH STAR: ${localNorthStar !== null ? localNorthStar : '(none found)'}
+    `
+    : "No local context found.";
 
   // Find the spoke's latest commit sha up front - both the decision-log
   // dedup check below and the diff fetch further down need it, so fetch it
@@ -373,13 +437,54 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   if (latestCommitSha) {
     try {
       const { data: commitDetail } = await octokit.repos.getCommit({ owner, repo, ref: latestCommitSha });
-      const patches = (commitDetail.files || [])
-        .filter(f => typeof f.patch === 'string' && f.patch.length > 0)
-        .map(f => `--- ${f.filename} (${f.status}) ---\n${f.patch}`)
-        .join('\n\n');
+      const changedFiles = commitDetail.files || [];
+
+      // Skip bot-authored / generated-data-only commits before spending an
+      // AI call on them (issue #35) - see BOT_AUTHOR_LOGINS/
+      // EXCLUDED_DIFF_PATH_PREFIXES above.
+      const commitAuthorLogin = commitDetail.author && commitDetail.author.login;
+      const allFilesExcluded = changedFiles.length > 0 && changedFiles.every(
+        f => EXCLUDED_DIFF_PATH_PREFIXES.some(prefix => f.filename.startsWith(prefix))
+      );
+      if (BOT_AUTHOR_LOGINS.has(commitAuthorLogin) || allFilesExcluded) {
+        await logOutcome('bot_or_generated_commit_skip');
+        return {
+          httpStatus: 200,
+          body: { status: 'Skipped', reason: 'Latest commit is bot-authored or touches only excluded paths', dryRun }
+        };
+      }
+
+      const patchableFiles = changedFiles.filter(f => typeof f.patch === 'string' && f.patch.length > 0);
+
+      // Code files first, doc/config-like files last (issue #34) - a stable
+      // sort so files of the same kind keep their original relative order.
+      const ordered = [...patchableFiles].sort((a, b) => {
+        const aDoc = isDocLikeFile(a.filename), bDoc = isDocLikeFile(b.filename);
+        return aDoc === bDoc ? 0 : (aDoc ? 1 : -1);
+      });
+
+      // Take-until-full, but skip (not stop at) a file that doesn't fit, so
+      // a later, smaller file still gets a chance - and cap each file's own
+      // patch first (PER_FILE_MAX_CHARS) so one huge file can't consume the
+      // whole budget by itself.
+      const pieces = [];
+      const omittedFiles = [];
+      let runningLength = 0;
+      for (const f of ordered) {
+        const piece = `--- ${f.filename} (${f.status}) ---\n${truncateFilePatch(f.patch, f.filename)}`;
+        if (runningLength + piece.length + 2 > MAX_DIFF_CHARS) {
+          omittedFiles.push(f.filename);
+          continue;
+        }
+        pieces.push(piece);
+        runningLength += piece.length + 2;
+      }
+
+      const patches = pieces.join('\n\n');
       if (patches.length > 0) {
-        codeDiff = patches.length > MAX_DIFF_CHARS
-          ? patches.slice(0, MAX_DIFF_CHARS) + `\n\n[... diff truncated at ${MAX_DIFF_CHARS} chars ...]`
+        codeDiff = omittedFiles.length > 0
+          ? patches + `\n\n[... ${omittedFiles.length} file(s) omitted to stay under ${MAX_DIFF_CHARS} chars: ` +
+            `${omittedFiles.slice(0, 10).join(', ')}${omittedFiles.length > 10 ? ', ...' : ''} ...]`
           : patches;
       }
     } catch (e) {

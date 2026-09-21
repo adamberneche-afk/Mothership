@@ -13,9 +13,7 @@
 //      just `(token) => makeGithubClient(httpFetch, token)`.
 //   2. No Node `fetch`/Promises - everything here is a plain synchronous
 //      function, matching UrlFetchApp.fetch's real (blocking) execution
-//      model. `aiFetch(url, options)` returns the same
-//      { getResponseCode(), getContentText() } shape `github`'s calls do,
-//      rather than a Fetch Response with an async `.json()`.
+//      model.
 //   3. No local filesystem - a Vercel deployment bundles this repo's own
 //      universal_lessons.md/north_star_framework.md/hub_lessons.md AND
 //      spokes.json/tenants.json alongside the function and reads them
@@ -24,8 +22,44 @@
 //      `hubGithub.repos.getContent` instead - always the current committed
 //      content, no redeploy needed to pick up an edit (an improvement, not
 //      just a workaround).
+//   4. No direct AI API call at all - unlike api/autonomous_agent.js (and
+//      this file's own earlier version), the actual inference step is a
+//      human-built Google Workspace Studio Flow using its own native "Ask
+//      Gemini" step, not a `chat/completions` HTTP call. See
+//      review_queue.js's header comment for the full why (this deployment
+//      target has GCP disabled account-wide, so no AI API key can even be
+//      issued) and the exact hand-off mechanics. processRequest() below
+//      does everything through the quota gate exactly as before, then
+//      enqueues instead of calling an AI endpoint; finalizeReviewResult_()
+//      is the rest of the original logic (validation, dry-run/rate-cap,
+//      decision-log, issue creation), now run by harvestReviewResults()
+//      once a Flow has actually answered.
 
 const MAX_DIFF_CHARS = 12000;
+
+// Ported from api/autonomous_agent.js's issue #34/#35 fixes - see that
+// file's header comments on each constant for the full reasoning. Kept in
+// sync deliberately: this file is a platform port of the same decision
+// logic, not an independent implementation, so a fix here without the
+// matching fix there (or vice versa) is exactly the kind of two-copies
+// drift this project's own lessons.md already warns about elsewhere.
+const DOC_LIKE_EXTENSIONS = new Set(['.md', '.json', '.yml', '.yaml', '.txt']);
+
+function isDocLikeFile(filename) {
+  const idx = filename.lastIndexOf('.');
+  return idx !== -1 && DOC_LIKE_EXTENSIONS.has(filename.slice(idx).toLowerCase());
+}
+
+const PER_FILE_MAX_CHARS = 2000;
+
+function truncateFilePatch(patch, filename) {
+  if (patch.length <= PER_FILE_MAX_CHARS) return patch;
+  return patch.slice(0, PER_FILE_MAX_CHARS) + `\n[... ${filename} truncated at ${PER_FILE_MAX_CHARS} chars ...]`;
+}
+
+const BOT_AUTHOR_LOGINS = new Set(['github-actions[bot]', 'dependabot[bot]']);
+const EXCLUDED_DIFF_PATH_PREFIXES = ['exports/'];
+
 const HUB_ISSUE_LABEL = 'cto-hub-auto';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const DECISION_LOG_MAX_ENTRIES = 500;
@@ -60,9 +94,19 @@ function safeGetJsonArrayFromHub(hubGithub, base64Decode, hubOwner, hubRepo, pat
   }
 }
 
+// Returns null, not DEFAULT_TENANT_ID, for an owner/repo that isn't one of
+// this hub's registered spokes. Used to fall back to the "default" tenant
+// for ANYTHING unmatched - a deliberate backward-compatibility choice from
+// before this hub had a live, publicly-reachable deployment, not a security
+// feature. Once the gas/ deployment went live with "Anyone" access, that
+// same fallback meant any caller on the internet could name an arbitrary
+// owner/repo and have this hub fetch it with GLOBAL_GITHUB_TOKEN - see
+// processRequest()'s own tenant-resolution comment for the caller-facing
+// half of this fix. Returning null here lets processRequest() reject an
+// unmatched spoke outright instead of silently treating it as "default".
 function resolveTenantIdForSpoke(owner, repo, spokes) {
   const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
+  return match ? match.tenantId : null;
 }
 
 function findTenant(tenantId, tenants) {
@@ -193,6 +237,33 @@ function countReviewsThisMonth(hubGithub, base64Decode, hubOwner, hubRepo, tenan
   return entries.filter(e => e && e.eventType === 'review_run' && new Date(e.timestamp) >= monthStart).length;
 }
 
+// Shared by both halves of the split this file now has: processRequest()
+// (enqueue time - needs a github client scoped to the right tenant/spoke
+// credential to fetch context/diff) and finalizeReviewResult_() (harvest
+// time - needs the SAME resolution again, re-derived fresh rather than
+// persisted, so a tenant/credential/DRY_RUN_MODE change between enqueue
+// and harvest is honored using current config, not a stale snapshot from
+// whenever the row was queued - and so a resolved credential is never
+// written into the queue spreadsheet at all).
+function resolveTenantAndGithub_(owner, repo, {
+  githubFactory, hubGithub, base64Decode, config, hubOwner, hubRepo,
+  spokesOverride, tenantsOverride, dryRunOverride
+}) {
+  const spokes = spokesOverride || safeGetJsonArrayFromHub(hubGithub, base64Decode, hubOwner, hubRepo, SPOKES_REGISTRY_PATH);
+  const tenants = tenantsOverride || safeGetJsonArrayFromHub(hubGithub, base64Decode, hubOwner, hubRepo, TENANTS_REGISTRY_PATH);
+  const tenantId = resolveTenantIdForSpoke(owner, repo, spokes);
+  const tenant = findTenant(tenantId, tenants);
+
+  const spokeToken = (tenant && resolveSecretRef(tenant.githubCredentialRef, config.scriptProperties)) || config.globalGithubToken;
+  const github = githubFactory(spokeToken);
+
+  const dryRun = dryRunOverride !== undefined
+    ? dryRunOverride
+    : config.dryRunMode !== 'false';
+
+  return { github, tenantId, tenant, dryRun };
+}
+
 // The actual decision logic, factored out of the Apps Script entry point
 // (Code.js) so it can be driven by a local test harness with fakes instead
 // of hitting GitHub and the AI API for real - same testability the Vercel
@@ -208,14 +279,14 @@ function countReviewsThisMonth(hubGithub, base64Decode, hubOwner, hubRepo, tenan
 function processRequest(reqBody, {
   githubFactory,
   hubGithub,
-  aiFetch,
   base64Encode,
   base64Decode,
   config = {},
   dryRunOverride,
   now,
   spokesOverride,
-  tenantsOverride
+  tenantsOverride,
+  reviewQueueSheet
 } = {}) {
   const { owner, repo, mode, callerKey } = reqBody || {};
 
@@ -234,64 +305,83 @@ function processRequest(reqBody, {
 
   // TENANT RESOLUTION + CALLER AUTHENTICATION - same rules/rationale as
   // api/autonomous_agent.js's identical block. spokesOverride/tenantsOverride
-  // let tests inject a registry instead of a real hub fetch.
-  const spokes = spokesOverride || safeGetJsonArrayFromHub(hubGithub, base64Decode, hubOwner, hubRepo, SPOKES_REGISTRY_PATH);
-  const tenants = tenantsOverride || safeGetJsonArrayFromHub(hubGithub, base64Decode, hubOwner, hubRepo, TENANTS_REGISTRY_PATH);
-  const tenantId = resolveTenantIdForSpoke(owner, repo, spokes);
-  const tenant = findTenant(tenantId, tenants);
+  // let tests inject a registry instead of a real hub fetch. Caller-key
+  // auth happens once, here, at enqueue time - a queued row was already
+  // authenticated when it was written, so finalizeReviewResult_() at
+  // harvest time never re-checks it (see resolveTenantAndGithub_'s own
+  // comment for what IS re-derived at harvest time, and why).
+  const { github, tenantId, tenant, dryRun } = resolveTenantAndGithub_(owner, repo, {
+    githubFactory, hubGithub, base64Decode, config, hubOwner, hubRepo,
+    spokesOverride, tenantsOverride, dryRunOverride
+  });
 
-  // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
-  // config value never files a real issue by accident - DRY_RUN_MODE has to
-  // be explicitly set to the string "false" to go live. Computed up front
-  // (moved ahead of tenant/credential handling below), same reasoning as
-  // api/autonomous_agent.js, so the tenant-status gate can use it too.
-  const dryRun = dryRunOverride !== undefined
-    ? dryRunOverride
-    : config.dryRunMode !== 'false';
-
-  // TENANT STATUS GATE - same rules/rationale as api/autonomous_agent.js's
-  // identical block: an explicitly non-'active' tenant is skipped before
-  // any GitHub call, `status` optional for backward compat.
-  if (tenant && tenant.status && tenant.status !== 'active') {
-    return { httpStatus: 200, body: { status: 'Skipped', reason: `Tenant status is '${tenant.status}', not 'active'`, dryRun } };
+  // Reject an owner/repo that isn't a registered spoke outright, before any
+  // GitHub call runs with GLOBAL_GITHUB_TOKEN under it. Real fix, not
+  // defense-in-depth theater: owner/repo is caller-supplied and trivially
+  // spoofable, so this alone wouldn't stop someone claiming to BE a
+  // registered spoke - the requiredCallerKey check right below is what
+  // actually gates that. What this specifically closes is the blast radius
+  // of a leaked/guessed caller key: even with it, a caller can only target
+  // this hub's own registered spokes, never an arbitrary repo on GitHub
+  // that GLOBAL_GITHUB_TOKEN happens to be able to read.
+  if (!tenant) {
+    return { httpStatus: 403, body: { error: 'owner/repo is not a registered spoke of this hub' } };
   }
 
-  const requiredCallerKey = tenant ? resolveSecretRef(tenant.callerKeyRef, config.scriptProperties) : null;
+  // CALLER-KEY AUTH runs before the tenant-status gate below, not after -
+  // same rules/rationale as api/autonomous_agent.js's identical block: an
+  // unauthenticated caller must not be able to learn anything about a
+  // tenant (e.g. that it's suspended) from a request it never proved it
+  // was allowed to make.
+  const requiredCallerKey = resolveSecretRef(tenant.callerKeyRef, config.scriptProperties);
   if (requiredCallerKey && callerKey !== requiredCallerKey) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
 
-  // Credential for SPOKE operations - same rules/rationale as
-  // api/autonomous_agent.js's identical block: config.globalGithubToken is
-  // used ONLY when no tenant matched at all; a matched tenant whose
-  // credential ref fails to resolve is a hard skip, never a silent
-  // fallback to the hub's own broad token.
-  let spokeToken;
-  if (tenant) {
-    spokeToken = resolveSecretRef(tenant.githubCredentialRef, config.scriptProperties);
-    if (!spokeToken) {
-      return { httpStatus: 200, body: { status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun } };
-    }
-  } else {
-    spokeToken = config.globalGithubToken;
+  // TENANT STATUS GATE - same rules/rationale as api/autonomous_agent.js's
+  // identical block: an explicitly non-'active' tenant is skipped before
+  // any GitHub call, `status` optional for backward compat. `tenant` is
+  // guaranteed non-null past the reject above.
+  if (tenant.status && tenant.status !== 'active') {
+    return { httpStatus: 200, body: { status: 'Skipped', reason: `Tenant status is '${tenant.status}', not 'active'`, dryRun } };
   }
-  const github = githubFactory(spokeToken);
+
+  // Credential hard-skip - same rules/rationale as api/autonomous_agent.js's
+  // identical block: a tenant with no githubCredentialRef configured at all
+  // (e.g. the seeded "default"/test tenants) falls back to
+  // config.globalGithubToken via resolveTenantAndGithub_ above, same as
+  // before real per-tenant credentials existed. A tenant that DID configure
+  // one but whose ref fails to resolve must never silently fall back to
+  // that broader token instead - `github` above (built by
+  // resolveTenantAndGithub_ using this same ref) is simply never used in
+  // that case.
+  if (tenant.githubCredentialRef && !resolveSecretRef(tenant.githubCredentialRef, config.scriptProperties)) {
+    return { httpStatus: 200, body: { status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun } };
+  }
 
   const universalLessons = safeGetHubFile(hubGithub, base64Decode, hubOwner, hubRepo, 'universal_lessons.md');
   const globalNorthStar = safeGetHubFile(hubGithub, base64Decode, hubOwner, hubRepo, 'north_star_framework.md');
   const hubLessons = safeGetHubFile(hubGithub, base64Decode, hubOwner, hubRepo, 'hub_lessons.md');
 
-  let localContext = 'No local context found.';
-  try {
-    const { data: lsData } = github.repos.getContent({ owner, repo, path: 'lessons.md' });
-    const { data: nsData } = github.repos.getContent({ owner, repo, path: 'NORTH_STAR.md' });
-    localContext = `
-      LOCAL LESSONS: ${base64Decode(lsData.content)}
-      LOCAL NORTH STAR: ${base64Decode(nsData.content)}
-    `;
-  } catch (e) {
-    localContext = 'No local context found.';
-  }
+  // lessons.md and NORTH_STAR.md are fetched independently (issue #35) - a
+  // spoke whose NORTH_STAR.md has moved off-root must not also lose an
+  // otherwise-valid lessons.md just because they used to share one try/catch.
+  const fetchOptionalRepoFile = (path) => {
+    try {
+      const { data } = github.repos.getContent({ owner, repo, path });
+      return base64Decode(data.content);
+    } catch (e) {
+      return null;
+    }
+  };
+  const localLessons = fetchOptionalRepoFile('lessons.md');
+  const localNorthStar = fetchOptionalRepoFile('NORTH_STAR.md');
+  const localContext = (localLessons !== null || localNorthStar !== null)
+    ? `
+      LOCAL LESSONS: ${localLessons !== null ? localLessons : '(none found)'}
+      LOCAL NORTH STAR: ${localNorthStar !== null ? localNorthStar : '(none found)'}
+    `
+    : 'No local context found.';
 
   let latestCommitSha = null;
   try {
@@ -327,21 +417,61 @@ function processRequest(reqBody, {
     recordUsageEvent(hubGithub, base64Encode, base64Decode, hubOwner, hubRepo, { tenantId, timestamp: new Date().toISOString(), eventType, mode, owner, repo, ...extra });
 
   let codeDiff = null;
+  let botOrGeneratedCommitSkip = false;
   if (latestCommitSha) {
     try {
       const { data: commitDetail } = github.repos.getCommit({ owner, repo, ref: latestCommitSha });
-      const patches = (commitDetail.files || [])
-        .filter(f => typeof f.patch === 'string' && f.patch.length > 0)
-        .map(f => `--- ${f.filename} (${f.status}) ---\n${f.patch}`)
-        .join('\n\n');
-      if (patches.length > 0) {
-        codeDiff = patches.length > MAX_DIFF_CHARS
-          ? patches.slice(0, MAX_DIFF_CHARS) + `\n\n[... diff truncated at ${MAX_DIFF_CHARS} chars ...]`
-          : patches;
+      const changedFiles = commitDetail.files || [];
+
+      // Skip bot-authored / generated-data-only commits before spending an
+      // AI call on them (issue #35).
+      const commitAuthorLogin = commitDetail.author && commitDetail.author.login;
+      const allFilesExcluded = changedFiles.length > 0 && changedFiles.every(
+        f => EXCLUDED_DIFF_PATH_PREFIXES.some(prefix => f.filename.startsWith(prefix))
+      );
+      if (BOT_AUTHOR_LOGINS.has(commitAuthorLogin) || allFilesExcluded) {
+        botOrGeneratedCommitSkip = true;
+      } else {
+        const patchableFiles = changedFiles.filter(f => typeof f.patch === 'string' && f.patch.length > 0);
+
+        // Code files first, doc/config-like files last (issue #34).
+        const ordered = patchableFiles.slice().sort((a, b) => {
+          const aDoc = isDocLikeFile(a.filename), bDoc = isDocLikeFile(b.filename);
+          return aDoc === bDoc ? 0 : (aDoc ? 1 : -1);
+        });
+
+        const pieces = [];
+        const omittedFiles = [];
+        let runningLength = 0;
+        for (const f of ordered) {
+          const piece = `--- ${f.filename} (${f.status}) ---\n${truncateFilePatch(f.patch, f.filename)}`;
+          if (runningLength + piece.length + 2 > MAX_DIFF_CHARS) {
+            omittedFiles.push(f.filename);
+            continue;
+          }
+          pieces.push(piece);
+          runningLength += piece.length + 2;
+        }
+
+        const patches = pieces.join('\n\n');
+        if (patches.length > 0) {
+          codeDiff = omittedFiles.length > 0
+            ? patches + `\n\n[... ${omittedFiles.length} file(s) omitted to stay under ${MAX_DIFF_CHARS} chars: ` +
+              `${omittedFiles.slice(0, 10).join(', ')}${omittedFiles.length > 10 ? ', ...' : ''} ...]`
+            : patches;
+        }
       }
     } catch (e) {
       codeDiff = null;
     }
+  }
+
+  if (botOrGeneratedCommitSkip) {
+    logOutcome('bot_or_generated_commit_skip');
+    return {
+      httpStatus: 200,
+      body: { status: 'Skipped', reason: 'Latest commit is bot-authored or touches only excluded paths', dryRun }
+    };
   }
 
   if (!codeDiff) {
@@ -400,47 +530,83 @@ function processRequest(reqBody, {
     }
   `;
 
-  const aiResponse = aiFetch(`${config.aiBaseUrl}/chat/completions`, {
-    method: 'post',
-    headers: { Authorization: `Bearer ${config.aiApiKey}`, 'Content-Type': 'application/json' },
-    payload: JSON.stringify({
-      model: config.aiModel,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.1
-    })
+  // No direct AI call here (see review_queue.js's header comment for why:
+  // this deployment target has GCP disabled account-wide, so an AI API key
+  // can't even be issued). Queue this prompt for a human-built Google
+  // Workspace Studio Flow's own native inference step to answer, and
+  // respond immediately - the real outcome (an issue filed, a decision
+  // logged) surfaces later via finalizeReviewResult_(), once
+  // harvestReviewResults() picks up this row's answer.
+  const sheet = reviewQueueSheet || (() => {
+    const ss = openQueueSpreadsheet_(config);
+    return ss ? ensureQueueTab_(ss, QUEUE_TAB_REVIEW, RQ_HEADERS) : null;
+  })();
+
+  if (!sheet) {
+    return {
+      httpStatus: 200,
+      body: { status: 'Skipped', reason: 'No queue spreadsheet available (QUEUE_SHEET_ID unset and no scriptProperties to auto-create/persist one into, or the create-lock was briefly contended) - nothing to queue this review into', dryRun }
+    };
+  }
+
+  const queued = enqueueReviewRow_(sheet, { owner, repo, mode, commitSha: latestCommitSha, promptText: prompt });
+
+  return {
+    httpStatus: 200,
+    body: {
+      status: 'Queued',
+      reason: queued.alreadyQueued
+        ? 'Already queued, waiting on the Studio Flow to answer this row'
+        : 'Queued for native Workspace inference - a human-built Studio Flow answers ReviewQueue rows on its own schedule; harvestReviewResults() files the decision once one exists',
+      dryRun
+    }
+  };
+}
+
+// finalizeReviewResult_ - the back half of the original inline processRequest()
+// logic, run once a Studio Flow has actually answered (harvestReviewResults(),
+// review_queue.js). Re-resolves the tenant/github client fresh from
+// {owner, repo} (resolveTenantAndGithub_'s own comment explains why) rather
+// than trusting anything persisted at enqueue time. Same validation
+// discipline, same dry-run/rate-cap rails, same decision-log write as the
+// original inline version - nothing about the decision logic changed, only
+// when it runs and where its input comes from (a queue row's
+// GeminiFullOutput, not a synchronous aiFetch response).
+function finalizeReviewResult_({ owner, repo, mode, commitSha, rawContent }, {
+  githubFactory, hubGithub, base64Encode, base64Decode, config = {},
+  dryRunOverride, spokesOverride, tenantsOverride
+}) {
+  const hubOwner = config.hubOwner || DEFAULT_HUB_OWNER;
+  const hubRepo = config.hubRepo || DEFAULT_HUB_REPO;
+
+  const { github, tenantId, dryRun } = resolveTenantAndGithub_(owner, repo, {
+    githubFactory, hubGithub, base64Decode, config, hubOwner, hubRepo,
+    spokesOverride, tenantsOverride, dryRunOverride
   });
 
-  let aiData;
-  try {
-    aiData = JSON.parse(aiResponse.getContentText());
-  } catch (e) {
-    aiData = null;
-  }
-  const rawContent = aiData?.choices?.[0]?.message?.content;
+  const logOutcome = (outcome, extra = {}) =>
+    appendDecisionLogEntry(github, base64Encode, base64Decode, owner, repo, makeLogEntry({ mode, commitSha, outcome, ...extra }));
+  const recordUsage = (eventType, extra = {}) =>
+    recordUsageEvent(hubGithub, base64Encode, base64Decode, hubOwner, hubRepo, { tenantId, timestamp: new Date().toISOString(), eventType, mode, owner, repo, ...extra });
 
-  if (typeof rawContent !== 'string' || rawContent.trim().length === 0) {
-    logOutcome('ai_error', { summary: 'AI returned no content' });
-    return { httpStatus: 200, body: { status: 'Skipped', reason: 'AI returned no content', dryRun } };
-  }
-
-  // The actual cost-incurring event the quota gate above protects against
-  // overrunning - recorded now that the AI call genuinely happened.
-  recordUsage('review_run', aiData && aiData.usage ? { usage: aiData.usage } : {});
+  // The actual cost-incurring event the quota gate (processRequest(),
+  // enqueue time) protects against overrunning - recorded now that a real
+  // answer exists. No `usage` field, unlike the old inline chat/completions
+  // call - a native Workspace Flow step hands back only the text it wrote
+  // into GeminiFullOutput, no token-usage figures.
+  recordUsage('review_run');
 
   let result;
   try {
     result = JSON.parse(rawContent);
   } catch (parseError) {
     logOutcome('invalid_ai_response', { summary: 'AI did not return valid JSON' });
-    return {
-      httpStatus: 200,
-      body: { status: 'Skipped', reason: 'AI did not return valid JSON', raw: rawContent.slice(0, 500), dryRun }
-    };
+    return { status: 'Skipped', reason: 'AI did not return valid JSON', raw: rawContent.slice(0, 500), dryRun };
   }
 
   if (result.has_findings !== true) {
     logOutcome('no_findings');
-    return { httpStatus: 200, body: { status: 'Skipped', reason: 'AI reported no findings', dryRun } };
+    return { status: 'Skipped', reason: 'AI reported no findings', dryRun };
   }
 
   const isNonEmptyString = (v) => typeof v === 'string' && v.trim().length > 0;
@@ -453,10 +619,7 @@ function processRequest(reqBody, {
 
   if (!isValidShape) {
     logOutcome('invalid_ai_response', { summary: 'AI response did not match the required shape' });
-    return {
-      httpStatus: 200,
-      body: { status: 'Skipped', reason: 'AI response did not match the required shape', raw: rawContent.slice(0, 500), dryRun }
-    };
+    return { status: 'Skipped', reason: 'AI response did not match the required shape', raw: rawContent.slice(0, 500), dryRun };
   }
 
   const issueTitle = `CTO HUB: ${mode.toUpperCase()} Action`;
@@ -465,20 +628,14 @@ function processRequest(reqBody, {
 
   if (dryRun) {
     logOutcome('dry_run_would_create', { summary });
-    return {
-      httpStatus: 200,
-      body: { status: 'DryRunFinding', dryRun: true, wouldCreate: { title: issueTitle, body: issueBody } }
-    };
+    return { status: 'DryRunFinding', dryRun: true, wouldCreate: { title: issueTitle, body: issueBody } };
   }
 
   const cap = Number(config.rateCapPerRepoPerDay || 3);
   const countToday = countHubIssuesCreatedTodayUTC(github, owner, repo);
   if (countToday >= cap) {
     logOutcome('rate_capped', { summary });
-    return {
-      httpStatus: 200,
-      body: { status: 'Skipped', reason: `Rate cap reached (${countToday}/${cap} issues filed today)`, dryRun }
-    };
+    return { status: 'Skipped', reason: `Rate cap reached (${countToday}/${cap} issues filed today)`, dryRun };
   }
 
   const created = github.issues.create({
@@ -491,5 +648,5 @@ function processRequest(reqBody, {
   logOutcome('created', { issueUrl: created.data.html_url, summary });
   recordUsage('issue_created', { issueUrl: created.data.html_url });
 
-  return { httpStatus: 200, body: { status: 'Success', dryRun, issueUrl: created.data.html_url } };
+  return { status: 'Success', dryRun, issueUrl: created.data.html_url };
 }

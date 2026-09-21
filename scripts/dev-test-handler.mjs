@@ -37,7 +37,10 @@ function check(name, condition) {
 
 // `decisionLog: null` simulates the file not existing yet (getContent 404s).
 // Pass an array (even []) to simulate an existing log with that content.
-function makeFakeOctokit({ decisionLog = null, issuesCreatedToday = [], commitSha = 'abc123', diffFiles } = {}) {
+function makeFakeOctokit({
+  decisionLog = null, issuesCreatedToday = [], commitSha = 'abc123', diffFiles,
+  commitAuthorLogin, missingLocalFiles = []
+} = {}) {
   const calls = { issuesCreate: [], getContent: [], createOrUpdateFileContents: [] };
   let currentLog = decisionLog;
   let currentSha = decisionLog !== null ? 'fake-sha-0' : null;
@@ -55,7 +58,8 @@ function makeFakeOctokit({ decisionLog = null, issuesCreatedToday = [], commitSh
           return { data: { content: Buffer.from(JSON.stringify(currentLog)).toString('base64'), sha: currentSha } };
         }
         if (path === 'lessons.md' || path === 'NORTH_STAR.md') {
-          return { data: { content: Buffer.from('fake local context').toString('base64') } };
+          if (missingLocalFiles.includes(path)) throw new Error('404 not found');
+          return { data: { content: Buffer.from(`fake content of ${path}`).toString('base64') } };
         }
         throw new Error('404 not found');
       },
@@ -68,7 +72,12 @@ function makeFakeOctokit({ decisionLog = null, issuesCreatedToday = [], commitSh
         return { data: {} };
       },
       listCommits: async () => ({ data: commitSha ? [{ sha: commitSha }] : [] }),
-      getCommit: async () => ({ data: { files } })
+      getCommit: async () => ({
+        data: {
+          files,
+          ...(commitAuthorLogin ? { author: { login: commitAuthorLogin } } : {})
+        }
+      })
     },
     issues: {
       listForRepo: async () => ({ data: issuesCreatedToday }),
@@ -128,6 +137,22 @@ function makeFakeFetch(aiJsonContent) {
   return fetchImpl;
 }
 
+// Same as makeFakeFetch, but also captures the actual request body sent to
+// the AI - needed to assert on which files/text made it into the prompt
+// (issue #34's ordering/truncation fix, issue #35's local-context fix).
+function makeFakeFetchCapturing(aiJsonContent) {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push(JSON.parse(options.body));
+    return {
+      json: async () => ({ choices: [{ message: { content: aiJsonContent } }] })
+    };
+  };
+  fetchImpl.callCount = () => calls.length;
+  fetchImpl.lastPrompt = () => calls[calls.length - 1]?.messages?.[0]?.content ?? '';
+  return fetchImpl;
+}
+
 const FINDING_JSON = JSON.stringify({
   has_findings: true,
   action_summary: 'Found a thing',
@@ -141,6 +166,22 @@ const NO_FINDING_JSON = JSON.stringify({
   code_patch: '',
   value_impact: { reasoning: '' }
 });
+
+// Registers the plain 'o'/'r' owner/repo pair every non-multi-tenancy test
+// below uses, as a real registered spoke on a tenant with no callerKeyRef -
+// these tests exist to exercise dry-run/rate-cap/decision-log/diff-ordering
+// logic, not tenant resolution, and processRequest() now rejects an
+// owner/repo that isn't a registered spoke outright (see
+// resolveTenantIdForSpoke's header comment), so they need a real
+// registration to keep reaching the behavior they're actually testing.
+// Without an override, processRequest() reads the REAL spokes.json/
+// tenants.json off disk - 'o'/'r' is not a real spoke there.
+const GENERIC_SPOKE = [
+  { tenantId: 'generic', owner: 'o', repo: 'r', addedAt: '2026-08-13T00:00:00Z', status: 'active' }
+];
+const GENERIC_TENANT = [
+  { tenantId: 'generic', name: 'Generic test tenant', status: 'active', plan: 'internal', quota: { reviewsPerMonth: null }, createdAt: '2026-08-13T00:00:00Z' }
+];
 
 // A registry with two distinct tenants, each with one spoke - used by every
 // multi-tenancy test below so tenant isolation is asserted against real
@@ -162,7 +203,7 @@ async function testDryRunNeverCreatesIssue() {
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { httpStatus, body } = await processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true }
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('httpStatus is 200', httpStatus === 200);
   check('status is DryRunFinding', body.status === 'DryRunFinding');
@@ -185,7 +226,7 @@ async function testRateCapBlocksAtLimit() {
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: false }
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: false, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('status is Skipped once at cap', body.status === 'Skipped');
   check('reason mentions rate cap', /rate cap/i.test(body.reason || ''));
@@ -200,7 +241,7 @@ async function testRateCapAllowsUnderLimit() {
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: false }
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: false, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('status is Success', body.status === 'Success');
   check('dryRun is false', body.dryRun === false);
@@ -217,7 +258,7 @@ async function testNoFindingsResponseCarriesDryRun() {
   const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
   const { body } = await processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true }
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('status is Skipped', body.status === 'Skipped');
   check('dryRun field is present', body.dryRun === true);
@@ -234,7 +275,7 @@ async function testDecisionLogSkipsAlreadyDecidedCommit() {
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true }
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('AI was never called', fetchImpl.callCount() === 0);
   check('status is Skipped', body.status === 'Skipped');
@@ -250,7 +291,7 @@ async function testAiErrorDoesNotBlockRetry() {
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true }
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('AI was called (not skipped)', fetchImpl.callCount() === 1);
   check('a real decision was reached', body.status === 'DryRunFinding');
@@ -262,7 +303,7 @@ async function testDecisionLogWritesEntryOnNormalRun() {
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   await processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true }
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   const writes = octokit.calls.createOrUpdateFileContents;
   check('exactly one write to the decision log', writes.length === 1);
@@ -281,7 +322,7 @@ async function testReplayOfACreatedDecisionSurfacesIssueUrlAtTopLevel() {
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true }
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('AI was never called', fetchImpl.callCount() === 0);
   check('top-level issueUrl matches the logged one', body.issueUrl === 'https://github.com/o/r/issues/42');
@@ -297,24 +338,31 @@ async function testReplayWithoutAnIssueUrlOmitsTheField() {
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
     { owner: 'o', repo: 'r', mode: 'debug' },
-    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true }
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('no top-level issueUrl field', body.issueUrl === undefined);
 }
 
 // --- Multi-tenancy: credential resolution, isolation, usage, quota --------
 
-async function testUnregisteredSpokeFallsBackToDefaultTenantCredential() {
-  console.log('Multi-tenancy: a spoke not in spokes.json falls back to the "default" tenant (backward compat)');
+async function testUnregisteredSpokeIsRejectedOutright() {
+  // Real gap this closed: before this, resolveTenantIdForSpoke() fell back
+  // to the "default" tenant - and its GLOBAL_GITHUB_TOKEN-backed credential
+  // - for ANY owner/repo, not just this hub's own registered spokes. It now
+  // returns no tenant at all for an unmatched owner/repo, and
+  // processRequest() rejects the request before any GitHub call runs.
+  console.log('Multi-tenancy: an owner/repo that is not a registered spoke of ANY tenant is rejected outright, before any GitHub call runs');
   process.env.GLOBAL_GITHUB_TOKEN = 'the-global-token';
   const octokit = makeFakeOctokit();
   const factory = makeFakeOctokitFactory(octokit);
   const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
-  await processRequest(
+  const { httpStatus, body } = await processRequest(
     { owner: 'not-registered-owner', repo: 'not-registered-repo', mode: 'debug' },
     { octokitFactory: factory, fetchImpl, dryRunOverride: true, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
-  check('resolved to GLOBAL_GITHUB_TOKEN, not a tenant-specific one', factory.tokensUsed[0] === 'the-global-token');
+  check('httpStatus is 403', httpStatus === 403);
+  check('error names the actual problem', /not a registered spoke/i.test(body.error || ''));
+  check('no real GitHub API call ever ran with the global token', octokit.calls.getContent.length === 0);
   delete process.env.GLOBAL_GITHUB_TOKEN;
 }
 
@@ -495,6 +543,143 @@ async function testNullQuotaMeansUnlimited() {
   delete process.env.ACME_TEST_TOKEN;
 }
 
+// --- Issue #34: diff ordering/truncation puts code before docs, and one -----
+// --- huge file can't starve everything after it -----------------------------
+
+async function testDiffOrdersCodeFilesBeforeDocFilesWhenBothCantFit() {
+  console.log('Issue #34: when the diff is too big to fit, a doc file yields its slot to a code file');
+  // A huge doc file first (as GitHub's file order would have it), then a
+  // small real code file - large enough combined to force a choice.
+  const hugeDocPatch = '+line\n'.repeat(5000); // way over MAX_DIFF_CHARS on its own
+  const diffFiles = [
+    { filename: 'DEPLOY_GUIDE.md', status: 'modified', patch: hugeDocPatch },
+    { filename: 'src/real_logic.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n-buggy\n+fixed' }
+  ];
+  const octokit = makeFakeOctokit({ diffFiles });
+  const fetchImpl = makeFakeFetchCapturing(NO_FINDING_JSON);
+  await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
+  );
+  const prompt = fetchImpl.lastPrompt();
+  check('the code file made it into the prompt', prompt.includes('src/real_logic.js'));
+  check('the code file\'s actual patch text is present', prompt.includes('buggy') && prompt.includes('fixed'));
+}
+
+async function testDiffCapsAnySingleFileSoItCannotStarveTheRest() {
+  console.log("Issue #34: one file's patch is capped so it can't consume the whole budget alone");
+  const hugeCodePatch = '+line\n'.repeat(5000);
+  const diffFiles = [
+    { filename: 'src/huge_file.js', status: 'modified', patch: hugeCodePatch },
+    { filename: 'src/small_file.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n-old\n+distinctive_marker' }
+  ];
+  const octokit = makeFakeOctokit({ diffFiles });
+  const fetchImpl = makeFakeFetchCapturing(NO_FINDING_JSON);
+  await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
+  );
+  const prompt = fetchImpl.lastPrompt();
+  check('the huge file is present but truncated', prompt.includes('src/huge_file.js') && prompt.includes('truncated'));
+  check('the small file after it still made it in', prompt.includes('distinctive_marker'));
+}
+
+async function testDiffNotesOmittedFilesWhenTheyDontFit() {
+  console.log('Issue #34: files that genuinely cannot fit are named in an omission note, not silently dropped');
+  // Each patch is well over PER_FILE_MAX_CHARS (2000) on its own, so every
+  // file gets capped to ~2000 chars individually - but 7 of those (~14,000
+  // chars combined) still can't all fit under the overall MAX_DIFF_CHARS
+  // (12000), so at least one must be omitted outright.
+  const diffFiles = Array.from({ length: 7 }, (_, i) => ({
+    filename: `src/${String.fromCharCode(97 + i)}.js`, // a.js, b.js, ...
+    status: 'modified',
+    patch: '+line\n'.repeat(3000)
+  }));
+  const octokit = makeFakeOctokit({ diffFiles });
+  const fetchImpl = makeFakeFetchCapturing(NO_FINDING_JSON);
+  await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
+  );
+  const prompt = fetchImpl.lastPrompt();
+  check('an omission note is present', prompt.includes('omitted'));
+  check('the omission note names a specific dropped file', /src\/[a-g]\.js/.test(prompt.slice(prompt.indexOf('omitted'))));
+}
+
+// --- Issue #35: bot-authored / generated-data-only commits are skipped -----
+// --- before spending an AI call, and local-context files are independent --
+
+async function testBotAuthoredCommitIsSkippedBeforeTheAiCall() {
+  console.log('Issue #35: a github-actions[bot]-authored commit is skipped before the AI call');
+  const octokit = makeFakeOctokit({ commitAuthorLogin: 'github-actions[bot]' });
+  const fetchImpl = makeFakeFetch(FINDING_JSON);
+  const { body } = await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
+  );
+  check('AI was never called', fetchImpl.callCount() === 0);
+  check('status is Skipped', body.status === 'Skipped');
+  check('reason mentions bot/excluded', /bot|excluded/i.test(body.reason || ''));
+}
+
+async function testHumanCommitTouchingOnlyExportsPathIsSkipped() {
+  console.log('Issue #35: a commit touching only exports/ paths is skipped even from a human author');
+  const diffFiles = [
+    { filename: 'exports/2026-08-17-issues.json', status: 'added', patch: '+huge json dump' },
+    { filename: 'exports/2026-08-17-issues.md', status: 'added', patch: '+huge md dump' }
+  ];
+  const octokit = makeFakeOctokit({ diffFiles }); // no bot author set - a human pushed this
+  const fetchImpl = makeFakeFetch(FINDING_JSON);
+  const { body } = await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
+  );
+  check('AI was never called', fetchImpl.callCount() === 0);
+  check('status is Skipped', body.status === 'Skipped');
+}
+
+async function testNormalCommitFromABotIsNotSkippedIfPathsArentExcluded() {
+  console.log('Issue #35 (regression guard): being bot-authored alone already skips - but a mixed human/bot-adjacent path set is not treated as excluded unless ALL files match');
+  const diffFiles = [
+    { filename: 'src/real_logic.js', status: 'modified', patch: '@@ -1,1 +1,1 @@\n-old\n+new' },
+    { filename: 'exports/data.json', status: 'added', patch: '+data' }
+  ];
+  const octokit = makeFakeOctokit({ diffFiles }); // human author, mixed paths - NOT all excluded
+  const fetchImpl = makeFakeFetch(FINDING_JSON);
+  const { httpStatus } = await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
+  );
+  check('AI was still called - not every file matched the excluded prefix', fetchImpl.callCount() === 1);
+  check('httpStatus is 200', httpStatus === 200);
+}
+
+async function testLocalContextSurvivesWhenOnlyOneFileIsMissing() {
+  console.log("Issue #35: a real lessons.md still reaches the prompt even when NORTH_STAR.md 404s");
+  const octokit = makeFakeOctokit({ missingLocalFiles: ['NORTH_STAR.md'] });
+  const fetchImpl = makeFakeFetchCapturing(NO_FINDING_JSON);
+  await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
+  );
+  const prompt = fetchImpl.lastPrompt();
+  check('the real lessons.md content reached the prompt', prompt.includes('fake content of lessons.md'));
+  check('NORTH_STAR is reported as not found, not silently dropped', prompt.includes('(none found)'));
+  check('the whole local context did NOT collapse to "No local context found."', !prompt.includes('No local context found.'));
+}
+
+async function testLocalContextIsTheNoneFoundFallbackWhenBothFilesAreMissing() {
+  console.log('Issue #35 (regression guard): when BOTH local files are genuinely missing, the fallback text still applies');
+  const octokit = makeFakeOctokit({ missingLocalFiles: ['lessons.md', 'NORTH_STAR.md'] });
+  const fetchImpl = makeFakeFetchCapturing(NO_FINDING_JSON);
+  await processRequest(
+    { owner: 'o', repo: 'r', mode: 'debug' },
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
+  );
+  const prompt = fetchImpl.lastPrompt();
+  check('falls back to "No local context found."', prompt.includes('No local context found.'));
+}
+
 async function main() {
   await testDryRunNeverCreatesIssue();
   await testRateCapBlocksAtLimit();
@@ -505,7 +690,7 @@ async function main() {
   await testDecisionLogWritesEntryOnNormalRun();
   await testReplayOfACreatedDecisionSurfacesIssueUrlAtTopLevel();
   await testReplayWithoutAnIssueUrlOmitsTheField();
-  await testUnregisteredSpokeFallsBackToDefaultTenantCredential();
+  await testUnregisteredSpokeIsRejectedOutright();
   await testRegisteredSpokeResolvesItsOwnTenantCredential();
   await testSuspendedTenantIsSkippedBeforeAnyGithubCall();
   await testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken();
@@ -516,6 +701,14 @@ async function main() {
   await testQuotaExceededBlocksBeforeTheAiCall();
   await testQuotaUnderLimitProceedsNormally();
   await testNullQuotaMeansUnlimited();
+  await testDiffOrdersCodeFilesBeforeDocFilesWhenBothCantFit();
+  await testDiffCapsAnySingleFileSoItCannotStarveTheRest();
+  await testDiffNotesOmittedFilesWhenTheyDontFit();
+  await testBotAuthoredCommitIsSkippedBeforeTheAiCall();
+  await testHumanCommitTouchingOnlyExportsPathIsSkipped();
+  await testNormalCommitFromABotIsNotSkippedIfPathsArentExcluded();
+  await testLocalContextSurvivesWhenOnlyOneFileIsMissing();
+  await testLocalContextIsTheNoneFoundFallbackWhenBothFilesAreMissing();
 
   console.log('');
   if (failures > 0) {
