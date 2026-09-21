@@ -298,9 +298,18 @@ per CodeQL run is the price of keeping the YAML identical everywhere.
 
 ## Current compliance
 
-Verified 2026-09-21 by direct inspection, not by reading docs. Mothership's
-rows 6–9 were flipped by the work in this branch and each was proven per the
-DoD above; the other four repos' columns are unchanged since that audit.
+**Correction (2026-09-21, later same day):** the table below originally
+showed Argoloth/KOS/TSO as missing checks 6–10, current only as of the point
+where this repo's own work reached full compliance and *before* those three
+repos had actually received the distribution. It was never updated after —
+which this document's own later "dispatch proof" section already
+contradicted (a `probe` job cannot report real per-secret results in a repo
+that doesn't have `secrets-doctor.yml` installed) and `SESSION_HANDOFF.md`
+already recorded correctly (Argoloth #13–#14, KOS #30, TSO #2054, all
+merged). Fixed here rather than left to keep contradicting evidence three
+sections down in the same file.
+
+Verified 2026-09-21 by direct inspection, not by reading docs.
 
 | | Mothership | KOS | Argoloth | TSO | ThinkOS |
 |---|---|---|---|---|---|
@@ -309,16 +318,19 @@ DoD above; the other four repos' columns are unchanged since that audit.
 | 3 watchdog | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 4 tests in CI | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 5 docs-check | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 6 doc-currency | ✅ | ✅ | ❌ | ✅ | ❌ |
-| 7 doc-link-check | ✅ | ❌ | ❌ | ✅ | ✅ |
-| 8 doc-placeholder-check | ✅ | ❌ | ❌ | ✅ | ✅ |
-| 9 coverage-gaps | ✅ | ✅ | ❌ | ✅ | ❌ |
-| 10 secrets-doctor | ✅ | ❌ | ❌ | ⚠️ | ❌ |
+| 6 doc-currency | ✅ | pre-existing own | ✅ | pre-existing own | ❌ |
+| 7 doc-link-check | ✅ | ✅ | ✅ | ✅ | non-canonical |
+| 8 doc-placeholder-check | ✅ | ✅ | ✅ | ✅ | non-canonical |
+| 9 coverage-gaps | ✅ | pre-existing own | ✅ | ✅ | ❌ |
+| 10 secrets-doctor | ✅ | ✅ | ✅ | ✅ | PR #6, draft |
 
 **The hub was not compliant, and that blocked everything.** A distributor
 can only distribute what it has, so bringing this repo to full compliance was
 the first implementation step, not a parity cleanup to be done later. **The
-hub is now compliant on all ten.** The next step is the distributor itself.
+hub is now compliant on all ten, and Argoloth, KOS and TSO have received the
+distribution** (merged: Argoloth #13–#14, KOS #30, TSO #2054). ThinkOS-Server
+is the only repo left short of the floor — see open item 9 in
+`SESSION_HANDOFF.md`.
 
 Where a check's mature implementation lives elsewhere, it is adopted here
 rather than rewritten. Which copy to adopt was decided by reading both, not
@@ -380,13 +392,16 @@ what this repo considers current. Generalizing the sync tool closes this as
 a side effect of step 3 above — but it is a real, pre-existing hole, not
 newly introduced by the floor work.
 
-## Partial credit
+## Partial credit (historical)
 
-**TSO, check 10 (⚠️).** TSO has a doctor and it works, but it hand-lists
-three secrets while its workflows reference six — `BACKUP_DATABASE_URL` and
-`BACKUP_PASSPHRASE` from `db-backup.yml` are unchecked. It is not absent and
-it is not compliant: replacing it with the generic `secrets-doctor` closes
-the gap and removes the hand-maintained list at the same time.
+**TSO, check 10, before PR #2054 merged.** TSO had a doctor and it worked,
+but it hand-listed three secrets while its workflows referenced five that
+needed configuring — `BACKUP_DATABASE_URL` and `BACKUP_PASSPHRASE` from
+`db-backup.yml` were unchecked. Superseded: the generic `secrets-doctor` is
+merged and running (see "Current compliance" above), and its first real
+dispatch found exactly the gap this section predicted — both secrets unset,
+`db-backup.yml` never once successful. Kept as the record of why the generic
+check replaced the hand-written one, not as current status.
 
 ## Exemptions
 

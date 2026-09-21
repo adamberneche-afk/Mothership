@@ -144,11 +144,13 @@ Items 2, 4, 6 and 10 are unchanged in substance from what Audit Docket II alread
 
 ## Repo state as of this handoff
 
-**Updated 2026-09-21.** Everything this session touched is merged; one docs commit is pushed and unmerged.
+**Updated 2026-09-21.** Everything this session touched is merged.
+
+> **Correction (2026-09-21, later same day):** this table originally said the branch below was "1 commit ahead, pushed, no PR opened." That was true when written and stale by the time anyone read it — PR #53 carrying that exact commit merged at 23:20:18 UTC the same day, before this file's own next read. Recorded here rather than silently fixed, since a table whose own subject changes out from under it while the file is being edited is the same class of mistake this document exists to catch.
 
 | Repo | `main` | Open work from this session |
 |---|---|---|
-| Mothership | `1876b85` (#52 merged) | `claude/mothership-handoff-review-5k8plk` is **1 commit ahead, pushed, no PR opened** — `CICD_FLOOR.md`'s dispatch proof plus this handoff update. Open a PR or cherry-pick it; do not let it rot on the branch. |
+| Mothership | `ba19888` (#53 merged) | none |
 | Argoloth | `114e2c7` (#14 merged) | none |
 | KOS | `2fbc5a4` (#30 merged) | none |
 | TSO | `75498c9` (#2054 merged) | none |
