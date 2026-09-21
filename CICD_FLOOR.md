@@ -30,7 +30,7 @@ recorded below as a deliberate exemption with a reason.
 | 3 | **watchdog** | `actionlint` over every workflow file, plus the last run conclusion of every `schedule`-triggered workflow. Weekly. |
 | 4 | **Tests gated in CI** | A required check that runs the repo's real test suite on every PR. |
 | 5 | **docs-check** | A PR adding a new capability file must touch that area's docs. |
-| 6 | **doc-currency** | Docs may not cite functions, files or counts that no longer exist. |
+| 6 | **doc-currency** | Docs may not cite a file or a function that no longer exists in the repo. A line carrying a `doc-currency:ignore` marker is skipped, and a path that is legitimately never present here (a spoke's file, a gitignored one) is declared in `floor.json`'s `knownAbsentPaths` — a map, so each entry carries its written reason. |
 | 7 | **doc-link-check** | No dead relative links between Markdown files. |
 | 8 | **doc-placeholder-check** | No unedited template text (`[Your Company Name]`, lorem ipsum). A line carrying a `floor-allow-placeholder` marker is skipped — for docs that describe the check and therefore must contain its patterns. <!-- floor-allow-placeholder: this row documents the patterns --> |
 | 9 | **coverage-gaps** | Every scheduled job's script has test coverage CI can actually reach. |
@@ -127,6 +127,9 @@ This also matches existing convention — `spokes.json`, `tenants.json` and
 
 ### `.github/floor.json`
 
+Abridged — this repo's real `.github/floor.json` is the authority, and it
+grows a key each time a check is adopted. The shape:
+
 ```json
 {
   "floorVersion": "1",
@@ -136,9 +139,17 @@ This also matches existing convention — `spokes.json`, `tenants.json` and
     "watchedPaths": ["api/", "gas/", "dashboard/", ".github/workflows/"],
     "requiredDocs": ["README.md"]
   },
+  "docExcludePaths": ["node_modules"],
+  "docCurrency": { "excludeDirs": [], "exemptDocs": [], "codeExtensions": [], "knownAbsentPaths": {} },
+  "placeholderPatterns": [],
   "scheduledScriptDir": "scripts/"
 }
 ```
+
+Every key is read defensively — a missing one degrades to a documented
+default rather than hard-failing the check. That matters because a spoke's
+copy of `floor.json` will routinely predate a key the hub has just added,
+and the distributed workflow has to keep working in the interval.
 
 **Known cost.** A `strategy.matrix` needs its values at workflow-parse time,
 so it cannot read a file directly. CodeQL therefore gains a small preceding
@@ -148,7 +159,9 @@ per CodeQL run is the price of keeping the YAML identical everywhere.
 
 ## Current compliance
 
-Verified 2026-09-21 by direct inspection, not by reading docs.
+Verified 2026-09-21 by direct inspection, not by reading docs. Mothership's
+rows 6–8 were flipped by the work in this branch and each was proven per the
+DoD above; the other four repos' columns are unchanged since that audit.
 
 | | Mothership | KOS | Argoloth | TSO | ThinkOS |
 |---|---|---|---|---|---|
@@ -157,21 +170,33 @@ Verified 2026-09-21 by direct inspection, not by reading docs.
 | 3 watchdog | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 4 tests in CI | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 5 docs-check | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 6 doc-currency | ❌ | ✅ | ❌ | ✅ | ❌ |
-| 7 doc-link-check | ❌ | ❌ | ❌ | ✅ | ✅ |
-| 8 doc-placeholder-check | ❌ | ❌ | ❌ | ✅ | ✅ |
+| 6 doc-currency | ✅ | ✅ | ❌ | ✅ | ❌ |
+| 7 doc-link-check | ✅ | ❌ | ❌ | ✅ | ✅ |
+| 8 doc-placeholder-check | ✅ | ❌ | ❌ | ✅ | ✅ |
 | 9 coverage-gaps | ❌ | ✅ | ❌ | ✅ | ❌ |
 | 10 doctor | ✅ | ❌ | ❌ | ✅ | ❌ |
 
-**The hub is not compliant, and that now blocks everything.** Mothership is
-missing checks 6–9. A distributor can only distribute what it has, so
-bringing this repo to full compliance is the first implementation step, not
-a parity cleanup to be done later.
+**The hub was not compliant, and that blocked everything.** A distributor
+can only distribute what it has, so bringing this repo to full compliance is
+the first implementation step, not a parity cleanup to be done later. Checks
+7, 8 and 6 are now in; **check 9 (`coverage-gaps`) is the last gap.**
 
 Where a check's mature implementation lives elsewhere, it is adopted here
-rather than rewritten: `doc-currency` from KOS (it checks doc *truth*, not
-just that a doc was touched), and `coverage-gaps` from TSO (its
-require-graph resolution supersedes KOS's VM-instrumented original).
+rather than rewritten. Which copy to adopt was decided by reading both, not
+by reputation:
+
+- **`doc-currency` from TSO**, not KOS. KOS's is much the more capable of the
+  two — 14 checks against TSO's 2, plus a whole exclusions taxonomy — but it
+  `require`s `../gas-lint/check.js`, a KOS-only Apps Script static analyzer, <!-- doc-currency:ignore: KOS's file, named here for contrast - deliberately not this repo's -->
+  for its comment and string stripping. Adopting it wholesale would mean
+  dragging gas-lint into every repo the floor reaches. TSO's is a
+  dependency-free slice of the same original and imports nothing but node
+  builtins, which is the property that matters for a file that has to run
+  unchanged in five repos. Porting the two checks it kept
+  (`cited-file-missing`, `cited-function-missing`) is a deliberate floor,
+  not a shortfall: a repo wanting KOS's other twelve can still have them.
+- **`coverage-gaps` from TSO**, whose require-graph resolution supersedes
+  KOS's VM-instrumented original.
 
 ## Latent gap this surfaced
 

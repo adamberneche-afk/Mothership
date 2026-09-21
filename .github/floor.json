@@ -8,6 +8,16 @@
     "requiredDocs": ["README.md"]
   },
   "docExcludePaths": ["node_modules"],
+  "docCurrency": {
+    "excludeDirs": ["node_modules", ".git", "__pycache__", "dist", "build", "coverage"],
+    "exemptDocs": ["lessons.md", "hub_lessons.md", "session_handoff.md", "docs_vs_codebase.md"],
+    "codeExtensions": [".js", ".mjs", ".cjs", ".py"],
+    "knownAbsentPaths": {
+      ".github/workflows/call-hub.yml": "a SPOKE's file, not the hub's - this repo documents it extensively because managing spokes is its whole job, and setup_spoke.py generates it. Cited on ~7 README lines and will keep growing, which is why this belongs here rather than as per-line markers.",
+      "gas/.clasp.json": "gitignored by design - it carries a scriptId tied to one person's Google account. gas/.clasp.json.example is the checked-in template, and that one does resolve.",
+      "meta/FLOW_DOCTRINE.md": "a KOS file, cited for attribution where this repo's queue-liveness checks were ported from. Attributed as KOS's in the surrounding prose."
+    }
+  },
   "placeholderPatterns": [
     "\\[Your [A-Z][a-z]",
     "[Ll]orem ipsum",

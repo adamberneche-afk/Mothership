@@ -1,0 +1,52 @@
+name: Documentation Currency Check
+
+# Floor check 6 (see CICD_FLOOR.md). Catches a doc that cites a function or
+# a file which no longer exists in this repo. Adapted from TSO's
+# tools/doc-currency, itself a narrow slice of KOS's original - see the
+# header of scripts/doc-currency.js for why TSO's is the base rather than
+# KOS's more capable version.
+#
+# WHY THIS IS NOT REDUNDANT WITH ci.yml's docs-check: docs-check asks
+# whether README.md was *touched* in the same PR as a new capability file.
+# That is a question about diffs, not about truth - a PR can satisfy it
+# completely while leaving every existing claim in the doc stale. This asks
+# the other question.
+#
+# DELIBERATELY NO `paths:` FILTER. Doc currency is a joint property of the
+# docs AND the code: deleting a function in api/ can make a README stale
+# without touching a single .md file, and that is the exact failure mode
+# worth catching. A `paths:` list is also evaluated at workflow-parse time,
+# so it could not be driven from .github/floor.json the way the rest of the
+# floor's per-repo settings are - hardcoding one here would break the
+# byte-identical-in-every-repo property. The check is a pure filesystem
+# walk with no network and no dependency install, so running it on every
+# PR costs seconds.
+#
+# Per-repo settings live in .github/floor.json under `docCurrency`, read at
+# runtime - see CICD_FLOOR.md's "why runtime config instead of templating"
+# section.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  doc-currency:
+    runs-on: ubuntu-latest
+    # A read-only checkout is all this needs: no network, no credentials,
+    # no dependency install. Safe on a pull_request opened from a fork.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      # No `npm ci` - scripts/doc-currency.js imports only node builtins,
+      # on purpose, so this check cannot be taken down by a dependency
+      # install failing.
+      - name: Check docs for stale file and function citations
+        run: node scripts/doc-currency.js
