@@ -19,6 +19,14 @@
     "scriptExtensions": [".js", ".mjs", ".cjs"],
     "exemptScripts": {}
   },
+  "doctor": {
+    "optionalSecrets": {
+      "AI_API_KEY": "normally lives only as a Vercel env var, not an Actions secret - an Actions runner cannot read Vercel's env either way, so its absence here is expected unless it has been deliberately mirrored. doctor.js's own AI check degrades to a clean skip for the same reason.",
+      "AI_BASE_URL": "same as AI_API_KEY - a Vercel env var, mirrored to Actions only if someone chose to.",
+      "GAS_STAGING_DEPLOYMENT_ID": "deploy-apps-script.yml treats the staging deployment as optional and reports a clean skip without it - see that workflow's secrets gate.",
+      "GAS_STAGING_WEB_APP_URL": "same as GAS_STAGING_DEPLOYMENT_ID - only needed once a staging deployment exists."
+    }
+  },
   "placeholderPatterns": [
     "\\[Your [A-Z][a-z]",
     "[Ll]orem ipsum",
