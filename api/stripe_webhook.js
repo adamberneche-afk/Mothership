@@ -51,28 +51,15 @@ import { verifyOnboardingToken } from '../lib/onboarding_token.js';
 import { mintInstallationToken } from '../lib/github_app.js';
 import { appendToJsonRegistryWithRetry, readJsonArrayFile } from '../lib/registry_writer.js';
 import { loadPlansRegistry, findPlanByStripePriceId } from '../lib/secrets.js';
+import { readRawBody } from '../lib/raw_body.js';
 
 export const config = { api: { bodyParser: false } };
 
-const MAX_BODY_BYTES = 1_000_000;
-
-export function readRawBody(req, { maxBytes = MAX_BODY_BYTES } = {}) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let total = 0;
-    req.on('data', (chunk) => {
-      total += chunk.length;
-      if (total > maxBytes) {
-        reject(new Error('payload too large'));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
+// Re-exported for backward compatibility - existing callers (and this
+// file's own test harness) import readRawBody from here; the actual
+// implementation now lives in lib/raw_body.js, deduped with
+// api/github_app_webhook.js's byte-identical copy.
+export { readRawBody };
 
 function tenantIdForInstallation(installationId) {
   return `ghapp-${installationId}`;
@@ -226,7 +213,18 @@ export async function handleStripeWebhook(rawBody, signatureHeader, {
   // just possibly with one redundant plan lookup.
   const { entries: existingTenants } = await readJsonArrayFile(hubOctokit, hubOwner, hubRepo, 'tenants.json');
   if (existingTenants.some((t) => t && t.tenantId === tenantId)) {
-    return { httpStatus: 200, body: { status: 'AlreadyProvisioned', tenantId } };
+    // Still retry spoke registration on a redelivery of an already-
+    // provisioned tenant's event, rather than returning immediately: spoke
+    // registration is best-effort/fail-soft (see autoRegisterSpokesForInstallation's
+    // header comment) and independently idempotent per spoke, so a prior
+    // delivery's spoke-registration failure would otherwise be masked
+    // forever the moment the tenant record itself exists - this is the one
+    // real retry opportunity a Stripe redelivery gives it.
+    const spokeResult = await autoRegisterSpokesForInstallation({
+      installationId, tenantId, hubOctokit, hubOwner, hubRepo, now, fetchImpl,
+      appId: githubAppId, privateKey: githubAppPrivateKey, githubAppRequest
+    });
+    return { httpStatus: 200, body: { status: 'AlreadyProvisioned', tenantId, spokes: spokeResult } };
   }
 
   const plan = await resolvePlanForSession(stripe, session.id, plans);
@@ -243,15 +241,17 @@ export async function handleStripeWebhook(rawBody, signatureHeader, {
 
   const provisionResult = await provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId: session.customer, plan, hubOctokit, hubOwner, hubRepo, now });
 
-  if (provisionResult.status === 'Provisioned') {
-    const spokeResult = await autoRegisterSpokesForInstallation({
-      installationId, tenantId: provisionResult.tenantId, hubOctokit, hubOwner, hubRepo, now, fetchImpl,
-      appId: githubAppId, privateKey: githubAppPrivateKey, githubAppRequest
-    });
-    return { httpStatus: 200, body: { ...provisionResult, spokes: spokeResult } };
-  }
-
-  return { httpStatus: 200, body: provisionResult };
+  // Retries spoke registration regardless of whether THIS call is what
+  // actually wrote the tenant record (status 'Provisioned') or a race
+  // landed it as already-written by a concurrent delivery (status
+  // 'AlreadyProvisioned', from provisionTenantForInstallation's own
+  // decide callback) - same reasoning as the early AlreadyProvisioned
+  // check above.
+  const spokeResult = await autoRegisterSpokesForInstallation({
+    installationId, tenantId: provisionResult.tenantId, hubOctokit, hubOwner, hubRepo, now, fetchImpl,
+    appId: githubAppId, privateKey: githubAppPrivateKey, githubAppRequest
+  });
+  return { httpStatus: 200, body: { ...provisionResult, spokes: spokeResult } };
 }
 
 export default async function handler(req, res) {

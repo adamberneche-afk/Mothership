@@ -40,6 +40,11 @@ on:
         required: false
         type: boolean
         default: false
+      update:
+        description: 'Update an EXISTING tenant-id (plan change, suspension, etc) instead of creating a new one'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   provision-tenant:
@@ -56,16 +61,29 @@ jobs:
         run: npm ci
 
       - name: Provision tenant
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          TENANT_NAME: ${{ inputs.name }}
+          TENANT_PLAN: ${{ inputs.plan }}
+          TENANT_CREDENTIAL_REF: ${{ inputs.credential_ref }}
+          TENANT_QUOTA: ${{ inputs.quota }}
+          TENANT_STATUS: ${{ inputs.status }}
+          TENANT_SPOKES: ${{ inputs.spokes }}
+          TENANT_DRY_RUN: ${{ inputs.dry_run }}
+          TENANT_UPDATE: ${{ inputs.update }}
         run: |
-          ARGS=(--tenant-id "${{ inputs.tenant_id }}" --name "${{ inputs.name }}" --plan "${{ inputs.plan }}" --credential-ref "${{ inputs.credential_ref }}")
-          if [ -n "${{ inputs.quota }}" ]; then ARGS+=(--quota "${{ inputs.quota }}"); fi
-          if [ -n "${{ inputs.status }}" ]; then ARGS+=(--status "${{ inputs.status }}"); fi
-          for spoke in ${{ inputs.spokes }}; do ARGS+=(--spoke "$spoke"); done
-          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS+=(--dry-run); fi
+          ARGS=(--tenant-id "$TENANT_ID" --name "$TENANT_NAME" --plan "$TENANT_PLAN" --credential-ref "$TENANT_CREDENTIAL_REF")
+          if [ -n "$TENANT_QUOTA" ]; then ARGS+=(--quota "$TENANT_QUOTA"); fi
+          if [ -n "$TENANT_STATUS" ]; then ARGS+=(--status "$TENANT_STATUS"); fi
+          for spoke in $TENANT_SPOKES; do ARGS+=(--spoke "$spoke"); done
+          if [ "$TENANT_DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "$TENANT_UPDATE" = "true" ]; then ARGS+=(--update); fi
           node scripts/provision-tenant.js "${ARGS[@]}"
 
       - name: Commit and push (skipped on dry run)
         if: inputs.dry_run != 'true'
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -74,5 +92,5 @@ jobs:
             exit 0
           fi
           git add tenants.json spokes.json
-          git commit -m "chore: provision tenant ${{ inputs.tenant_id }} (operator-driven, via Actions)"
+          git commit -m "chore: provision tenant $TENANT_ID (operator-driven, via Actions)"
           git push

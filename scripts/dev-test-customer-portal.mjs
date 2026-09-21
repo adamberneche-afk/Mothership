@@ -210,6 +210,36 @@ async function testRequestAfterTheRateLimitWindowIsAllowedAgain() {
   check('and sent a second email', sendEmailImpl.calls.length === 2);
 }
 
+async function testRateLimitMapIsCappedAndEvictsTheOldestEntryUnderSustainedDistinctEmails() {
+  console.log("the rate-limit Map is bounded - it doesn't grow past maxRateLimitEntries under a flood of distinct emails (memory-exhaustion DoS mitigation)");
+  const stripeClient = makeFakeStripeClient({ customersListResult: { data: [] } });
+  const rateLimitState = new Map();
+  const now = 9_000_000;
+  const cap = 5;
+  for (let i = 0; i < cap; i++) {
+    await handleRequestPortalLink({ email: `flood${i}@customer.com` }, { stripeClient, dashboardBaseUrl: 'https://mothership.example', rateLimitState, now, maxRateLimitEntries: cap });
+  }
+  check(`Map grew to exactly the cap (${cap}) after ${cap} distinct emails`, rateLimitState.size === cap);
+
+  await handleRequestPortalLink({ email: 'flood-overflow@customer.com' }, { stripeClient, dashboardBaseUrl: 'https://mothership.example', rateLimitState, now, maxRateLimitEntries: cap });
+  check('Map size never exceeds the cap, even after one more distinct email', rateLimitState.size === cap);
+  check('the oldest entry (flood0) was evicted to make room', !rateLimitState.has('flood0@customer.com'));
+  check('the newest entry is present', rateLimitState.has('flood-overflow@customer.com'));
+}
+
+async function testExpiredRateLimitEntriesAreSweptOnTheNextCall() {
+  console.log('an entry whose rate-limit window has already elapsed is swept out of the Map on the next call, not kept around forever');
+  const stripeClient = makeFakeStripeClient({ customersListResult: { data: [] } });
+  const rateLimitState = new Map();
+  const now = 1_000_000;
+  await handleRequestPortalLink({ email: 'expires-soon@customer.com' }, { stripeClient, dashboardBaseUrl: 'https://mothership.example', rateLimitState, now });
+  check('the entry exists right after the first request', rateLimitState.has('expires-soon@customer.com'));
+
+  await handleRequestPortalLink({ email: 'someone-else@customer.com' }, { stripeClient, dashboardBaseUrl: 'https://mothership.example', rateLimitState, now: now + 61_000 });
+  check('the expired entry was swept away by a later, unrelated call', !rateLimitState.has('expires-soon@customer.com'));
+  check('the Map only holds the still-active entry', rateLimitState.size === 1 && rateLimitState.has('someone-else@customer.com'));
+}
+
 async function testStripeOrEmailFailureIsSwallowedAndStillReturnsTheGenericResponse() {
   console.log('a Stripe/email failure mid-flow is swallowed - never thrown, and still the identical generic response (not distinguishable from a non-match)');
   const stripeClient = {
@@ -248,6 +278,8 @@ async function main() {
   await testMalformedEmailReturnsGenericWithoutCallingStripe();
   await testRateLimitingSkipsStripeAndEmailOnASecondRequestWithinTheWindow();
   await testRequestAfterTheRateLimitWindowIsAllowedAgain();
+  await testRateLimitMapIsCappedAndEvictsTheOldestEntryUnderSustainedDistinctEmails();
+  await testExpiredRateLimitEntriesAreSweptOnTheNextCall();
   await testStripeOrEmailFailureIsSwallowedAndStillReturnsTheGenericResponse();
   await testMissingDashboardBaseUrlFailsSoftWithoutCallingStripe();
 

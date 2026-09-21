@@ -16,7 +16,14 @@
 //     --tenant-id acme --name "Acme Corp" --plan pro \
 //     --credential-ref ghapp:12345678 \
 //     [--quota 100] [--caller-key-ref env:ACME_CALLER_KEY] \
-//     [--status active] [--spoke owner/repo ...] [--dry-run]
+//     [--status active] [--spoke owner/repo ...] [--dry-run] [--update]
+//
+// --update is required to modify an EXISTING tenant-id (the plan-change/
+// manual-suspension use case above) and rejected for a new one - omitting
+// it always creates, so a typo'd tenant-id can never silently overwrite an
+// existing tenant. All fields are re-supplied in full on an update (this
+// CLI has no partial-patch mode), same discipline as writeFileSync below
+// re-writing the whole registry file rather than editing it in place.
 //
 // Trust model: writes DIRECTLY to the local tenants.json/spokes.json on
 // disk (no PR), same as scripts/prune-logs.js's own direct-write
@@ -84,10 +91,21 @@ function validateCredentialRefShape(ref, fieldName, errors) {
 export function validateTenantInput(input, { existingTenants = [], existingSpokes = [], plans = [] } = {}) {
   const errors = [];
 
+  // --update is required to modify an existing tenant-id (plan changes,
+  // manual suspension - see this file's own header comment) and rejected
+  // for a fresh one - an explicit flag either way, so a typo'd tenant-id
+  // can't silently create a duplicate-looking tenant when the operator
+  // meant to update, nor silently overwrite one when they meant to create.
+  const existingTenant = input.tenantId
+    ? existingTenants.find((t) => t && typeof t.tenantId === 'string' && t.tenantId.toLowerCase() === input.tenantId.toLowerCase())
+    : undefined;
+
   if (!input.tenantId || !TENANT_ID_PATTERN.test(input.tenantId)) {
     errors.push(`tenant-id must match ${TENANT_ID_PATTERN} (got '${input.tenantId}')`);
-  } else if (existingTenants.some((t) => t && typeof t.tenantId === 'string' && t.tenantId.toLowerCase() === input.tenantId.toLowerCase())) {
-    errors.push(`tenant-id '${input.tenantId}' already exists (case-insensitive match)`);
+  } else if (existingTenant && !input.update) {
+    errors.push(`tenant-id '${input.tenantId}' already exists (case-insensitive match) - pass --update to modify it`);
+  } else if (!existingTenant && input.update) {
+    errors.push(`--update was given but no existing tenant '${input.tenantId}' was found - omit --update to create it`);
   }
 
   if (!input.name || typeof input.name !== 'string' || !input.name.trim()) {
@@ -139,7 +157,7 @@ export function validateTenantInput(input, { existingTenants = [], existingSpoke
   if (input.credentialRef && CREDENTIAL_SCHEME_PATTERN.test(input.credentialRef)) {
     const [, scheme, value] = input.credentialRef.match(CREDENTIAL_SCHEME_PATTERN);
     if (scheme === 'ghapp' && GHAPP_ID_PATTERN.test(value)) {
-      const alreadyUsed = existingTenants.find((t) => t && t.githubCredentialRef === `ghapp:${value}`);
+      const alreadyUsed = existingTenants.find((t) => t && t.githubCredentialRef === `ghapp:${value}` && t.tenantId.toLowerCase() !== input.tenantId?.toLowerCase());
       if (alreadyUsed) errors.push(`ghapp:${value} is already used by tenant '${alreadyUsed.tenantId}' - one installation, one tenant`);
     }
   }
@@ -177,7 +195,10 @@ export function validateTenantInput(input, { existingTenants = [], existingSpoke
       quota: { reviewsPerMonth },
       githubCredentialRef: input.credentialRef,
       ...(input.callerKeyRef ? { callerKeyRef: input.callerKeyRef } : {}),
-      createdAt: new Date(input.now || Date.now()).toISOString()
+      // An update keeps the tenant's original createdAt rather than
+      // resetting it to now - createdAt means when the tenant was first
+      // provisioned, not when it was last touched.
+      createdAt: existingTenant ? existingTenant.createdAt : new Date(input.now || Date.now()).toISOString()
     },
     spokesToAdd
   };
@@ -201,11 +222,15 @@ export function provisionTenant(input, { existingTenants = [], existingSpokes = 
     return { status: 'DryRun', tenant: validation.tenant, spokesToAdd: spokeEntries };
   }
 
+  const tenantsJson = input.update
+    ? existingTenants.map((t) => (t && t.tenantId.toLowerCase() === input.tenantId.toLowerCase() ? validation.tenant : t))
+    : [...existingTenants, validation.tenant];
+
   return {
-    status: 'Provisioned',
+    status: input.update ? 'Updated' : 'Provisioned',
     tenant: validation.tenant,
     spokesToAdd: spokeEntries,
-    tenantsJson: [...existingTenants, validation.tenant],
+    tenantsJson,
     spokesJson: [...existingSpokes, ...spokeEntries]
   };
 }
@@ -227,6 +252,7 @@ function parseArgs(argv) {
       case '--status': input.status = next(); break;
       case '--spoke': input.spokes.push(next()); break;
       case '--dry-run': input.dryRun = true; break;
+      case '--update': input.update = true; break;
       default:
         console.error(`unrecognized argument: ${arg}`);
         process.exitCode = 1;
@@ -249,16 +275,16 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       for (const err of result.errors) console.error(`  - ${err}`);
       process.exitCode = 1;
     } else if (result.status === 'DryRun') {
-      console.log('Dry run - nothing written. Would create:');
+      console.log(`Dry run - nothing written. Would ${input.update ? 'update' : 'create'}:`);
       console.log(JSON.stringify(result.tenant, null, 2));
       if (result.spokesToAdd.length) console.log('And register spokes:', JSON.stringify(result.spokesToAdd, null, 2));
     } else {
       writeFileSync('tenants.json', JSON.stringify(result.tenantsJson, null, 2) + '\n');
       writeFileSync('spokes.json', JSON.stringify(result.spokesJson, null, 2) + '\n');
-      console.log(`Provisioned tenant '${result.tenant.tenantId}'${result.spokesToAdd.length ? ` with ${result.spokesToAdd.length} spoke(s)` : ''}.`);
+      console.log(`${result.status} tenant '${result.tenant.tenantId}'${result.spokesToAdd.length ? ` with ${result.spokesToAdd.length} spoke(s)` : ''}.`);
       console.log('tenants.json/spokes.json updated on disk - review and commit:');
       console.log('  git add tenants.json spokes.json');
-      console.log(`  git commit -m "chore: provision tenant ${result.tenant.tenantId}"`);
+      console.log(`  git commit -m "chore: ${input.update ? 'update' : 'provision'} tenant ${result.tenant.tenantId}"`);
       console.log('  git push');
     }
   }

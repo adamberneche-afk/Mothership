@@ -86,6 +86,18 @@ async function testInstallationDeletedSuspendsTheMatchingTenant() {
   check('suspendedReason is github_app_uninstalled', tenant.suspendedReason === 'github_app_uninstalled');
 }
 
+async function testInstallationDeletedSuspendsACliProvisionedTenantWithACustomTenantId() {
+  console.log('installation.deleted also finds and suspends a tenant provisioned via scripts/provision-tenant.js with a custom tenant-id (not the ghapp-<id> naming convention)');
+  const { rawBody, signatureHeader } = signedEvent(installationEvent('deleted', 555555));
+  const hubOctokit = makeFakeHubOctokitWithTenants([{ tenantId: 'acme', name: 'Acme Corp', status: 'active', plan: 'standard', quota: { reviewsPerMonth: null }, githubCredentialRef: 'ghapp:555555', installationId: 555555, createdAt: '2026-08-13T00:00:00Z' }]);
+  const result = await handleGithubAppWebhook(rawBody, signatureHeader, { webhookSecret: WEBHOOK_SECRET, hubOctokit });
+  check('reports Suspended, not Ignored - the tenant was found by credential ref, not by naming convention', result.body.status === 'Suspended');
+  check('the response names the real tenantId, not a guessed ghapp-<id> one', result.body.tenantId === 'acme');
+  const tenant = hubOctokit.files['tenants.json'].content.find(t => t.tenantId === 'acme');
+  check('tenant status is now suspended', tenant.status === 'suspended');
+  check('suspendedReason is github_app_uninstalled', tenant.suspendedReason === 'github_app_uninstalled');
+}
+
 async function testInstallationSuspendBehavesTheSameAsDeleted() {
   console.log('installation.suspend behaves the same as deleted');
   const { rawBody, signatureHeader } = signedEvent(installationEvent('suspend', 22222));
@@ -242,6 +254,7 @@ async function main() {
   testVerifyRejectsWrongSecret();
   testVerifyAcceptsARealSignature();
   await testInstallationDeletedSuspendsTheMatchingTenant();
+  await testInstallationDeletedSuspendsACliProvisionedTenantWithACustomTenantId();
   await testInstallationSuspendBehavesTheSameAsDeleted();
   await testInstallationUnsuspendRestoresOnlyWhenReasonMatches();
   await testUnsuspendNeverOverridesAManualSuspension();

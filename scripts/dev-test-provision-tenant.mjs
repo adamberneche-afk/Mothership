@@ -68,6 +68,50 @@ function testDuplicateTenantIdRejectedCaseInsensitive() {
   check('the error names the case-insensitive collision', result.errors.some((e) => /already exists/.test(e)));
 }
 
+function testUpdateWithoutFlagOnExistingTenantIsRejected() {
+  console.log('an existing tenant-id without --update is still rejected (the pre-existing collision guard)');
+  const existingTenants = [{ tenantId: 'acme', name: 'Old Name', status: 'active', plan: 'starter', quota: { reviewsPerMonth: 50 }, githubCredentialRef: 'env:X', createdAt: '2026-01-01T00:00:00Z' }];
+  const result = provision(baseInput({ tenantId: 'acme' }), { existingTenants });
+  check('rejected', result.status === 'Invalid');
+  check('the error suggests --update', result.errors.some((e) => /already exists.*--update/.test(e)));
+}
+
+function testUpdateFlagOnNonexistentTenantIsRejected() {
+  console.log('--update against a tenant-id that does not exist is rejected, not silently treated as a create');
+  const result = provision(baseInput({ tenantId: 'ghost', update: true }), { existingTenants: [] });
+  check('rejected', result.status === 'Invalid');
+  check('the error explains no existing tenant was found', result.errors.some((e) => /no existing tenant 'ghost' was found/.test(e)));
+}
+
+function testUpdateFlagOnExistingTenantReplacesItsRecordInPlace() {
+  console.log('--update on an existing tenant-id replaces its record in tenantsJson, in place, rather than appending a duplicate');
+  const existingTenants = [
+    { tenantId: 'globex', name: 'Globex', status: 'active', plan: 'starter', quota: { reviewsPerMonth: 50 }, githubCredentialRef: 'env:GLOBEX_TOKEN', createdAt: '2026-01-01T00:00:00Z' },
+    { tenantId: 'acme', name: 'Old Name', status: 'active', plan: 'starter', quota: { reviewsPerMonth: 50 }, githubCredentialRef: 'env:ACME_TOKEN', createdAt: '2026-01-01T00:00:00Z' }
+  ];
+  const result = provision(baseInput({ tenantId: 'acme', name: 'New Name', plan: 'pro', credentialRef: 'env:ACME_TOKEN', update: true }), { existingTenants });
+  check('updated', result.status === 'Updated');
+  check('tenantsJson still has exactly two tenants, not three', result.tenantsJson.length === 2);
+  const updated = result.tenantsJson.find((t) => t.tenantId === 'acme');
+  check('the acme record reflects the new name/plan', updated.name === 'New Name' && updated.plan === 'pro');
+  check("globex's record is untouched", result.tenantsJson.find((t) => t.tenantId === 'globex').name === 'Globex');
+}
+
+function testUpdatePreservesOriginalCreatedAt() {
+  console.log('--update keeps the tenant\'s original createdAt rather than resetting it to now');
+  const existingTenants = [{ tenantId: 'acme', name: 'Old Name', status: 'active', plan: 'starter', quota: { reviewsPerMonth: 50 }, githubCredentialRef: 'env:X', createdAt: '2020-01-01T00:00:00Z' }];
+  const result = provision(baseInput({ tenantId: 'acme', update: true, now: 1_700_000_000_000 }), { existingTenants });
+  check('updated', result.status === 'Updated');
+  check('createdAt is the original one, not "now"', result.tenant.createdAt === '2020-01-01T00:00:00Z');
+}
+
+function testUpdateReusingItsOwnGhappRefIsNotFlaggedAsAlreadyUsed() {
+  console.log("--update re-supplying a tenant's own already-assigned ghapp: ref does not false-positive as 'already used by another tenant'");
+  const existingTenants = [{ tenantId: 'acme', name: 'Old Name', status: 'active', plan: 'starter', quota: { reviewsPerMonth: 50 }, githubCredentialRef: 'ghapp:555', installationId: 555, createdAt: '2026-01-01T00:00:00Z' }];
+  const result = provision(baseInput({ tenantId: 'acme', credentialRef: 'ghapp:555', update: true }), { existingTenants });
+  check('updated, not rejected', result.status === 'Updated');
+}
+
 function testBadTenantIdShapeRejected() {
   console.log('a tenantId with an invalid shape is rejected');
   const result = provision(baseInput({ tenantId: 'Not_Valid!' }));
@@ -264,6 +308,11 @@ async function main() {
   testExplicitQuotaOverridesTheKnownPlanDefault();
   testUnknownPlanWithoutQuotaIsRejected();
   testUnknownPlanWithExplicitQuotaIsAccepted();
+  testUpdateWithoutFlagOnExistingTenantIsRejected();
+  testUpdateFlagOnNonexistentTenantIsRejected();
+  testUpdateFlagOnExistingTenantReplacesItsRecordInPlace();
+  testUpdatePreservesOriginalCreatedAt();
+  testUpdateReusingItsOwnGhappRefIsNotFlaggedAsAlreadyUsed();
 
   console.log('');
   if (failures > 0) {

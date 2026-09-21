@@ -38,29 +38,17 @@ import { createHmac, timingSafeEqual } from 'crypto';
 import Stripe from 'stripe';
 import { updateJsonRegistryEntryWithRetry } from '../lib/registry_writer.js';
 import { sendEmail } from '../lib/email.js';
+import { readRawBody } from '../lib/raw_body.js';
 
 export const config = { api: { bodyParser: false } };
 
-const MAX_BODY_BYTES = 1_000_000;
 const REVOCATION_REASON = 'github_app_uninstalled';
 
-export function readRawBody(req, { maxBytes = MAX_BODY_BYTES } = {}) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let total = 0;
-    req.on('data', (chunk) => {
-      total += chunk.length;
-      if (total > maxBytes) {
-        reject(new Error('payload too large'));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
+// Re-exported for backward compatibility - existing callers (and this
+// file's own test harness) import readRawBody from here; the actual
+// implementation now lives in lib/raw_body.js, deduped with
+// api/stripe_webhook.js's byte-identical copy.
+export { readRawBody };
 
 export function verifyGithubWebhookSignature(rawBody, signatureHeader, secret) {
   if (!secret || !signatureHeader || !signatureHeader.startsWith('sha256=')) return false;
@@ -130,12 +118,20 @@ export async function handleGithubAppWebhook(rawBody, signatureHeader, {
     return { httpStatus: 200, body: { status: 'Ignored', reason: `unhandled action ${event && event.action}` } };
   }
 
-  const tenantId = `ghapp-${installationId}`;
-  const find = (tenants) => tenants.findIndex((t) => t && t.tenantId === tenantId);
+  // Matches on githubCredentialRef, the actual `ghapp:<installationId>`
+  // pointer - NOT on a `ghapp-<installationId>` tenantId naming
+  // convention. That convention only holds for a tenant provisioned via
+  // api/stripe_webhook.js's self-service flow; scripts/provision-tenant.js
+  // lets an operator assign a ghapp: credential to a tenant with any
+  // tenant-id at all (e.g. --tenant-id acme --credential-ref ghapp:12345),
+  // and matching by naming convention alone would silently never find -
+  // and so never suspend - that tenant when its installation is revoked.
+  const credentialRef = `ghapp:${installationId}`;
+  const find = (tenants) => tenants.findIndex((t) => t && t.githubCredentialRef === credentialRef);
 
   if (event.action === 'deleted' || event.action === 'suspend') {
     const result = await updateJsonRegistryEntryWithRetry(hubOctokit, hubOwner, hubRepo, 'tenants.json', {
-      message: `chore: suspend tenant ${tenantId} (GitHub App ${event.action})`,
+      message: `chore: suspend tenant for GitHub App installation ${installationId} (${event.action})`,
       find,
       update: (tenant) => {
         if (tenant.status === 'suspended') return null; // already suspended - nothing to change
@@ -151,12 +147,12 @@ export async function handleGithubAppWebhook(rawBody, signatureHeader, {
       const stripe = stripeClient || new Stripe(stripeSecretKey || 'sk_missing');
       notification = await notifySuspendedTenant(result.entry, { stripeClient: stripe, sendEmailImpl, dashboardBaseUrl });
     }
-    return { httpStatus: 200, body: { status: result.changed ? 'Suspended' : 'AlreadySuspended', tenantId, ...(notification ? { notification } : {}) } };
+    return { httpStatus: 200, body: { status: result.changed ? 'Suspended' : 'AlreadySuspended', tenantId: result.entry.tenantId, ...(notification ? { notification } : {}) } };
   }
 
   // event.action === 'unsuspend'
   const result = await updateJsonRegistryEntryWithRetry(hubOctokit, hubOwner, hubRepo, 'tenants.json', {
-    message: `chore: restore tenant ${tenantId} (GitHub App unsuspend)`,
+    message: `chore: restore tenant for GitHub App installation ${installationId} (unsuspend)`,
     find,
     update: (tenant) => {
       // Only restore if THIS webhook is what suspended it - never override
@@ -167,7 +163,7 @@ export async function handleGithubAppWebhook(rawBody, signatureHeader, {
     }
   });
   if (!result.found) return { httpStatus: 200, body: { status: 'Ignored', reason: `no tenant found for installation ${installationId}` } };
-  return { httpStatus: 200, body: { status: result.changed ? 'Restored' : 'NotRestored', tenantId } };
+  return { httpStatus: 200, body: { status: result.changed ? 'Restored' : 'NotRestored', tenantId: result.entry.tenantId } };
 }
 
 export default async function handler(req, res) {

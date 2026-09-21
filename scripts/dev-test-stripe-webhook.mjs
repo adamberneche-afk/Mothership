@@ -302,6 +302,49 @@ async function testDuplicateDeliveryOfTheSameEventIsIdempotent() {
   delete process.env.ONBOARDING_STATE_SECRET;
 }
 
+// Fakes the installation-repositories fetch failing the first N calls
+// (simulating a transient GitHub error during spoke auto-registration),
+// then succeeding - so a test can prove a later redelivery gets a real
+// retry instead of the failure being masked forever by the tenant already
+// existing.
+function makeFakeFetchThatFailsFirstNCalls(n, repoFullNames) {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    if (url === 'https://api.github.com/installation/repositories') {
+      if (calls.filter(c => c.url === url).length <= n) {
+        return { ok: false, status: 500, json: async () => ({ message: 'internal error' }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ repositories: repoFullNames.map((full_name) => ({ full_name })) }) };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  fetchImpl.calls = calls;
+  return fetchImpl;
+}
+
+async function testSpokeRegistrationFailureOnFirstDeliveryIsRetriedOnRedelivery() {
+  console.log('a spoke-registration failure on the first delivery is NOT masked by the second delivery finding the tenant already provisioned - it gets a real retry');
+  _clearAppAuthCacheForTests();
+  process.env.ONBOARDING_STATE_SECRET = 'stripe-webhook-spoke-retry-test';
+  const clientReferenceId = signOnboardingToken({ onboardingId: 'ob-4', installationId: '77777', accountLogin: 'retry-org' });
+  const { rawBody, signatureHeader } = signedPayload(checkoutCompletedEvent({ id: 'evt_retry', sessionId: 'cs_retry', clientReferenceId }));
+  const hubOctokit = makeFakeHubOctokitWithRegistry();
+  const fetchImpl = makeFakeFetchThatFailsFirstNCalls(1, ['retry-org/widget-service']);
+  const deps = { stripeWebhookSecret: WEBHOOK_SECRET, hubOctokit, fetchImpl, githubAppId: 1, githubAppPrivateKey: privateKey, githubAppRequest: makeFakeGithubAppRequest(), stripeClient: makeStripeClientWithFakeLineItems('price_test_standard'), plans: TEST_PLANS };
+
+  const first = await handleStripeWebhook(rawBody, signatureHeader, deps);
+  check('first delivery provisions the tenant', first.body.status === 'Provisioned');
+  check('first delivery\'s spoke registration failed (the simulated 500)', first.body.spokes.skipped === true && first.body.spokes.registered === 0);
+  check('no spoke was registered yet', !hubOctokit.files['spokes.json'].content.some(s => s.owner === 'retry-org'));
+
+  const second = await handleStripeWebhook(rawBody, signatureHeader, deps);
+  check('second (redelivered) call reports AlreadyProvisioned for the tenant', second.body.status === 'AlreadyProvisioned');
+  check('but the redelivery DID retry spoke registration, and it succeeded this time', second.body.spokes.registered === 1);
+  check('the spoke now actually exists in spokes.json', hubOctokit.files['spokes.json'].content.some(s => s.owner === 'retry-org' && s.repo === 'widget-service' && s.tenantId === 'ghapp-77777'));
+  delete process.env.ONBOARDING_STATE_SECRET;
+}
+
 async function testSimulatedConcurrentRaceStillYieldsExactlyOneTenant() {
   console.log('a simulated race (another writer commits between this call\'s read and write) still yields exactly one tenant record via the retry-with-fresh-read path');
   _clearAppAuthCacheForTests();
@@ -365,6 +408,7 @@ async function main() {
   await testUnrecognizedPriceIsNeverSilentlyDefaulted();
   await testUnrecognizedPriceNeverOverridesAnAlreadyProvisionedTenant();
   await testDuplicateDeliveryOfTheSameEventIsIdempotent();
+  await testSpokeRegistrationFailureOnFirstDeliveryIsRetriedOnRedelivery();
   await testSimulatedConcurrentRaceStillYieldsExactlyOneTenant();
   await testProvisionedTenantAlwaysUsesGhappSchemeNeverEnv();
   await testReadRawBodyRejectsOversizedPayloadWithoutBufferingItAll();
