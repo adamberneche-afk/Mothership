@@ -31,7 +31,7 @@ import {
   runCoverageGaps,
   renderReport
 } from './coverage-gaps.js';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 
@@ -143,6 +143,54 @@ function testExtractRelativeImports() {
   check('a parent-relative specifier', extractRelativeImports("import a from '../lib/x.js';").includes('../lib/x.js'));
   check('a bare package name is ignored - it can never be a file here', extractRelativeImports("import fs from 'fs';").length === 0);
   check('deduplicates', extractRelativeImports("import a from './x.js';\nimport('./x.js');").length === 1);
+  check('a template-literal specifier resolves', extractRelativeImports('import(`./x.js`)').includes('./x.js'));
+  check('an INTERPOLATED specifier is skipped - it cannot be resolved statically',
+    extractRelativeImports('import(`./${name}.js`)').length === 0);
+  check('`fromCache(...)` is not a `from` clause', extractRelativeImports("fromCache('./x.js')").length === 0);
+  check('`myrequire(...)` is not a require', extractRelativeImports("myrequire('./x.js')").length === 0);
+}
+
+// This is the bug the check found in ITSELF on its first real run, pinned.
+// A regex over raw source counted an import statement that merely APPEARS
+// inside a string or comment as a real coverage edge - which reported
+// scripts/watchdog.js as covered by this very harness, because the fixtures
+// above contain quoted import statements as text. A false coverage edge is
+// the precise failure this whole check exists to catch, so the tool
+// producing one would have made it self-defeating: with that edge present,
+// deleting the real dev-test-watchdog.mjs would still have read "covered".
+function testImportsInStringsAndCommentsAreNotEdges() {
+  console.log('\nextractRelativeImports - strings and comments are not coverage edges (pinned regression)');
+  check('an import statement inside a double-quoted string is NOT an edge',
+    extractRelativeImports(`const fixture = "import { run } from './watchdog.js';";`).length === 0);
+  check('an import statement inside a single-quoted string is NOT an edge',
+    extractRelativeImports(`const fixture = 'import a from "./watchdog.js";';`).length === 0);
+  check('an import in a line comment is NOT an edge',
+    extractRelativeImports("// import a from './x.js';").length === 0);
+  check('an import in a block comment is NOT an edge',
+    extractRelativeImports("/*\n * import a from './x.js';\n */").length === 0);
+  check('a real import on the SAME source as a quoted one still resolves',
+    extractRelativeImports(`const fixture = "from './fake.js'";\nimport { r } from './real.js';`)
+      .join() === './real.js');
+  check('a regex literal containing a quote does not swallow a later real import',
+    extractRelativeImports("const q = /['\"]/g;\nimport { r } from './real.js';").includes('./real.js'));
+  check('a divided expression is not mistaken for a regex literal',
+    extractRelativeImports("const half = total / 2;\nimport { r } from './real.js';").includes('./real.js'));
+  check('an escaped quote inside a string does not end it early',
+    extractRelativeImports(`const s = "he said \\"from './fake.js'\\"";`).length === 0);
+}
+
+// The harness's own source is the fixture here: it is a real file that
+// contains many quoted import statements, and the scanner must find only
+// the imports this file actually makes.
+function testThisHarnessesOwnImportsAreReadCorrectly() {
+  console.log("\nextractRelativeImports - against this harness's own source");
+  const own = readFileSync(new URL(import.meta.url), 'utf8');
+  const found = extractRelativeImports(own);
+  check('finds the one real relative import this file makes', found.includes('./coverage-gaps.js'));
+  check(
+    `finds ONLY that one, not the quoted fixtures (found: ${found.join(', ') || 'none'})`,
+    found.length === 1
+  );
 }
 
 function testFileImportsScript() {
@@ -388,6 +436,8 @@ function main() {
   testExtractNodeScriptInvocations();
   testFindScheduledWorkflows();
   testExtractRelativeImports();
+  testImportsInStringsAndCommentsAreNotEdges();
+  testThisHarnessesOwnImportsAreReadCorrectly();
   testFileImportsScript();
   testListAllTestFiles();
   testCheckTestCommandGlobs();

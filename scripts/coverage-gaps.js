@@ -204,16 +204,116 @@ export function listAllTestFiles(config = loadConfig(), root = ROOT) {
 // re-export (`export ... from`), dynamic `import()`, and CJS `require()`.
 // Only relative specifiers - a bare package name can never resolve to a
 // file in this repo.
-export function extractRelativeImports(source) {
-  const specs = [];
-  const patterns = [
-    /\bfrom\s*['"](\.[^'"]+)['"]/g, // static import + re-export
-    /\bimport\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g, // dynamic import
-    /\brequire\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g // CJS
-  ];
-  for (const re of patterns) {
-    for (const m of source.matchAll(re)) specs.push(m[1]);
+//
+// WHY THIS IS A SCANNER AND NOT A REGEX. A regex over raw source text also
+// matches an import statement that appears INSIDE a string or a comment,
+// and that is not a hypothetical: the first real run of this check reported
+// scripts/watchdog.js as covered by scripts/dev-test-coverage-gaps.mjs,
+// which does not import it - the harness merely contains the text
+// "import { run } from './watchdog.js';" as a string fixture. That is a
+// false coverage edge, and false coverage edges are the exact failure this
+// check exists to prevent: with one, deleting the real dev-test-watchdog.mjs
+// would still read "covered". A tool whose job is detecting vacuous green
+// cannot itself report one.
+//
+// So this walks the source instead, skipping comments outright and
+// consuming each string literal whole. A specifier counts only when the
+// CODE immediately preceding its literal - code, not text - is `from`,
+// `import(` or `require(`. A quoted import statement nested inside another
+// string is never seen as its own literal, because the outer string is
+// consumed as one unit; the code before it is whatever followed the opening
+// quote's context, which is not `from`.
+//
+// This is the same correctness problem KOS's original solved by requiring
+// gas-lint's comment/string stripping. Rather than drag that dependency in,
+// the scanner here is ~50 lines of node builtins and stays inside this
+// file's "imports nothing" constraint.
+const STRING_QUOTES = new Set(["'", '"', '`']);
+
+// A `/` starts a regex literal rather than a division when the last
+// significant code character cannot end an expression. Getting this wrong
+// costs at most a MISSED import (a loud false "uncovered"), never a
+// fabricated one, which is the safe direction for this tool to fail in.
+const REGEX_PRECEDERS = new Set(['=', '(', ',', ':', '[', '!', '&', '|', '?', '{', '}', ';', '+', '-', '*', '%', '<', '>', '~', '^']);
+
+// Returns the string literals in `source` that appear in code position,
+// each paired with the code that preceded it (comments and other strings
+// removed). Template literals are treated as plain literals; one containing
+// `${` is skipped, since an interpolated path cannot be resolved statically
+// anyway.
+function scanCodePositionStrings(source) {
+  const found = [];
+  let code = '';
+  let i = 0;
+  while (i < source.length) {
+    const c = source[i];
+    const next = source[i + 1];
+
+    if (c === '/' && next === '/') {
+      while (i < source.length && source[i] !== '\n') i++;
+      continue;
+    }
+    if (c === '/' && next === '*') {
+      i += 2;
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i++;
+      i += 2;
+      continue;
+    }
+    if (c === '/') {
+      const lastCode = code.trimEnd().slice(-1);
+      if (lastCode === '' || REGEX_PRECEDERS.has(lastCode)) {
+        // Consume a regex literal, honouring escapes and character classes
+        // so a quote inside one never flips us into string mode.
+        i++;
+        let inClass = false;
+        while (i < source.length) {
+          const r = source[i];
+          if (r === '\\') { i += 2; continue; }
+          if (r === '[') inClass = true;
+          else if (r === ']') inClass = false;
+          else if (r === '/' && !inClass) { i++; break; }
+          else if (r === '\n') break;
+          i++;
+        }
+        code += ' ';
+        continue;
+      }
+      code += c;
+      i++;
+      continue;
+    }
+
+    if (STRING_QUOTES.has(c)) {
+      const quote = c;
+      let value = '';
+      let interpolated = false;
+      i++;
+      while (i < source.length) {
+        const r = source[i];
+        if (r === '\\') { value += source.slice(i, i + 2); i += 2; continue; }
+        if (r === quote) { i++; break; }
+        if (quote === '`' && r === '$' && source[i + 1] === '{') interpolated = true;
+        if (quote !== '`' && r === '\n') break; // unterminated - bail out of string mode
+        value += r;
+        i++;
+      }
+      if (!interpolated) found.push({ value, precedingCode: code });
+      code += ' ';
+      continue;
+    }
+
+    code += c;
+    i++;
   }
+  return found;
+}
+
+const IMPORT_POSITION_RE = /(?:\bfrom|\bimport\s*\(|\brequire\s*\()\s*$/;
+
+export function extractRelativeImports(source) {
+  const specs = scanCodePositionStrings(source)
+    .filter(({ value, precedingCode }) => value.startsWith('.') && IMPORT_POSITION_RE.test(precedingCode))
+    .map(({ value }) => value);
   return [...new Set(specs)];
 }
 
