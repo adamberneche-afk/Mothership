@@ -1,0 +1,20 @@
+{
+  "_comment": "Per-repo configuration for the portfolio CI/CD floor - see CICD_FLOOR.md. The floor's workflows and scripts are byte-identical in every repo; everything that legitimately differs between repos lives here instead, so a repo can change its own settings without regenerating anything and the installer's copies stay verifiably identical. A pull request CAN weaken its own checks by editing this file, which is why changes to it want the same review attention as a change to a workflow - the floor-drift check is what catches divergence that nobody approved.",
+  "floorVersion": "1",
+  "codeqlLanguages": ["actions", "javascript-typescript", "python"],
+  "testCommand": "npm test",
+  "docsCheck": {
+    "watchedPaths": ["api/", "gas/", "dashboard/", ".github/workflows/"],
+    "requiredDocs": ["README.md"]
+  },
+  "docExcludePaths": ["node_modules"],
+  "placeholderPatterns": [
+    "\\[Your [A-Z][a-z]",
+    "[Ll]orem ipsum",
+    "[Aa]dd your own .{0,40} here",
+    "\\(or your preferred [a-z]+\\)",
+    "REPLACE[_ -]ME",
+    "<your-[a-z-]+-here>"
+  ],
+  "scheduledScriptDir": "scripts/"
+}

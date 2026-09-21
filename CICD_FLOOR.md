@@ -32,7 +32,7 @@ recorded below as a deliberate exemption with a reason.
 | 5 | **docs-check** | A PR adding a new capability file must touch that area's docs. |
 | 6 | **doc-currency** | Docs may not cite functions, files or counts that no longer exist. |
 | 7 | **doc-link-check** | No dead relative links between Markdown files. |
-| 8 | **doc-placeholder-check** | No unedited template text (`[Your Company Name]`, lorem ipsum). |
+| 8 | **doc-placeholder-check** | No unedited template text (`[Your Company Name]`, lorem ipsum). A line carrying a `floor-allow-placeholder` marker is skipped — for docs that describe the check and therefore must contain its patterns. <!-- floor-allow-placeholder: this row documents the patterns --> |
 | 9 | **coverage-gaps** | Every scheduled job's script has test coverage CI can actually reach. |
 | 10 | **doctor** | Dispatch-only pre-flight that the secrets each workflow needs actually resolve. |
 

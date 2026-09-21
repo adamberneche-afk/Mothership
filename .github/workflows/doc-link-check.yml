@@ -1,0 +1,54 @@
+name: Documentation Link Check
+
+# Floor check 7 (see CICD_FLOOR.md). Catches dead relative links in Markdown
+# docs - a file renamed, deleted, or never created but still linked from
+# another doc. Adopted from the copy already running in TSO/ThinkOS-Server,
+# where a docs audit found ~25 instances of exactly this.
+#
+# Runs in --offline mode deliberately: it only resolves links against files
+# actually present in the checkout, so it never flakes on an external URL
+# being slow, rate-limited, or temporarily down. A doc-rot check that goes
+# red for reasons unrelated to this repo's own docs trains people to ignore
+# it.
+#
+# The exclude paths come from .github/floor.json rather than being written
+# here, so this file stays byte-identical across every repo the floor is
+# distributed to - see CICD_FLOOR.md's "why runtime config instead of
+# templating" section.
+
+on:
+  pull_request:
+    paths:
+      - '**/*.md'
+      - '.github/workflows/doc-link-check.yml'
+      - '.github/floor.json'
+      - '.lycheeignore'
+  workflow_dispatch:
+
+jobs:
+  link-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read exclude paths from the floor config
+        id: floor
+        run: |
+          set -euo pipefail
+          # `// []` so a floor.json omitting the key degrades to "nothing
+          # excluded" rather than hard-failing - the distributed copy has to
+          # tolerate a spoke whose config predates a key being added.
+          excludes=$(jq -r '(.docExcludePaths // [])[] | "--exclude-path " + .' .github/floor.json | tr '\n' ' ')
+          echo "excludes=${excludes}" >> "$GITHUB_OUTPUT"
+
+      - name: Check for broken relative links in Markdown
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --offline
+            --no-progress
+            ${{ steps.floor.outputs.excludes }}
+            '**/*.md'
+          fail: true
