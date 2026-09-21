@@ -6,6 +6,7 @@ Written for whoever (human or a fresh Claude Code session) picks this up next. R
 
 > **Update (2026-09-20):** Two further sessions landed real work. **Items 3, 6 (half), and 7 have since closed**, and item 1 closed on 2026-09-18 — all marked inline below. New in this round: the KOS inference service was stood up on real infrastructure for the first time, which found five defects no test suite had caught; Mothership's own `doPost()` auth gap was found and fixed; and the dependabot backlog was cleared. **Three new items (11-13) are appended to the table** — 11 and 12 are things only the repo owner can do; 13 was found and closed the same day. The "Start here" section has been rewritten: leader-hub's `doPost()` is fixed, so it is no longer the top item.
 
+> **Update (2026-09-21):** A session working through KOS's Open Items list (Flow 2 prompt-injection fix, SCR confirm/override, the inference service's Drive scope, leader-hub's Sales Log escaping — all merged: KOS PRs #23-25, #27) also got a real answer on "Start here" item 3 below, straight from the repo owner: **keep Vercel as an open deployment option, but do not deploy into it until there's a concrete reason to expand the account's surface area.** PR #33 stays open, unmerged — it's the record of that option, not a queued task. See item 3's own entry for what this does and doesn't resolve.
 
 ---
 
@@ -25,7 +26,9 @@ Nothing below is a technical blocker — all of it is code that is merged and wa
    - `TOKEN_ENCRYPTION_KEY` is already set in Render. **Back it up** — lose it and every stored OAuth token becomes undecryptable.
    - Caveat worth a decision: free Render web services spin down after ~15 min without HTTP traffic. The job worker runs in-process, so on the free plan it stops whenever the service sleeps. Continuous operation means the Starter plan, not a code change.
 
-**3. One open decision: is Vercel still a deployment target?** PR #33 ("Real deployment pipeline") builds Vercel CD, but `main` has since moved the hub to Apps Script. It is 17 commits behind with five conflicting files, and the `self-reflect.yml` conflict is Vercel-vs-Apps-Script, not whitespace. Nobody should resolve that without an answer. Its Apps Script CD half (Phase 4) looks independently useful.
+**3. ✅ Decided (2026-09-21): Vercel stays optional, not deployed.** The repo owner's answer, direct: keep Vercel available as a deployment target in principle, but don't actually deploy into it until there's a concrete reason to expand the account's surface area. Nothing to action right now — this is a "don't" decision, not a "do" one.
+   - **What this resolves:** PR #33 ("Real deployment pipeline," its Phase 3 — Vercel CD) is not getting merged or acted on. It stays open on GitHub as the record of this option, in case a future need for Vercel ever materializes — not because it's mergeable as-is or queued as a task. It is still 17+ commits behind `main` and conflicting; nobody should try to land it without re-scoping it against whatever `main` looks like at that point.
+   - **What this does NOT resolve:** whether PR #33's other four phases (health endpoints, smoke-test/failure-alerting infra, its independently-useful Apps Script CD half — Phase 4, and the installer/CI resync in Phase 5) are still worth extracting on their own, now that `main` already has its own heartbeat-failure-alerting fixes (PR #45) and a live Apps Script hub. That's a separate, still-open question nobody has asked yet — don't assume it's covered by this decision.
 
 ---
 
