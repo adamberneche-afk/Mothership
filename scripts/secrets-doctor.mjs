@@ -281,11 +281,25 @@ export function syncWorkflow(workflowContent, expected) {
 // is the one wrong answer that would make this a rubber stamp.
 export function judgeSecret(name, raw, config) {
   if (raw !== 'true' && raw !== 'false') {
+    // THE VALUE IS DELIBERATELY NOT ECHOED, and this is not caution for its
+    // own sake. This branch fires only when the variable is NOT a boolean,
+    // and the most plausible way that happens is a mis-wiring that drops
+    // the `!= ''` - `CONFIGURED_X: ${{ secrets.X }}` - which puts the
+    // actual credential in it. So the one case where the value is worth
+    // printing for debugging is the case where it might be a secret.
+    // Reporting its shape is enough to fix the wiring.
+    //
+    // CodeQL's js/clear-text-logging rule flagged the version that did echo
+    // it, correctly, and this reasoning is why that was a real finding
+    // rather than a taint-tracking false positive.
+    const shape = raw === undefined ? 'unset' : raw === '' ? 'empty' : 'present but not a recognized boolean';
     return {
       name,
       status: 'broken',
       detail:
-        `expected ${envVarNameFor(name)} to be "true" or "false", got ${JSON.stringify(raw ?? null)}. ` +
+        `expected ${envVarNameFor(name)} to be exactly "true" or "false"; it was ${shape}. ` +
+        'The value is not echoed - a variable that is not a boolean here may be a credential, which is ' +
+        'exactly what a mis-wired generated block would put in it. Re-run `node scripts/secrets-doctor.mjs --sync`. ' +
         'Treating an unreadable probe as a failure rather than as "configured".'
     };
   }

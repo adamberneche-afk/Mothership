@@ -185,6 +185,17 @@ every secret it checks, so counting those as uses would make the expected
 set self-fulfilling: a secret would stay "referenced" forever once wired,
 and a stale entry could never be found.
 
+**Nothing is echoed when the wiring is wrong.** The script rejects any
+`CONFIGURED_<NAME>` that is not exactly `true` or `false`, and reports only
+its *shape* — unset, empty, or present-but-not-a-boolean. That branch fires
+only when the variable is not a boolean, and the most plausible cause is a
+mis-wiring that drops the `!= ''` and puts the real credential there. So the
+one case where printing the value would help debugging is the case where it
+might be a secret. CodeQL's `js/clear-text-logging` rule flagged the
+revision that echoed it, which was a real finding and not a taint-tracking
+false positive. A test pins it, so it cannot come back as a debugging
+convenience.
+
 **A real, disclosed limit.** This confirms a secret exists and is non-empty,
 never that its value is correct. It would have caught every incident that
 motivated it — a `VERCEL_URL` never set, a `VERCEL_TOKEN` that never existed

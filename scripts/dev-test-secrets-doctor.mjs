@@ -255,6 +255,32 @@ function testUnreadableInputFailsClosed() {
   );
 }
 
+// The branch above fires ONLY when the variable is not a boolean, and the
+// most plausible cause is a mis-wiring that drops the `!= ''` and puts the
+// real credential in it. So the one case where echoing the value would help
+// debugging is the case where it might be a secret. CodeQL's
+// js/clear-text-logging rule flagged the revision that echoed it, and it was
+// right. Pinned here so it can never come back as a debugging convenience.
+function testBrokenProbeNeverEchoesTheValue() {
+  console.log('\njudgeSecret - a broken probe never echoes the value it rejected');
+  const secretish = 'ghp_ThisLooksExactlyLikeARealTokenAndMustNotBeLogged';
+  const r = judgeSecret('A', secretish, testConfig());
+  check('still reported broken', r.status === 'broken');
+  check('the detail does NOT contain the value', !r.detail.includes(secretish));
+  check('nor any substring of it beyond a few chars', !r.detail.includes('ghp_'));
+  check('but it does say what shape it was', r.detail.includes('present but not a recognized boolean'));
+  check('and names the variable so the wiring can be fixed', r.detail.includes(envVarNameFor('A')));
+  check('and points at --sync', r.detail.includes('--sync'));
+  check('unset is distinguished from empty', judgeSecret('A', undefined, testConfig()).detail.includes('unset'));
+  check('empty is distinguished from unset', judgeSecret('A', '', testConfig()).detail.includes('empty'));
+  check('and the rendered line carries no value either', !renderProbeLine(r).includes(secretish));
+}
+
+// renderReport is the only thing that prints a detail, so assert through it.
+function renderProbeLine(verdict) {
+  return renderReport({ checks: [verdict], problems: [], workflowCount: 1, hasFindings: true });
+}
+
 // --- runSecretsDoctor, end to end -------------------------------------
 
 function scratchRepo(workflows, wiredSecrets) {
@@ -423,6 +449,7 @@ function main() {
   testSyncWorkflow();
   testJudgeSecret();
   testUnreadableInputFailsClosed();
+  testBrokenProbeNeverEchoesTheValue();
   testEndToEndGreen();
   testEndToEndMissingSecret();
   testUnwiredSecretIsNotSilentlySkipped();
