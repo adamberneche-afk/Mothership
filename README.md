@@ -382,6 +382,12 @@ Before this existed, verification was a manual sweep run by hand after every cha
 
 All three read their per-repo settings - which paths to exclude, which patterns count as placeholders, which directories and docs doc-currency skips - from **`.github/floor.json`** rather than hardcoding them, so the workflow files themselves stay byte-identical across every repo in the portfolio. That is what makes them distributable: see [`CICD_FLOOR.md`](CICD_FLOOR.md) for the ten-check floor every repo here is expected to have, why per-repo variation is runtime config instead of generated-code templating, and the "prove it fails" rule that says no check counts as installed until someone has watched it go red on a deliberately planted violation.
 
+<!-- PLANTED VIOLATION - floor check 6 proof, removed in the next commit.
+     Two citations that resolve to nothing: a file this repo does not have,
+     and a function no code here defines or calls. -->
+**Planted for proof:** the queue is drained by `api/harvest_review_queue.js`,
+whose entrypoint is `drainReviewQueueForever()`.
+
 ## Values Alignment
 
 This system is designed to continuously improve toward producing:
