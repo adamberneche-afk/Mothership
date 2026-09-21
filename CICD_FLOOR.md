@@ -161,18 +161,20 @@ grows a key each time a check is adopted. The shape:
 ```json
 {
   "floorVersion": "1",
-  "codeqlLanguages": ["actions", "javascript-typescript"],
-  "testCommand": "npm test",
-  "docsCheck": {
-    "watchedPaths": ["api/", "gas/", "dashboard/", ".github/workflows/"],
-    "requiredDocs": ["README.md"]
-  },
   "docExcludePaths": ["node_modules"],
   "docCurrency": { "excludeDirs": [], "exemptDocs": [], "codeExtensions": [], "knownAbsentPaths": {} },
   "coverageGaps": { "testFilePatterns": [], "testCommandGlobs": [], "exemptScripts": {} },
   "placeholderPatterns": []
 }
 ```
+
+**Only keys something reads today.** `codeqlLanguages`, `testCommand` and
+`docsCheck` were written into this file ahead of the code that would consume
+them, and removed once it was clear nothing did — the same mistake as
+`scheduledScriptDir`. Their designs are still described here (CodeQL's matrix
+job below, `docs-check` above); the key comes back in the change that adds
+the reader, not before. A key nobody reads is a key that eventually gets
+trusted wrongly.
 
 Every key is read defensively — a missing one degrades to a documented
 default rather than hard-failing the check. That matters because a spoke's
