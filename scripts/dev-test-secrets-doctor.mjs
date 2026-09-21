@@ -24,13 +24,19 @@ import {
   extractSecretReferences,
   listWorkflowFiles,
   collectReferencedSecrets,
-  readAvailableSecretNames,
-  runSecretsDoctor,
-  renderReport
+  CONTROL_SECRET,
+  buildProbePlan,
+  renderPlan,
+  probeSecret,
+  renderProbe,
+  probeFailed
 } from './secrets-doctor.mjs';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+const ROOT_WORKFLOWS = join(dirname(fileURLToPath(import.meta.url)), '..', '.github', 'workflows');
 
 let failures = 0;
 function check(name, condition) {
@@ -158,148 +164,148 @@ function testCollectReferencedSecrets() {
   rmSync(dir, { recursive: true, force: true });
 }
 
-// --- readAvailableSecretNames ------------------------------------------
+// --- buildProbePlan ----------------------------------------------------
 
-function testReadAvailableSecretNames() {
-  console.log('\nreadAvailableSecretNames');
-  const dir = makeWorkflows({ 'names.txt': 'A\nB\n\n  C  \n' });
-  const names = readAvailableSecretNames(join(dir, 'names.txt'));
-  check('parses one name per line', names.includes('A') && names.includes('B'));
-  check('trims whitespace', names.includes('C'));
-  check('drops blank lines', names.length === 3);
-  check('a missing file yields null, not an empty list', readAvailableSecretNames(join(dir, 'nope.txt')) === null);
-  check('no path yields null', readAvailableSecretNames(undefined) === null);
-  // An EMPTY file is a real answer - a repo with no secrets configured -
-  // and must not be confused with "no list provided".
-  writeFileSync(join(dir, 'empty.txt'), '');
-  const empty = readAvailableSecretNames(join(dir, 'empty.txt'));
-  check('an empty file yields an empty list, distinct from null', Array.isArray(empty) && empty.length === 0);
-  rmSync(dir, { recursive: true, force: true });
-}
-
-// --- runSecretsDoctor --------------------------------------------------
-
-function testAllPresentIsGreen() {
-  console.log('\nrunSecretsDoctor - every referenced secret configured');
-  const dir = makeWorkflows({ 'a.yml': '${{ secrets.TOKEN_A }}\n${{ secrets.TOKEN_B }}' });
-  const r = runSecretsDoctor({ config: testConfig(), workflowsDir: dir, availableSecretNames: ['TOKEN_A', 'TOKEN_B'] });
-  check('no findings', r.hasFindings === false);
-  check('both reported present', r.checks.filter((c) => c.status === 'present').length === 2);
-  check('no problems', r.problems.length === 0);
-  rmSync(dir, { recursive: true, force: true });
-}
-
-function testMissingSecretIsRed() {
-  console.log('\nrunSecretsDoctor - a referenced secret that is not configured goes red');
-  const dir = makeWorkflows({ 'deploy.yml': '${{ secrets.NEVER_SET }}' });
-  const r = runSecretsDoctor({ config: testConfig(), workflowsDir: dir, availableSecretNames: ['SOMETHING_ELSE'] });
-  check('hasFindings is true', r.hasFindings === true);
-  const finding = r.checks.find((c) => c.name === 'NEVER_SET');
-  check('status is missing', finding.status === 'missing');
-  check('the finding names the workflow that needs it', finding.files.join() === 'deploy.yml');
-  const report = renderReport(r);
-  check('the report emits a ::error:: annotation', report.includes('::error::NEVER_SET'));
-  check('and names the workflow in it', report.includes('deploy.yml'));
-  rmSync(dir, { recursive: true, force: true });
-}
-
-function testOptionalSecretWarnsButPasses() {
-  console.log('\nrunSecretsDoctor - a declared-optional secret warns without failing');
-  const dir = makeWorkflows({ 'a.yml': '${{ secrets.MAYBE }}' });
-  const config = testConfig({ optionalSecrets: { MAYBE: 'only needed once staging exists' } });
-  const r = runSecretsDoctor({ config, workflowsDir: dir, availableSecretNames: [] });
-  check('no findings', r.hasFindings === false);
-  check('status is optional-missing', r.checks[0].status === 'optional-missing');
-  check('the reason is carried into the report', renderReport(r).includes('only needed once staging exists'));
+function testBuildProbePlan() {
+  console.log('\nbuildProbePlan - what to probe, derived from the workflows');
+  const dir = makeWorkflows({
+    'a.yml': '${{ secrets.TOKEN_B }}\n${{ secrets.TOKEN_A }}',
+    'b.yml': '${{ secrets.GITHUB_TOKEN }}'
+  });
+  const plan = buildProbePlan(dir, testConfig());
+  check('the control leg comes first', plan.matrix[0] === CONTROL_SECRET);
+  check('referenced secrets follow, sorted', plan.matrix.slice(1).join() === 'TOKEN_A,TOKEN_B');
   check(
-    'and WITHOUT the declaration it would have failed',
-    runSecretsDoctor({ config: testConfig(), workflowsDir: dir, availableSecretNames: [] }).hasFindings === true
+    'GITHUB_TOKEN appears once - as the control, not also as a referenced secret',
+    plan.matrix.filter((n) => n === CONTROL_SECRET).length === 1
+  );
+  check('the plan carries which workflow needs each', plan.referenced.get('TOKEN_A').join() === 'a.yml');
+  check('and how many workflows it scanned', plan.workflowFiles.length === 2);
+
+  const optional = buildProbePlan(dir, testConfig({ optionalSecrets: { TOKEN_A: 'why' } }));
+  check('optional names are identified for the plan output', optional.optionalNames.join() === 'TOKEN_A');
+  rmSync(dir, { recursive: true, force: true });
+}
+
+function testPlanIsNeverEmptyAndNeverSilent() {
+  console.log('\nbuildProbePlan - a repo with nothing to probe still runs the control');
+  const empty = makeWorkflows({ 'a.yml': 'name: X\non: push\n' });
+  const plan = buildProbePlan(empty, testConfig());
+  check('the matrix is never empty, so the probe job is never skipped', plan.matrix.length === 1);
+  check('and the plan says so rather than looking like success', renderPlan(plan).includes('Only the control leg will run'));
+  rmSync(empty, { recursive: true, force: true });
+
+  // No workflow files at all means the scan covered nothing, which is not
+  // the same as finding nothing wrong.
+  const none = makeWorkflows({});
+  check(
+    'no workflow files is reported as an ::error::',
+    renderPlan(buildProbePlan(none, testConfig())).includes('::error::No workflow files found')
+  );
+  rmSync(none, { recursive: true, force: true });
+}
+
+// --- probeSecret -------------------------------------------------------
+
+function testProbeVerdicts() {
+  console.log('\nprobeSecret - one secret, one verdict');
+  const dir = makeWorkflows({ 'deploy.yml': '${{ secrets.NEEDED }}\n${{ secrets.MAYBE }}' });
+  const config = testConfig({ optionalSecrets: { MAYBE: 'only once staging exists' } });
+
+  const present = probeSecret({ name: 'NEEDED', configuredRaw: 'true', config, workflowsDir: dir });
+  check('configured -> present', present.status === 'present');
+  check('and passes', !probeFailed(present));
+  check('the detail names the workflow that needs it', present.detail.includes('deploy.yml'));
+  check('and discloses that the value is not checked', present.detail.includes('the value itself is not checked'));
+
+  const missing = probeSecret({ name: 'NEEDED', configuredRaw: 'false', config, workflowsDir: dir });
+  check('not configured, not declared optional -> missing', missing.status === 'missing');
+  check('and fails', probeFailed(missing));
+  check('the report emits ::error:: naming it', renderProbe(missing).includes('::error::NEEDED'));
+  check('and points at the remedy', renderProbe(missing).includes('doctor.optionalSecrets'));
+
+  const optional = probeSecret({ name: 'MAYBE', configuredRaw: 'false', config, workflowsDir: dir });
+  check('not configured but declared optional -> optional-missing', optional.status === 'optional-missing');
+  check('and does NOT fail', !probeFailed(optional));
+  check('the declared reason is carried through', optional.detail.includes('only once staging exists'));
+  check(
+    'and WITHOUT the declaration the same input fails',
+    probeFailed(probeSecret({ name: 'MAYBE', configuredRaw: 'false', config: testConfig(), workflowsDir: dir }))
   );
   rmSync(dir, { recursive: true, force: true });
 }
 
-function testGithubTokenIsNeverMissing() {
-  console.log('\nrunSecretsDoctor - GITHUB_TOKEN is minted per run, never a finding');
-  const dir = makeWorkflows({ 'a.yml': '${{ secrets.GITHUB_TOKEN }}' });
-  const r = runSecretsDoctor({ config: testConfig(), workflowsDir: dir, availableSecretNames: [] });
-  check('no findings even with an empty available list', r.hasFindings === false);
-  check('reported as built-in', r.checks[0].status === 'built-in');
-  rmSync(dir, { recursive: true, force: true });
+// The control leg is the anti-vacuity guard for the whole mechanism: if
+// `secrets[matrix.secret]` ever stops resolving, every leg reports missing,
+// which looks identical to a repo that lost all its credentials at once.
+function testControlLeg() {
+  console.log('\nprobeSecret - the control leg distinguishes a broken mechanism from a real gap');
+  const ok = probeSecret({ name: CONTROL_SECRET, configuredRaw: 'true', config: testConfig() });
+  check('control configured -> control-ok', ok.status === 'control-ok');
+  check('and passes', !probeFailed(ok));
+
+  const broken = probeSecret({ name: CONTROL_SECRET, configuredRaw: 'false', config: testConfig() });
+  check('control NOT configured -> broken, not missing', broken.status === 'broken');
+  check('and fails', probeFailed(broken));
+  check('it says the mechanism is at fault, not the secrets', broken.detail.includes('Fix the workflow, not the secrets'));
+  check(
+    'and it cannot be silenced by an optionalSecrets entry',
+    probeSecret({
+      name: CONTROL_SECRET,
+      configuredRaw: 'false',
+      config: testConfig({ optionalSecrets: { [CONTROL_SECRET]: 'try to mute the control' } })
+    }).status === 'broken'
+  );
 }
 
-function testUnreferencedSecretsAreListedNotFailed() {
-  console.log('\nrunSecretsDoctor - a configured secret nothing references is listed, not failed');
-  const dir = makeWorkflows({ 'a.yml': '${{ secrets.USED }}' });
-  const r = runSecretsDoctor({
-    config: testConfig(),
-    workflowsDir: dir,
-    availableSecretNames: ['USED', 'OLD_RENAMED_TOKEN', 'GITHUB_TOKEN']
-  });
-  check('no findings', r.hasFindings === false);
-  check('the orphan is listed', r.unreferenced.includes('OLD_RENAMED_TOKEN'));
-  check('GITHUB_TOKEN is not listed as an orphan', !r.unreferenced.includes('GITHUB_TOKEN'));
-  check('the used one is not listed as an orphan', !r.unreferenced.includes('USED'));
-  check('the report explains why it is not a failure', renderReport(r).includes('not a failure'));
-  rmSync(dir, { recursive: true, force: true });
+// An unreadable probe input must never be read as "configured" - that is
+// the one wrong answer that turns this check into a rubber stamp.
+function testUnreadableProbeIsAFailure() {
+  console.log('\nprobeSecret - an unreadable input fails closed');
+  for (const raw of [undefined, '', 'TRUE', 'yes', '1', 'null']) {
+    const r = probeSecret({ name: 'X', configuredRaw: raw, config: testConfig() });
+    check(`SECRET_CONFIGURED=${JSON.stringify(raw)} -> broken`, r.status === 'broken' && probeFailed(r));
+  }
+  const noName = probeSecret({ name: undefined, configuredRaw: 'true', config: testConfig() });
+  check('a probe with no secret name -> broken', noName.status === 'broken' && probeFailed(noName));
+  check('and renders without throwing on the missing name', renderProbe(noName).includes('(no name)'));
 }
 
-// The two ways this check could report "clean" while having checked
-// nothing. Both must be hard failures: "no list provided" and "nothing
-// missing" must never look alike.
-function testVacuousRunsAreFailures() {
-  console.log('\nrunSecretsDoctor - a run that checked nothing is a failure, not a pass');
-  const dir = makeWorkflows({ 'a.yml': '${{ secrets.TOKEN }}' });
-
-  const noList = runSecretsDoctor({ config: testConfig(), workflowsDir: dir });
-  check('no available-name list -> hasFindings', noList.hasFindings === true);
-  check('and it says so as a problem, not a secret finding', noList.problems.some((p) => p.includes('nothing could be compared')));
-  check('the report emits it as ::error::', renderReport(noList).includes('::error::No available-secret-name list'));
-
-  const noWorkflows = makeWorkflows({});
-  const empty = runSecretsDoctor({ config: testConfig(), workflowsDir: noWorkflows, availableSecretNames: [] });
-  check('no workflow files at all -> hasFindings', empty.hasFindings === true);
-  check('and it says the scan covered nothing', empty.problems.some((p) => p.includes('scanned nothing')));
-
-  rmSync(noWorkflows, { recursive: true, force: true });
-  rmSync(dir, { recursive: true, force: true });
-}
-
-function testReportNeverContainsAValue() {
-  console.log('\nrenderReport - names and reasons only, never a value');
-  // The script is only ever handed NAMES (secrets-doctor.yml reduces the
-  // context with `jq keys[]` first), so there is no value for it to leak.
-  // This pins the contract: a name that looks like a value must still be
-  // treated as a name, and nothing else is ever echoed.
-  const dir = makeWorkflows({ 'a.yml': '${{ secrets.TOKEN }}' });
-  const r = runSecretsDoctor({ config: testConfig(), workflowsDir: dir, availableSecretNames: ['TOKEN'] });
-  const report = renderReport(r);
-  check('the report names the secret', report.includes('TOKEN'));
-  check('and discloses that presence is all it can confirm', report.includes('cannot verify the value'));
-  check('the result object carries no value field', r.checks.every((c) => !('value' in c)));
-  rmSync(dir, { recursive: true, force: true });
+function testNoValueIsEverHandled() {
+  console.log('\nprobeSecret - the contract: no code path receives a secret value');
+  // The workflow collapses the secret to a boolean inside the expression,
+  // so there is no value for this script to hold. This pins the shape:
+  // the only secret-derived input is the true/false string, and nothing
+  // the script returns carries a value field.
+  const r = probeSecret({ name: 'TOKEN', configuredRaw: 'true', config: testConfig() });
+  check('the verdict carries no value field', !('value' in r));
+  check('the verdict carries only name, status and detail', Object.keys(r).sort().join() === 'detail,name,status');
+  check('and the rendered line is name plus prose only', renderProbe(r) === `  ok   TOKEN - ${r.detail}`);
 }
 
 // --- the one test against the real repo --------------------------------
 
-function testThisRepoScansNonVacuously() {
-  console.log("\nthis repo's own workflows - non-vacuous");
+function testThisRepoPlansNonVacuously() {
+  console.log("\nthis repo's own workflows - the plan is non-vacuous");
+  // Only the PLAN half is assertable here. Whether this repo's secrets are
+  // actually set is a question only a dispatch can answer, and asserting it
+  // in the suite would make `npm test` depend on repo settings no test can
+  // control - which is also why check 10's planted-violation proof is a
+  // post-merge dispatch rather than something this file can stand in for.
   const config = loadConfig();
-  // No availableSecretNames: this asserts the SCAN half against reality.
-  // Whether this repo's secrets are all set is a question only a dispatch
-  // can answer, and asserting it here would make the suite depend on
-  // repo settings no test can control.
-  const r = runSecretsDoctor({ config });
-  check(`scanned this repo's workflows (${r.workflowCount})`, r.workflowCount > 5);
-  check(`resolved real secret references (${r.checks.length})`, r.checks.length > 5);
+  const plan = buildProbePlan(ROOT_WORKFLOWS, config);
+  check(`scanned this repo's workflows (${plan.workflowFiles.length})`, plan.workflowFiles.length > 5);
+  check(`derived real secrets to probe (${plan.matrix.length - 1})`, plan.matrix.length - 1 > 5);
+  check('the control leg is present', plan.matrix[0] === CONTROL_SECRET);
   check(
     'GLOBAL_GITHUB_TOKEN is among them - the credential whose silent invalidity started all this',
-    r.checks.some((c) => c.name === 'GLOBAL_GITHUB_TOKEN')
+    plan.matrix.includes('GLOBAL_GITHUB_TOKEN')
   );
   check(
     'every optionalSecrets entry in floor.json is actually referenced by some workflow',
-    Object.keys(config.optionalSecrets).every((n) => r.checks.some((c) => c.name === n))
+    Object.keys(config.optionalSecrets).every((n) => plan.matrix.includes(n))
   );
-  check('no phantom secret named X or outputs (the KOS false positives)', !r.checks.some((c) => c.name === 'X' || c.name === 'outputs'));
+  check('no phantom secret named X or outputs (the KOS false positives)', !plan.matrix.includes('X') && !plan.matrix.includes('outputs'));
 }
 
 // --- main ---------------------------------------------------------------
@@ -313,15 +319,13 @@ function main() {
   testExtractSecretReferences();
   testExtractorFalsePositives();
   testCollectReferencedSecrets();
-  testReadAvailableSecretNames();
-  testAllPresentIsGreen();
-  testMissingSecretIsRed();
-  testOptionalSecretWarnsButPasses();
-  testGithubTokenIsNeverMissing();
-  testUnreferencedSecretsAreListedNotFailed();
-  testVacuousRunsAreFailures();
-  testReportNeverContainsAValue();
-  testThisRepoScansNonVacuously();
+  testBuildProbePlan();
+  testPlanIsNeverEmptyAndNeverSilent();
+  testProbeVerdicts();
+  testControlLeg();
+  testUnreadableProbeIsAFailure();
+  testNoValueIsEverHandled();
+  testThisRepoPlansNonVacuously();
 
   console.log('');
   if (failures > 0) {

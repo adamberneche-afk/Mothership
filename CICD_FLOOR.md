@@ -36,7 +36,7 @@ between work outstanding and a decision already made.
 | 7 | **doc-link-check** | No dead relative links between Markdown files. |
 | 8 | **doc-placeholder-check** | No unedited template text (`[Your Company Name]`, lorem ipsum). A line carrying a `floor-allow-placeholder` marker is skipped — for docs that describe the check and therefore must contain its patterns. <!-- floor-allow-placeholder: this row documents the patterns --> |
 | 9 | **coverage-gaps** | Every scheduled job's script has test coverage CI can actually reach. Distinguishes "no test exists" from "a real test exists that `npm test` never runs" — the second is the one that reads green. A scheduled workflow invoking no local script is named in the report rather than silently dropped. |
-| 10 | **secrets-doctor** | Dispatch-only pre-flight that every secret the repo's workflows reference is actually configured. The expected set is **derived from the workflow files**, never written down — see below. Presence only: GitHub exposes a secret's name, never its value. |
+| 10 | **secrets-doctor** | Dispatch-only pre-flight that every secret the repo's workflows reference is configured and non-empty. The expected set is **derived from the workflow files**, never written down, and no secret value ever reaches a runner — see below. |
 
 ### Conventions that come with them
 
@@ -140,32 +140,53 @@ tests in its own idiom (Mothership's `scripts/dev-test-*.mjs`, Argoloth's
 `tests/*.test.js` under `node --test`). The floor is the ten checks, not a
 test style.
 
-### How `secrets-doctor` sees which secrets exist
+### How `secrets-doctor` checks a secret without ever holding one
 
-Worth writing down because it is the one non-obvious mechanism in the floor.
+Worth writing down, because the obvious implementation is the wrong one and
+CodeQL caught it.
 
 GitHub gives a repo **no way to list its own secrets**. The REST endpoint
 needs a PAT, and `GITHUB_TOKEN` has no permission scope that covers it —
 there is no `secrets:` key in a workflow's `permissions` block. The only
-thing a workflow can enumerate is the `secrets` context, via
-`toJSON(secrets)`, which carries **values**.
+enumerable thing is the `secrets` context, as JSON, which carries **values**.
 
-So the workflow reduces it to names before the script runs: one
-`jq -r 'keys[]'`, with the JSON arriving through `env:` rather than
-interpolated into `run:`, writing a names-only file. The script is handed
-names. It cannot print a secret value because it never has one — that is the
-point of the two-step shape, and collapsing it into a single step that pipes
-the JSON into Node would work and would be strictly worse. That step also
-deliberately omits `set -x`, which would echo the value into the log.
+The first revision did exactly that and reduced it to names with `jq`.
+CodeQL's `js/excessive-secrets-exposure` rule flagged it on the PR that
+introduced it: every organization and repository secret value handed to a
+runner, to learn a list of names. The mitigations were real — names
+extracted before Node started, `env:` rather than `run:`, no `set -x` — and
+the exposure was real too, and a narrower design existed. **The rule was
+right and the design changed.**
 
-**A real, disclosed limit.** This confirms a secret with the right *name*
-exists. It cannot confirm the value is correct, or even non-empty. It would
-have caught every incident that motivated it — a `VERCEL_URL` never set, a
-`VERCEL_TOKEN` that never existed — and it would **not** catch a token that
-is set but expired. Mothership's hub doctor exercises a few credentials live
-for exactly that reason; doing the same generically would mean firing real
-side effects (a hub review, an email) to validate a credential, which is
-worse than the gap it closes.
+Two jobs now:
+
+| job | sees | does |
+|---|---|---|
+| `plan` | no secrets context at all | derives the referenced names from the workflow files, emits them as a matrix |
+| `probe` | one boolean per leg | `secrets[matrix.secret] != ''`, compared **inside the expression** |
+
+What crosses into a runner is the string `true` or `false`. No secret value
+enters any runner, for any secret, at any point — and it upgraded the check
+from "a secret with this name exists" to "and it is non-empty".
+
+**The control leg.** The matrix always carries `GITHUB_TOKEN`, which Actions
+mints on every run. If `secrets[matrix.secret]` indexing ever stops
+resolving, every leg reports missing — which looks identical to a repo that
+lost all its credentials at once. The control makes a broken mechanism say
+so. It cannot be silenced by an `optionalSecrets` entry.
+
+**What this cost.** The first version could also list a *configured* secret
+that no workflow references — what a rename leaves behind. That needed the
+enumeration, so it is gone. An informational nicety against a real exposure
+is not a close call.
+
+**A real, disclosed limit.** This confirms a secret exists and is non-empty,
+never that its value is correct. It would have caught every incident that
+motivated it — a `VERCEL_URL` never set, a `VERCEL_TOKEN` that never existed
+— and it would **not** catch a token that is set but expired. Mothership's
+hub doctor exercises a few credentials live for exactly that reason; doing
+the same generically would mean firing real side effects (a hub review, an
+email) to validate a credential, which is worse than the gap it closes.
 
 ### Why runtime config instead of templating
 
