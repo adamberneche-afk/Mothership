@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manage Your Subscription - Mothership</title>
+<meta name="description" content="Request a link to manage your Mothership subscription.">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#14161a">
+<style>
+  :root {
+    --paper: #f4f3ee; --panel: #ffffff; --ink: #1e2124; --ink-soft: #5c5f57;
+    --line: #d9d5c7; --accent: #a5551e; --teal: #2f6459;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #14161a; --panel: #1a1d22; --ink: #e8e4d9; --ink-soft: #a9a79c;
+      --line: rgba(255,255,255,0.14); --accent: #de9455; --teal: #74b4a2;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: var(--paper); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.5;
+  }
+  .card {
+    max-width: 420px; width: 100%; margin: 24px; padding: 32px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  }
+  h1 { font-size: 1.4rem; margin: 0 0 12px; }
+  p { color: var(--ink-soft); margin: 0 0 20px; }
+  label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 6px; }
+  input[type="email"] {
+    width: 100%; padding: 10px 12px; margin-bottom: 16px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--paper); color: var(--ink); font: inherit;
+  }
+  input[type="email"]:focus-visible {
+    outline: 2px solid var(--teal); outline-offset: 2px;
+  }
+  .btn {
+    display: inline-block; width: 100%; text-align: center; padding: 12px 20px;
+    background: var(--accent); color: #fff; text-decoration: none; border: none; border-radius: 8px;
+    font-weight: 600; font: inherit; cursor: pointer;
+  }
+  .btn:hover { opacity: 0.9; }
+  .btn:focus-visible, a:focus-visible {
+    outline: 2px solid var(--teal); outline-offset: 2px; border-radius: 4px;
+  }
+  .btn[disabled] { cursor: wait; opacity: 0.7; }
+  #result {
+    margin-top: 16px; font-size: 0.9rem; color: var(--ink-soft);
+  }
+  #result[hidden] { display: none; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Manage your subscription</h1>
+    <p>Enter the email address you used to sign up, and we'll send you a link to view or change your plan, update payment details, or cancel.</p>
+    <form id="request-form">
+      <label for="email">Email address</label>
+      <input type="email" id="email" name="email" required autocomplete="email">
+      <button class="btn" type="submit" id="submit-btn">Send me a link</button>
+    </form>
+    <p id="result" role="status" aria-live="polite" hidden></p>
+  </div>
+  <script>
+    document.getElementById('request-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const emailInput = document.getElementById('email');
+      const submitBtn = document.getElementById('submit-btn');
+      const resultEl = document.getElementById('result');
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Sending…';
+      resultEl.hidden = true;
+
+      // Whatever happens - success, failure, network error - this page
+      // always shows the identical message. The anti-enumeration property
+      // this is built to preserve lives in api/request_portal_link.js's
+      // response itself; showing anything different here on a network
+      // error vs a real response would leak nothing new, but there's no
+      // reason to distinguish them either.
+      const GENERIC_MESSAGE = "If that email has an account, we've sent a link to manage your subscription.";
+      try {
+        const res = await fetch('/api/request_portal_link', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: emailInput.value })
+        });
+        const data = await res.json().catch(() => ({}));
+        resultEl.textContent = data.message || GENERIC_MESSAGE;
+      } catch (e) {
+        resultEl.textContent = GENERIC_MESSAGE;
+      } finally {
+        resultEl.hidden = false;
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Send me a link';
+      }
+    });
+  </script>
+</body>
+</html>

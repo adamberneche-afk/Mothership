@@ -328,9 +328,35 @@ function processRequest(reqBody, {
     return { httpStatus: 403, body: { error: 'owner/repo is not a registered spoke of this hub' } };
   }
 
+  // CALLER-KEY AUTH runs before the tenant-status gate below, not after -
+  // same rules/rationale as api/autonomous_agent.js's identical block: an
+  // unauthenticated caller must not be able to learn anything about a
+  // tenant (e.g. that it's suspended) from a request it never proved it
+  // was allowed to make.
   const requiredCallerKey = resolveSecretRef(tenant.callerKeyRef, config.scriptProperties);
   if (requiredCallerKey && callerKey !== requiredCallerKey) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
+  }
+
+  // TENANT STATUS GATE - same rules/rationale as api/autonomous_agent.js's
+  // identical block: an explicitly non-'active' tenant is skipped before
+  // any GitHub call, `status` optional for backward compat. `tenant` is
+  // guaranteed non-null past the reject above.
+  if (tenant.status && tenant.status !== 'active') {
+    return { httpStatus: 200, body: { status: 'Skipped', reason: `Tenant status is '${tenant.status}', not 'active'`, dryRun } };
+  }
+
+  // Credential hard-skip - same rules/rationale as api/autonomous_agent.js's
+  // identical block: a tenant with no githubCredentialRef configured at all
+  // (e.g. the seeded "default"/test tenants) falls back to
+  // config.globalGithubToken via resolveTenantAndGithub_ above, same as
+  // before real per-tenant credentials existed. A tenant that DID configure
+  // one but whose ref fails to resolve must never silently fall back to
+  // that broader token instead - `github` above (built by
+  // resolveTenantAndGithub_ using this same ref) is simply never used in
+  // that case.
+  if (tenant.githubCredentialRef && !resolveSecretRef(tenant.githubCredentialRef, config.scriptProperties)) {
+    return { httpStatus: 200, body: { status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun } };
   }
 
   const universalLessons = safeGetHubFile(hubGithub, base64Decode, hubOwner, hubRepo, 'universal_lessons.md');

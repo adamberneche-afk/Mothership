@@ -176,7 +176,18 @@ function buildSharedPoolLearningPrompt_({ sharedPoolSpokes, tenants, githubFacto
     const label = `Contributor ${i + 1}`;
     const tenantId = spoke.tenantId || DEFAULT_TENANT_ID;
     const tenant = findTenantRL(tenantId, tenants);
-    const spokeToken = (tenant && resolveSecretRefRL(tenant.githubCredentialRef, config.scriptProperties)) || config.globalGithubToken;
+    // Same rules/rationale as api/recursive_learning.js's identical fix: a
+    // matched tenant whose credential ref fails to resolve is excluded
+    // from this round of the shared pool (never a silent fallback to a
+    // broader credential) - `continue`, not a hard return, so one
+    // misconfigured contributor doesn't abort the whole cross-org pass.
+    let spokeToken;
+    if (tenant) {
+      spokeToken = resolveSecretRefRL(tenant.githubCredentialRef, config.scriptProperties);
+      if (!spokeToken) continue;
+    } else {
+      spokeToken = config.globalGithubToken;
+    }
     const github = githubFactory(spokeToken);
 
     labelToSpoke[label] = { owner: spoke.owner, repo: spoke.repo, tenantId };
@@ -490,7 +501,22 @@ function runRecursiveLearning(reqBody, {
     if (!Object.prototype.hasOwnProperty.call(byTenant, tenantId)) continue;
     const tenantSpokes = byTenant[tenantId];
     const tenant = findTenantRL(tenantId, tenants);
-    const spokeToken = (tenant && resolveSecretRefRL(tenant.githubCredentialRef, config.scriptProperties)) || config.globalGithubToken;
+
+    // Same rules/rationale as gas/autonomous_agent.js's identical fix: a
+    // tenant with no githubCredentialRef configured at all falls back to
+    // config.globalGithubToken; a tenant that DID configure one but whose
+    // ref fails to resolve is a hard skip instead, never a silent fallback
+    // to that broader token for reading this tenant's own repos.
+    let spokeToken;
+    if (tenant && tenant.githubCredentialRef) {
+      spokeToken = resolveSecretRefRL(tenant.githubCredentialRef, config.scriptProperties);
+      if (!spokeToken) {
+        results.push({ tenantId, status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun });
+        continue;
+      }
+    } else {
+      spokeToken = config.globalGithubToken;
+    }
     const github = githubFactory(spokeToken);
 
     const promptText = buildTenantLearningPrompt_({ tenantId, tenantSpokes, github, base64Decode, universalLessons, globalNorthStar });

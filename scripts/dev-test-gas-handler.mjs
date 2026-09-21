@@ -389,6 +389,55 @@ function testRegisteredSpokeResolvesItsOwnTenantCredential() {
   check("resolved to acme's own token, not the global one", factory.tokensUsed[0] === 'acme-secret-token');
 }
 
+function testSuspendedTenantIsSkippedBeforeAnyGithubCall() {
+  console.log("Multi-tenancy fix: a tenant with status !== 'active' is skipped before any GitHub call");
+  const github = makeFakeGithub();
+  const hubGithub = makeFakeHubGithub();
+  const sheet = makeFakeSheet();
+  const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
+  const suspendedTenants = TWO_TENANTS.map(t => t.tenantId === 'acme' ? { ...t, status: 'suspended' } : t);
+  const { httpStatus, body } = processRequest(
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: suspendedTenants }
+  );
+  check('httpStatus is 200 (a quiet skip, not an error)', httpStatus === 200);
+  check("reason mentions the tenant's status", /status is 'suspended'/.test(body.reason));
+  check('zero GitHub calls were made for a suspended tenant', github.calls.getContent.length === 0);
+  check('nothing was queued for a suspended tenant', sheet._rows.length === 0);
+}
+
+function testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken() {
+  console.log('Multi-tenancy fix: a matched tenant whose credential ref fails to resolve is a hard skip, never a silent global-token fallback');
+  const github = makeFakeGithub();
+  const factory = makeFakeGithubFactory(github);
+  const hubGithub = makeFakeHubGithub();
+  const sheet = makeFakeSheet();
+  // Deliberately no ACME_TEST_TOKEN in scriptProperties - simulates a
+  // misconfigured/revoked credential ref for a tenant that DOES exist.
+  const scriptProperties = makeFakeScriptProperties({});
+  const { httpStatus, body } = processRequest(
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: factory, hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { globalGithubToken: 'the-global-token', scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+  );
+  check('httpStatus is 200 (a quiet skip, not an error)', httpStatus === 200);
+  check('reason mentions the credential could not be resolved', /Could not resolve GitHub credential/.test(body.reason));
+  check('no real GitHub API call ran with the fallen-back global token', github.calls.getContent.length === 0);
+  check('nothing was queued once the credential is unresolvable', sheet._rows.length === 0);
+}
+
+function testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured() {
+  console.log('Multi-tenancy: a tenant with no callerKeyRef set (acme) accepts any/no callerKey - backward compatible');
+  const github = makeFakeGithub();
+  const hubGithub = makeFakeHubGithub();
+  const sheet = makeFakeSheet();
+  const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
+  const { httpStatus } = processRequest(
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+  );
+  check('request proceeds (200), no caller-key requirement for this tenant', httpStatus === 200);
+}
+
 function testQuotaUnderLimitProceedsToQueuing() {
   console.log('Multi-tenancy: a tenant under their monthly quota proceeds to queuing normally');
   const github = makeFakeGithub();
@@ -609,6 +658,9 @@ async function main() {
   testReplayOfACreatedDecisionSurfacesIssueUrlAtTopLevel();
   testReplayWithoutAnIssueUrlOmitsTheField();
   testQuotaExceededBlocksBeforeQueuing();
+  testSuspendedTenantIsSkippedBeforeAnyGithubCall();
+  testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken();
+  testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured();
   testCallerKeyRejectedWhenWrongForATenantThatRequiresOne();
   testCallerKeyAcceptedWhenCorrect();
   testUnregisteredSpokeIsRejectedOutright();

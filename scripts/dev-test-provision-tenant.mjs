@@ -1,0 +1,325 @@
+// Local verification harness for scripts/provision-tenant.js. The core
+// functions (validateTenantInput/provisionTenant) never touch fs - all
+// registry state is passed in and returned, so these tests need no
+// scratch directory or real file I/O at all.
+//
+// Usage: node scripts/dev-test-provision-tenant.mjs
+
+import { validateTenantInput, provisionTenant } from './provision-tenant.js';
+
+let failures = 0;
+
+function check(name, condition) {
+  if (condition) {
+    console.log(`  ok - ${name}`);
+  } else {
+    console.error(`  FAIL - ${name}`);
+    failures++;
+  }
+}
+
+function baseInput(overrides = {}) {
+  return {
+    tenantId: 'acme',
+    name: 'Acme Corp',
+    plan: 'pro',
+    credentialRef: 'env:ACME_GITHUB_TOKEN',
+    spokes: [],
+    now: 1_700_000_000_000,
+    ...overrides
+  };
+}
+
+// A real plans.json-shaped fixture, shared by every test below via the
+// provision() wrapper - matches this session's convention of validating
+// --plan against known plans rather than treating it as a bare free-text
+// field.
+const TEST_PLANS = [
+  { planId: 'pro', name: 'Pro', stripePriceId: 'price_pro', stripePaymentLinkUrl: 'https://buy.stripe.com/pro', reviewsPerMonth: null },
+  { planId: 'starter', name: 'Starter', stripePriceId: 'price_starter', stripePaymentLinkUrl: 'https://buy.stripe.com/starter', reviewsPerMonth: 50 }
+];
+
+function provision(input, opts = {}) {
+  return provisionTenant(input, { plans: TEST_PLANS, ...opts });
+}
+
+// --- Tests -------------------------------------------------------------------
+
+function testHappyPathWithEnvRef() {
+  console.log('a well-formed tenant with an env: credential ref is accepted');
+  const result = provision(baseInput());
+  check('provisioned', result.status === 'Provisioned');
+  check('the tenant record is correct', result.tenant.tenantId === 'acme' && result.tenant.githubCredentialRef === 'env:ACME_GITHUB_TOKEN' && result.tenant.status === 'active');
+  check('tenantsJson includes the new tenant', result.tenantsJson.some((t) => t.tenantId === 'acme'));
+}
+
+function testHappyPathWithGhappRef() {
+  console.log('a well-formed tenant with a ghapp: credential ref is accepted');
+  const result = provision(baseInput({ tenantId: 'globex', credentialRef: 'ghapp:123456' }));
+  check('provisioned', result.status === 'Provisioned');
+  check('the credential ref is preserved exactly', result.tenant.githubCredentialRef === 'ghapp:123456');
+}
+
+function testDuplicateTenantIdRejectedCaseInsensitive() {
+  console.log('a duplicate tenantId is hard-rejected, including a case-insensitive match (Acme vs acme)');
+  const existingTenants = [{ tenantId: 'Acme', name: 'Existing', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:X', createdAt: '2026-01-01T00:00:00Z' }];
+  const result = provision(baseInput({ tenantId: 'acme' }), { existingTenants });
+  check('rejected', result.status === 'Invalid');
+  check('the error names the case-insensitive collision', result.errors.some((e) => /already exists/.test(e)));
+}
+
+function testUpdateWithoutFlagOnExistingTenantIsRejected() {
+  console.log('an existing tenant-id without --update is still rejected (the pre-existing collision guard)');
+  const existingTenants = [{ tenantId: 'acme', name: 'Old Name', status: 'active', plan: 'starter', quota: { reviewsPerMonth: 50 }, githubCredentialRef: 'env:X', createdAt: '2026-01-01T00:00:00Z' }];
+  const result = provision(baseInput({ tenantId: 'acme' }), { existingTenants });
+  check('rejected', result.status === 'Invalid');
+  check('the error suggests --update', result.errors.some((e) => /already exists.*--update/.test(e)));
+}
+
+function testUpdateFlagOnNonexistentTenantIsRejected() {
+  console.log('--update against a tenant-id that does not exist is rejected, not silently treated as a create');
+  const result = provision(baseInput({ tenantId: 'ghost', update: true }), { existingTenants: [] });
+  check('rejected', result.status === 'Invalid');
+  check('the error explains no existing tenant was found', result.errors.some((e) => /no existing tenant 'ghost' was found/.test(e)));
+}
+
+function testUpdateFlagOnExistingTenantReplacesItsRecordInPlace() {
+  console.log('--update on an existing tenant-id replaces its record in tenantsJson, in place, rather than appending a duplicate');
+  const existingTenants = [
+    { tenantId: 'globex', name: 'Globex', status: 'active', plan: 'starter', quota: { reviewsPerMonth: 50 }, githubCredentialRef: 'env:GLOBEX_TOKEN', createdAt: '2026-01-01T00:00:00Z' },
+    { tenantId: 'acme', name: 'Old Name', status: 'active', plan: 'starter', quota: { reviewsPerMonth: 50 }, githubCredentialRef: 'env:ACME_TOKEN', createdAt: '2026-01-01T00:00:00Z' }
+  ];
+  const result = provision(baseInput({ tenantId: 'acme', name: 'New Name', plan: 'pro', credentialRef: 'env:ACME_TOKEN', update: true }), { existingTenants });
+  check('updated', result.status === 'Updated');
+  check('tenantsJson still has exactly two tenants, not three', result.tenantsJson.length === 2);
+  const updated = result.tenantsJson.find((t) => t.tenantId === 'acme');
+  check('the acme record reflects the new name/plan', updated.name === 'New Name' && updated.plan === 'pro');
+  check("globex's record is untouched", result.tenantsJson.find((t) => t.tenantId === 'globex').name === 'Globex');
+}
+
+function testUpdatePreservesOriginalCreatedAt() {
+  console.log('--update keeps the tenant\'s original createdAt rather than resetting it to now');
+  const existingTenants = [{ tenantId: 'acme', name: 'Old Name', status: 'active', plan: 'starter', quota: { reviewsPerMonth: 50 }, githubCredentialRef: 'env:X', createdAt: '2020-01-01T00:00:00Z' }];
+  const result = provision(baseInput({ tenantId: 'acme', update: true, now: 1_700_000_000_000 }), { existingTenants });
+  check('updated', result.status === 'Updated');
+  check('createdAt is the original one, not "now"', result.tenant.createdAt === '2020-01-01T00:00:00Z');
+}
+
+function testUpdateReusingItsOwnGhappRefIsNotFlaggedAsAlreadyUsed() {
+  console.log("--update re-supplying a tenant's own already-assigned ghapp: ref does not false-positive as 'already used by another tenant'");
+  const existingTenants = [{ tenantId: 'acme', name: 'Old Name', status: 'active', plan: 'starter', quota: { reviewsPerMonth: 50 }, githubCredentialRef: 'ghapp:555', installationId: 555, createdAt: '2026-01-01T00:00:00Z' }];
+  const result = provision(baseInput({ tenantId: 'acme', credentialRef: 'ghapp:555', update: true }), { existingTenants });
+  check('updated, not rejected', result.status === 'Updated');
+}
+
+function testBadTenantIdShapeRejected() {
+  console.log('a tenantId with an invalid shape is rejected');
+  const result = provision(baseInput({ tenantId: 'Not_Valid!' }));
+  check('rejected', result.status === 'Invalid');
+  check('the error names the tenant-id field', result.errors.some((e) => /tenant-id must match/.test(e)));
+}
+
+function testKvSchemeHardRejected() {
+  console.log('credential-ref=kv:... is hard-rejected with an explicit not-implemented error');
+  const result = provision(baseInput({ credentialRef: 'kv:tenant/acme/token' }));
+  check('rejected', result.status === 'Invalid');
+  check('the error explicitly says kv: is not implemented', result.errors.some((e) => /kv: scheme is not implemented/.test(e)));
+}
+
+function testUnknownSchemeRejected() {
+  console.log('a credential-ref with no recognized scheme is rejected');
+  const result = provision(baseInput({ credentialRef: 'weird:whatever' }));
+  check('rejected', result.status === 'Invalid');
+}
+
+function testRawTokenShapedEnvValueRejected() {
+  console.log('credential-ref=env:<value that looks like a pasted raw token> is hard-rejected (the operator-mistake guard)');
+  const result = provision(baseInput({ credentialRef: 'env:ghp_1234567890abcdefghijklmnopqrstuvwxyz' }));
+  check('rejected', result.status === 'Invalid');
+  check('the error explains the raw-token-shape concern', result.errors.some((e) => /raw token/.test(e)));
+}
+
+function testOverlongEnvVarNameRejected() {
+  console.log('credential-ref=env:<suspiciously long value> is rejected even without a known token prefix');
+  const longValue = 'A'.repeat(100);
+  const result = provision(baseInput({ credentialRef: `env:${longValue}` }));
+  check('rejected', result.status === 'Invalid');
+}
+
+function testLowercaseEnvVarNameRejected() {
+  console.log("credential-ref=env:lowercase_name is rejected (doesn't look like a real env var name)");
+  const result = provision(baseInput({ credentialRef: 'env:not_a_real_var_name' }));
+  check('rejected', result.status === 'Invalid');
+}
+
+function testMalformedGhappIdRejected() {
+  console.log('credential-ref=ghapp:abc (non-numeric) and ghapp:0 (out of range) are both rejected');
+  const nonNumeric = provision(baseInput({ credentialRef: 'ghapp:abc' }));
+  const zero = provision(baseInput({ credentialRef: 'ghapp:0' }));
+  check('non-numeric rejected', nonNumeric.status === 'Invalid');
+  check('zero rejected', zero.status === 'Invalid');
+}
+
+function testGhappIdAlreadyUsedByAnotherTenantRejected() {
+  console.log('a ghapp:<id> already used by another tenant is rejected (one-installation-one-tenant invariant)');
+  const existingTenants = [{ tenantId: 'other-tenant', name: 'Other', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'ghapp:999', installationId: 999, createdAt: '2026-01-01T00:00:00Z' }];
+  const result = provision(baseInput({ tenantId: 'newcomer', credentialRef: 'ghapp:999' }), { existingTenants });
+  check('rejected', result.status === 'Invalid');
+  check('the error names the conflicting tenant', result.errors.some((e) => /already used by tenant 'other-tenant'/.test(e)));
+}
+
+function testMissingRequiredFieldsRejected() {
+  console.log('missing name/plan are rejected with specific errors');
+  const result = provision(baseInput({ name: '', plan: '' }));
+  check('rejected', result.status === 'Invalid');
+  check('name error present', result.errors.some((e) => /name is required/.test(e)));
+  check('plan error present', result.errors.some((e) => /plan is required/.test(e)));
+}
+
+function testNameWithNewlineOrBacktickRejected() {
+  console.log('a name containing a newline or backtick is rejected (PR-body injection guard, since tenant.name is embedded raw into a hub PR body)');
+  const withNewline = provision(baseInput({ name: 'Acme\nCorp' }));
+  const withBacktick = provision(baseInput({ name: 'Acme `rm -rf /` Corp' }));
+  check('newline rejected', withNewline.status === 'Invalid');
+  check('backtick rejected', withBacktick.status === 'Invalid');
+}
+
+function testInvalidQuotaValuesRejected() {
+  console.log('quota of 0, negative, non-integer, and garbage are all rejected');
+  check('0 rejected', provision(baseInput({ quota: '0' })).status === 'Invalid');
+  check('negative rejected', provision(baseInput({ quota: '-5' })).status === 'Invalid');
+  check('non-integer rejected', provision(baseInput({ quota: '1.5' })).status === 'Invalid');
+  check('garbage rejected', provision(baseInput({ quota: 'not-a-number' })).status === 'Invalid');
+}
+
+function testOmittedQuotaMeansUnlimited() {
+  console.log('an omitted quota results in reviewsPerMonth: null (unlimited), not a validation error');
+  const result = provision(baseInput());
+  check('provisioned', result.status === 'Provisioned');
+  check('quota is null (unlimited)', result.tenant.quota.reviewsPerMonth === null);
+}
+
+function testInvalidStatusRejected() {
+  console.log('an arbitrary free-text status is rejected - only active/suspended are allowed');
+  const result = provision(baseInput({ status: 'definitely-not-a-real-status' }));
+  check('rejected', result.status === 'Invalid');
+}
+
+function testSpokeWrongShapeRejected() {
+  console.log('a --spoke value not in owner/repo form is rejected');
+  const result = provision(baseInput({ spokes: ['not-owner-slash-repo'] }));
+  check('rejected', result.status === 'Invalid');
+}
+
+function testSpokeAlreadyBelongingToAnotherTenantRejected() {
+  console.log('a --spoke already registered to a DIFFERENT tenant is rejected');
+  const existingSpokes = [{ tenantId: 'someone-else', owner: 'acme-org', repo: 'widget', addedAt: '2026-01-01T00:00:00Z', status: 'active' }];
+  const result = provision(baseInput({ spokes: ['acme-org/widget'] }), { existingSpokes });
+  check('rejected', result.status === 'Invalid');
+  check('the error names the conflicting tenant', result.errors.some((e) => /already registered to a different tenant \('someone-else'\)/.test(e)));
+}
+
+function testInitialSpokesAppendedCorrectly() {
+  console.log('valid --spoke arguments are appended to spokesJson, attributed to the new tenant');
+  const result = provision(baseInput({ spokes: ['acme-org/widget', 'acme-org/gadget'] }));
+  check('provisioned', result.status === 'Provisioned');
+  check('both spokes appear in spokesJson', result.spokesJson.some(s => s.owner === 'acme-org' && s.repo === 'widget') && result.spokesJson.some(s => s.owner === 'acme-org' && s.repo === 'gadget'));
+  check('both are attributed to the new tenant', result.spokesJson.every(s => s.tenantId === 'acme'));
+}
+
+function testSpokeAlreadyBelongingToTheSameTenantIsANoOpNotAnError() {
+  console.log('a --spoke already registered to THIS SAME tenant is silently skipped, not duplicated or rejected');
+  const existingSpokes = [{ tenantId: 'acme', owner: 'acme-org', repo: 'widget', addedAt: '2026-01-01T00:00:00Z', status: 'active' }];
+  const result = provision(baseInput({ spokes: ['acme-org/widget'] }), { existingSpokes });
+  check('provisioned (not an error)', result.status === 'Provisioned');
+  check('the spoke was not duplicated', result.spokesJson.filter(s => s.owner === 'acme-org' && s.repo === 'widget').length === 1);
+}
+
+function testDryRunTouchesNoRegistryState() {
+  console.log('--dry-run returns the would-write data without mutating or returning tenantsJson/spokesJson');
+  const result = provision(baseInput({ dryRun: true, spokes: ['acme-org/widget'] }));
+  check('status is DryRun', result.status === 'DryRun');
+  check('the would-be tenant is shown', result.tenant.tenantId === 'acme');
+  check('the would-be spoke is shown', result.spokesToAdd.length === 1);
+  check('no tenantsJson/spokesJson is computed for a dry run', result.tenantsJson === undefined && result.spokesJson === undefined);
+}
+
+function testCredentialRefRequired() {
+  console.log('a missing credential-ref is rejected, not silently defaulted');
+  const result = provision(baseInput({ credentialRef: undefined }));
+  check('rejected', result.status === 'Invalid');
+  check('the error names the credential-ref field', result.errors.some((e) => /credential-ref is required/.test(e)));
+}
+
+function testKnownPlanAutoFillsQuotaFromPlansJson() {
+  console.log('a --plan matching plans.json auto-fills --quota from that plan\'s reviewsPerMonth when --quota is omitted');
+  const result = provision(baseInput({ plan: 'starter', quota: undefined }));
+  check('provisioned', result.status === 'Provisioned');
+  check('plan is recorded as given', result.tenant.plan === 'starter');
+  check("quota auto-filled from the starter plan's reviewsPerMonth (50)", result.tenant.quota.reviewsPerMonth === 50);
+}
+
+function testExplicitQuotaOverridesTheKnownPlanDefault() {
+  console.log('an explicit --quota overrides a known plan\'s default reviewsPerMonth, rather than being ignored');
+  const result = provision(baseInput({ plan: 'starter', quota: '999' }));
+  check('provisioned', result.status === 'Provisioned');
+  check('the explicit quota wins over the plan default', result.tenant.quota.reviewsPerMonth === 999);
+}
+
+function testUnknownPlanWithoutQuotaIsRejected() {
+  console.log('a --plan NOT in plans.json without an explicit --quota is rejected - a typo\'d plan name can\'t silently produce an unlimited-quota tenant');
+  const result = provision(baseInput({ plan: 'totally-made-up-plan', quota: undefined }));
+  check('rejected', result.status === 'Invalid');
+  check('the error names the unknown plan and asks for --quota', result.errors.some((e) => /not a known plan in plans\.json/.test(e) && /--quota/.test(e)));
+}
+
+function testUnknownPlanWithExplicitQuotaIsAccepted() {
+  console.log('a --plan NOT in plans.json IS accepted when --quota is given explicitly - a genuine custom/one-off deal, the operator\'s existing "trusted human" escape hatch');
+  const result = provision(baseInput({ plan: 'bespoke-enterprise-deal', quota: '10000' }));
+  check('provisioned', result.status === 'Provisioned');
+  check('the custom plan name is preserved exactly', result.tenant.plan === 'bespoke-enterprise-deal');
+  check('the explicit quota is used', result.tenant.quota.reviewsPerMonth === 10000);
+}
+
+async function main() {
+  testHappyPathWithEnvRef();
+  testHappyPathWithGhappRef();
+  testDuplicateTenantIdRejectedCaseInsensitive();
+  testBadTenantIdShapeRejected();
+  testKvSchemeHardRejected();
+  testUnknownSchemeRejected();
+  testRawTokenShapedEnvValueRejected();
+  testOverlongEnvVarNameRejected();
+  testLowercaseEnvVarNameRejected();
+  testMalformedGhappIdRejected();
+  testGhappIdAlreadyUsedByAnotherTenantRejected();
+  testMissingRequiredFieldsRejected();
+  testNameWithNewlineOrBacktickRejected();
+  testInvalidQuotaValuesRejected();
+  testOmittedQuotaMeansUnlimited();
+  testInvalidStatusRejected();
+  testSpokeWrongShapeRejected();
+  testSpokeAlreadyBelongingToAnotherTenantRejected();
+  testInitialSpokesAppendedCorrectly();
+  testSpokeAlreadyBelongingToTheSameTenantIsANoOpNotAnError();
+  testDryRunTouchesNoRegistryState();
+  testCredentialRefRequired();
+  testKnownPlanAutoFillsQuotaFromPlansJson();
+  testExplicitQuotaOverridesTheKnownPlanDefault();
+  testUnknownPlanWithoutQuotaIsRejected();
+  testUnknownPlanWithExplicitQuotaIsAccepted();
+  testUpdateWithoutFlagOnExistingTenantIsRejected();
+  testUpdateFlagOnNonexistentTenantIsRejected();
+  testUpdateFlagOnExistingTenantReplacesItsRecordInPlace();
+  testUpdatePreservesOriginalCreatedAt();
+  testUpdateReusingItsOwnGhappRefIsNotFlaggedAsAlreadyUsed();
+
+  console.log('');
+  if (failures > 0) {
+    console.error(`${failures} check(s) failed.`);
+    process.exit(1);
+  }
+  console.log('All checks passed.');
+}
+
+main();

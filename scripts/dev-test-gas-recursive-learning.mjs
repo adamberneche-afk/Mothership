@@ -356,6 +356,27 @@ function testTenantCredentialResolutionUsesTheRightTokenAtEnqueueTime() {
   check("the factory was called once per tenant with each tenant's own resolved token", factory.tokensUsed.includes('acme-secret-token') && factory.tokensUsed.includes('globex-secret-token'));
 }
 
+function testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken() {
+  console.log("Multi-tenancy fix: a matched tenant whose credential ref fails to resolve is a hard skip, never a silent global-token fallback");
+  const sharedFakeGithub = makeFakeSpokeGithub(TWO_TENANT_SPOKE_FILES);
+  const factory = makeFakeGithubFactory(sharedFakeGithub);
+  const hubGithub = makeFakeHubGithubForTenancy();
+  const sheet = makeFakeSheet();
+  // Deliberately no ACME_TEST_TOKEN - simulates a misconfigured/revoked
+  // credential ref for a tenant that DOES exist in the registry.
+  const scriptProperties = { getProperty: (key) => ({ GLOBEX_TEST_TOKEN: 'globex-secret-token' }[key] || null) };
+  const { body } = runRecursiveLearning({}, {
+    ...BASE_DEPS, githubFactory: factory, hubGithub, learningQueueSheet: sheet, dryRunOverride: true,
+    config: { scriptProperties, globalGithubToken: 'the-global-token' },
+    hubOwner: 'hub-owner', hubRepo: 'hub-repo',
+    spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS
+  });
+  const acmeResult = body.results.find(r => r.tenantId === 'acme');
+  check('acme is skipped with a credential-resolution reason', acmeResult.status === 'Skipped' && /Could not resolve GitHub credential/.test(acmeResult.reason));
+  check('the global token was never used for acme\'s repos', !factory.tokensUsed.includes('the-global-token'));
+  check('globex still resolved and ran normally, unaffected', factory.tokensUsed.includes('globex-secret-token'));
+}
+
 function testTenantCredentialReResolvedAtFinalizeTime() {
   console.log("Multi-tenancy: finalizeLearningResult_ re-resolves the tenant's own credential fresh at finalize time too");
   const hubGithub = makeFakeHubGithubForTenancy();
@@ -577,6 +598,7 @@ function main() {
   testTwoTenantsGetTwoIndependentQueuedPromptsNeverPooled();
   testEachTenantWithAProposalGetsItsOwnPR();
   testTenantCredentialResolutionUsesTheRightTokenAtEnqueueTime();
+  testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken();
   testTenantCredentialReResolvedAtFinalizeTime();
   testOptedOutSpokeNeverAppearsInSharedPoolQueueOrCountsTowardEvidence();
   testTwoDistinctTenantsClearsEvidenceBar();

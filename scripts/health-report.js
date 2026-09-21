@@ -20,12 +20,8 @@
 // Usage: node scripts/health-report.js
 
 import { Octokit } from '@octokit/rest';
-import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
-const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
-const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
-const DEFAULT_TENANT_ID = 'default';
 const DECISION_LOG_PATH = 'ai_decision_log.json';
 const HUB_ISSUE_LABEL = 'cto-hub-auto';
 const REPORT_ISSUE_LABEL = 'mothership-health-report';
@@ -35,40 +31,10 @@ const REPORT_WINDOW_DAYS = 7;
 const HUB_OWNER = process.env.HUB_GITHUB_OWNER || 'adamberneche-afk';
 const HUB_REPO = process.env.HUB_GITHUB_REPO || 'Mothership';
 
-function loadJsonArrayFromDisk(path) {
-  if (!existsSync(path)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-function loadSpokesRegistry() {
-  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
-}
-
-function loadTenantsRegistry() {
-  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
-}
-
-// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null;
-  return null;
-}
-
-function resolveTenantIdForSpoke(owner, repo, spokes) {
-  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
-}
-
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
+// loadSpokesRegistry/loadTenantsRegistry/resolveTenantIdForSpoke/findTenant/
+// resolveSecretRef now live in ../lib/secrets.js (imported above) - deduped
+// out of what used to be 6 byte-identical Node-side copies of the same
+// functions, see that file's header comment.
 
 async function safeGetTextContent(octokit, owner, repo, path) {
   try {
@@ -149,18 +115,23 @@ export async function buildFullReport(octokit, { now = Date.now(), windowDays = 
   const windowStart = new Date(now - windowDays * 24 * 60 * 60 * 1000);
   const generatedAt = new Date(now).toISOString();
 
-  const resolveOctokitForSpoke = (spoke) => {
+  // Read-only diagnostic tool - best-effort-with-some-token is the right
+  // behavior here (matches doctor.js/prune-logs.js/collect-issue-feedback.js's
+  // identical, deliberate fallback), unlike the hard-skip rule in
+  // api/autonomous_agent.js/api/recursive_learning.js.
+  const resolveOctokitForSpoke = async (spoke) => {
     if (!octokitFactory) return octokit;
     const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
     const tenant = findTenant(tenantId, tenants);
-    const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || process.env.GLOBAL_GITHUB_TOKEN;
+    const resolved = tenant ? await resolveSecretRef(tenant.githubCredentialRef) : null;
+    const token = resolved || process.env.GLOBAL_GITHUB_TOKEN;
     return octokitFactory(token);
   };
 
   const spokeReports = [];
   for (const spoke of spokes) {
     try {
-      spokeReports.push(await buildReportForSpoke(resolveOctokitForSpoke(spoke), spoke, { windowStart }));
+      spokeReports.push(await buildReportForSpoke(await resolveOctokitForSpoke(spoke), spoke, { windowStart }));
     } catch (e) {
       spokeReports.push({ owner: spoke.owner, repo: spoke.repo, error: e.message });
     }

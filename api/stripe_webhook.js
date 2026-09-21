@@ -1,0 +1,274 @@
+// Verifies a real Stripe payment and, only then, provisions a tenant. The
+// entire billing surface this sprint is this one event
+// (checkout.session.completed) - no subscription lifecycle, no portal, no
+// dunning (see lessons.md's dated entry for the full disclosed scope).
+//
+// Deliberately does NOT reuse api/autonomous_agent.js/api/recursive_learning.js's
+// `req.body` convention - Stripe's signature is computed over the exact
+// raw request bytes, and Vercel's default body-parsing would discard them
+// before this handler ever saw them. `config.api.bodyParser = false` below
+// opts out of that, and readRawBody manually drains the request stream
+// with an explicit byte cap (a concrete, cheap DoS mitigation - reject and
+// stop reading past ~1MB before buffering further). This file's `req.body`
+// is NEVER touched anywhere, on purpose.
+//
+// Uses the official `stripe` package for signature verification
+// specifically because real money is on the line here: `constructEvent`
+// correctly handles secret rotation, multiple simultaneous v1= signatures,
+// and timestamp tolerance in a way a hand-rolled HMAC check would have to
+// re-implement and re-verify itself. Every other new endpoint this sprint
+// intentionally avoids new dependencies; this is the one deliberate
+// exception.
+//
+// Real multi-tier pricing: the actual purchased plan is re-derived from
+// what Stripe says was really paid for (stripe.checkout.sessions.
+// listLineItems, matched against plans.json by Stripe price ID) - never
+// trusted from anything client-supplied. An unrecognized price (e.g. the
+// operator added a new Payment Link but forgot to update plans.json) does
+// NOT silently default to any plan - it's surfaced as 'UnrecognizedPrice'
+// for manual reconciliation, the same "disclosed gap over silent one"
+// treatment as the 'Unlinked' case below.
+//
+// Idempotency: Stripe can and does redeliver the same event (retries on
+// any non-2xx, and can occasionally redeliver even after a 200). The new
+// tenant's tenantId is DETERMINISTIC (`ghapp-<installationId>`, never
+// random) specifically so a duplicate/retried delivery re-derives the
+// exact same id - appendToJsonRegistryWithRetry's `decide` callback reads
+// tenants.json fresh on every attempt and returns AlreadyProvisioned
+// instead of writing again if that id is already there, closing the
+// "webhook redelivered/raced twice" double-provisioning risk.
+//
+// A Stripe Checkout Session's/Payment Link's success_url must be a
+// static, side-effect-free "thanks, check back shortly" page
+// (dashboard/onboarding-success.html) - NEVER the trigger for
+// provisioning. Only this verified, server-to-server webhook provisions
+// anything; conflating "the browser reached success_url" with "payment is
+// confirmed" would let anyone provision a free tenant just by visiting
+// that URL.
+
+import Stripe from 'stripe';
+import { verifyOnboardingToken } from '../lib/onboarding_token.js';
+import { mintInstallationToken } from '../lib/github_app.js';
+import { appendToJsonRegistryWithRetry, readJsonArrayFile } from '../lib/registry_writer.js';
+import { loadPlansRegistry, findPlanByStripePriceId } from '../lib/secrets.js';
+import { readRawBody } from '../lib/raw_body.js';
+
+export const config = { api: { bodyParser: false } };
+
+// Re-exported for backward compatibility - existing callers (and this
+// file's own test harness) import readRawBody from here; the actual
+// implementation now lives in lib/raw_body.js, deduped with
+// api/github_app_webhook.js's byte-identical copy.
+export { readRawBody };
+
+function tenantIdForInstallation(installationId) {
+  return `ghapp-${installationId}`;
+}
+
+// Looks up the real plan the customer actually paid for, from Stripe's own
+// record of the checkout session's line items - never from anything the
+// client supplied. Returns the matching plans.json entry, or null if the
+// session has no resolvable price or that price doesn't match any known
+// plan (a real, disclosed gap - see handleStripeWebhook's 'UnrecognizedPrice'
+// result - never silently defaulted).
+async function resolvePlanForSession(stripe, sessionId, plans) {
+  let lineItems;
+  try {
+    lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { expand: ['data.price'] });
+  } catch (e) {
+    return null;
+  }
+  const firstItem = lineItems && lineItems.data && lineItems.data[0];
+  const priceId = firstItem && firstItem.price && firstItem.price.id;
+  if (!priceId) return null;
+  return findPlanByStripePriceId(priceId, plans);
+}
+
+async function provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId, plan, hubOctokit, hubOwner, hubRepo, now }) {
+  const tenantId = tenantIdForInstallation(installationId);
+  return appendToJsonRegistryWithRetry(hubOctokit, hubOwner, hubRepo, 'tenants.json', {
+    message: `chore: provision tenant for GitHub App installation ${installationId} (self-service onboarding, plan ${plan.planId})`,
+    decide: (existingTenants) => {
+      const existing = existingTenants.find((t) => t && t.tenantId === tenantId);
+      if (existing) return { skip: true, result: { status: 'AlreadyProvisioned', tenantId } };
+      const entry = {
+        tenantId,
+        name: accountLogin,
+        status: 'active',
+        plan: plan.planId,
+        quota: { reviewsPerMonth: plan.reviewsPerMonth ?? null },
+        githubCredentialRef: `ghapp:${installationId}`,
+        installationId: Number(installationId),
+        // Recorded for operator support/reconciliation (looking a tenant up
+        // in the Stripe dashboard) - not read by any code path this sprint.
+        // A dedicated billing/{tenantId}.json file and a doctor.js
+        // live-subscription cross-check are real, deliberately deferred
+        // follow-up (this sprint's scope is "gate onboarding on a real
+        // payment," not a billing platform).
+        stripeCustomerId: stripeCustomerId || null,
+        createdAt: new Date(now).toISOString()
+      };
+      return { skip: false, entry, result: { status: 'Provisioned', tenantId } };
+    }
+  });
+}
+
+// Best-effort: registers a spokes.json entry for every repo this
+// installation actually covers, so onboarding is genuinely self-service
+// rather than "tenant exists but still needs a manual spoke-registration
+// step." Failure here does not fail the whole webhook - the
+// payment-linked tenant record is the thing that must not be lost; a
+// missing spoke is a lesser, recoverable gap an operator can register by
+// hand, and idempotency above already makes a Stripe retry safe either
+// way.
+async function autoRegisterSpokesForInstallation({ installationId, tenantId, hubOctokit, hubOwner, hubRepo, now, fetchImpl, appId, privateKey, githubAppRequest }) {
+  const token = await mintInstallationToken(installationId, { appId, privateKey, request: githubAppRequest });
+  if (!token) return { registered: 0, skipped: true, reason: 'could not mint an installation token' };
+  let repos;
+  try {
+    const res = await fetchImpl('https://api.github.com/installation/repositories', {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' }
+    });
+    if (!res.ok) return { registered: 0, skipped: true, reason: `GET /installation/repositories returned ${res.status}` };
+    const data = await res.json();
+    repos = data.repositories || [];
+  } catch (e) {
+    return { registered: 0, skipped: true, reason: e.message };
+  }
+
+  let registered = 0;
+  for (const repo of repos) {
+    const [owner, name] = (repo.full_name || '').split('/');
+    if (!owner || !name) continue;
+    const result = await appendToJsonRegistryWithRetry(hubOctokit, hubOwner, hubRepo, 'spokes.json', {
+      message: `chore: register spoke ${owner}/${name} for tenant ${tenantId} (self-service onboarding)`,
+      decide: (existingSpokes) => {
+        const existing = existingSpokes.find((s) => s && s.owner === owner && s.repo === name);
+        if (existing) return { skip: true, result: { added: false } };
+        const entry = { tenantId, owner, repo: name, addedAt: new Date(now).toISOString(), status: 'active' };
+        return { skip: false, entry, result: { added: true } };
+      }
+    });
+    if (result.added) registered++;
+  }
+  return { registered, skipped: false };
+}
+
+export async function handleStripeWebhook(rawBody, signatureHeader, {
+  stripeSecretKey = process.env.STRIPE_SECRET_KEY,
+  stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET,
+  hubOctokit,
+  hubOwner = process.env.HUB_GITHUB_OWNER || 'adamberneche-afk',
+  hubRepo = process.env.HUB_GITHUB_REPO || 'Mothership',
+  fetchImpl = fetch,
+  now = Date.now(),
+  stripeClient,
+  githubAppId = process.env.GITHUB_APP_ID,
+  githubAppPrivateKey = process.env.GITHUB_APP_PRIVATE_KEY,
+  githubAppRequest,
+  plans = loadPlansRegistry()
+} = {}) {
+  if (!stripeWebhookSecret) {
+    return { httpStatus: 500, body: { error: 'STRIPE_WEBHOOK_SECRET is not configured' } };
+  }
+  const stripe = stripeClient || new Stripe(stripeSecretKey || 'sk_missing');
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(rawBody, signatureHeader, stripeWebhookSecret);
+  } catch (e) {
+    // The single most important line in this file - a bad/missing/tampered
+    // signature is an immediate 400, before the body is even parsed as
+    // JSON, let alone acted on.
+    return { httpStatus: 400, body: { error: 'invalid signature' } };
+  }
+
+  if (event.type !== 'checkout.session.completed') {
+    return { httpStatus: 200, body: { status: 'Ignored', reason: `unhandled event type ${event.type}` } };
+  }
+
+  const session = event.data.object;
+  const claims = session.client_reference_id ? verifyOnboardingToken(session.client_reference_id, { now }) : null;
+  if (!claims || !claims.installationId) {
+    // Someone completed a checkout without going through
+    // api/github_app_callback.js first (a bookmarked/shared/direct hit on
+    // the bare Payment Link). Acked, not provisioned, not treated as an
+    // error Stripe should retry - surfaced in Vercel's function logs for
+    // manual reconciliation rather than a new persisted registry file.
+    console.warn(`stripe_webhook: checkout.session.completed with no valid onboarding token (session ${session.id}) - needs manual reconciliation`);
+    return { httpStatus: 200, body: { status: 'Unlinked', reason: 'no valid onboarding token on this session' } };
+  }
+
+  const { installationId, accountLogin } = claims;
+  const tenantId = tenantIdForInstallation(installationId);
+
+  // Cheap, best-effort idempotency pre-check BEFORE spending a Stripe API
+  // call to resolve the plan: a redelivered/duplicate event for a tenant
+  // that's already provisioned must report AlreadyProvisioned regardless
+  // of whether the plan lookup below would succeed right now (a session's
+  // line items are not guaranteed to stay resolvable forever) - the actual
+  // write-path idempotency check inside provisionTenantForInstallation
+  // still re-verifies this atomically against a fresh read, so a race
+  // landing between this check and that one is still handled correctly,
+  // just possibly with one redundant plan lookup.
+  const { entries: existingTenants } = await readJsonArrayFile(hubOctokit, hubOwner, hubRepo, 'tenants.json');
+  if (existingTenants.some((t) => t && t.tenantId === tenantId)) {
+    // Still retry spoke registration on a redelivery of an already-
+    // provisioned tenant's event, rather than returning immediately: spoke
+    // registration is best-effort/fail-soft (see autoRegisterSpokesForInstallation's
+    // header comment) and independently idempotent per spoke, so a prior
+    // delivery's spoke-registration failure would otherwise be masked
+    // forever the moment the tenant record itself exists - this is the one
+    // real retry opportunity a Stripe redelivery gives it.
+    const spokeResult = await autoRegisterSpokesForInstallation({
+      installationId, tenantId, hubOctokit, hubOwner, hubRepo, now, fetchImpl,
+      appId: githubAppId, privateKey: githubAppPrivateKey, githubAppRequest
+    });
+    return { httpStatus: 200, body: { status: 'AlreadyProvisioned', tenantId, spokes: spokeResult } };
+  }
+
+  const plan = await resolvePlanForSession(stripe, session.id, plans);
+  if (!plan) {
+    // A payment Stripe genuinely confirmed, but for a price that doesn't
+    // match any entry in plans.json - most likely the operator added a new
+    // Payment Link/Price without updating plans.json to match. Acked (not
+    // retried by Stripe) but never provisioned under a guessed/default
+    // plan - surfaced for manual reconciliation instead, same treatment as
+    // the 'Unlinked' case above.
+    console.warn(`stripe_webhook: checkout.session.completed (session ${session.id}) has no price matching any plan in plans.json - needs manual reconciliation`);
+    return { httpStatus: 200, body: { status: 'UnrecognizedPrice', reason: 'no plan in plans.json matches this session\'s Stripe price' } };
+  }
+
+  const provisionResult = await provisionTenantForInstallation({ installationId, accountLogin, stripeCustomerId: session.customer, plan, hubOctokit, hubOwner, hubRepo, now });
+
+  // Retries spoke registration regardless of whether THIS call is what
+  // actually wrote the tenant record (status 'Provisioned') or a race
+  // landed it as already-written by a concurrent delivery (status
+  // 'AlreadyProvisioned', from provisionTenantForInstallation's own
+  // decide callback) - same reasoning as the early AlreadyProvisioned
+  // check above.
+  const spokeResult = await autoRegisterSpokesForInstallation({
+    installationId, tenantId: provisionResult.tenantId, hubOctokit, hubOwner, hubRepo, now, fetchImpl,
+    appId: githubAppId, privateKey: githubAppPrivateKey, githubAppRequest
+  });
+  return { httpStatus: 200, body: { ...provisionResult, spokes: spokeResult } };
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'Method not allowed' });
+    return;
+  }
+  let rawBody;
+  try {
+    rawBody = await readRawBody(req);
+  } catch (e) {
+    res.status(413).json({ error: 'payload too large' });
+    return;
+  }
+  const signatureHeader = req.headers['stripe-signature'];
+  const { Octokit } = await import('@octokit/rest');
+  const hubOctokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const result = await handleStripeWebhook(rawBody, signatureHeader, { hubOctokit });
+  res.status(result.httpStatus).json(result.body);
+}

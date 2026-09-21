@@ -82,7 +82,7 @@ async function testAllHealthyPasses() {
   console.log('all-healthy: every check ok, function returns without throwing');
   const octokit = makeFakeOctokit({ rateLimitStatus: 200 });
   const fetchImpl = makeFakeFetch(200);
-  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' }, tenantsOverride: [] });
   check('allOk is true', result.allOk === true);
   check('every check reports ok', result.checks.every((c) => c.ok));
 }
@@ -91,7 +91,7 @@ async function testInvalidGithubTokenFailsButOtherChecksStillRun() {
   console.log('a 401 on GLOBAL_GITHUB_TOKEN is caught with a clear detail, and other checks still run');
   const octokit = makeFakeOctokit({ rateLimitStatus: 401 });
   const fetchImpl = makeFakeFetch(200);
-  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' }, tenantsOverride: [] });
   check('allOk is false', result.allOk === false);
   const githubCheck = result.checks.find((c) => c.label === 'GLOBAL_GITHUB_TOKEN');
   check('GLOBAL_GITHUB_TOKEN check failed with a real detail', githubCheck.ok === false && /401/.test(githubCheck.detail));
@@ -103,7 +103,7 @@ async function testInvalidAiKeyFails() {
   console.log('a 401 on the AI /models check is caught with a clear detail');
   const octokit = makeFakeOctokit({ rateLimitStatus: 200 });
   const fetchImpl = makeFakeFetch(401);
-  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-bad', AI_BASE_URL: 'https://ai.example.com' } });
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-bad', AI_BASE_URL: 'https://ai.example.com' }, tenantsOverride: [] });
   const aiCheck = result.checks.find((c) => c.label === 'AI_API_KEY');
   check('AI_API_KEY check failed with a real detail', aiCheck.ok === false && /401/.test(aiCheck.detail));
 }
@@ -112,7 +112,7 @@ async function testUnsetAiKeyReportsNotConfigured() {
   console.log('an unset AI_API_KEY reports "not configured" without any fetch call');
   const octokit = makeFakeOctokit({ rateLimitStatus: 200 });
   const fetchImpl = makeFakeFetch(200);
-  const result = await runDoctor(octokit, { fetchImpl, env: {} });
+  const result = await runDoctor(octokit, { fetchImpl, env: {}, tenantsOverride: [] });
   const aiCheck = result.checks.find((c) => c.label === 'AI_API_KEY');
   check('reports not configured', aiCheck.ok === false && aiCheck.detail === 'not configured');
   check('no fetch call was made', fetchImpl.calls.length === 0);
@@ -122,7 +122,7 @@ async function testUnsetGithubTokenReportsNotConfiguredWithoutAnyRequestCall() {
   console.log('an unset GLOBAL_GITHUB_TOKEN reports "not configured" without calling the API - GET /rate_limit itself returns 200 even fully unauthenticated, so this can only be caught by checking the token directly rather than trusting that response code');
   const octokit = makeFakeOctokit({ rateLimitStatus: 200 });
   const fetchImpl = makeFakeFetch(200);
-  const result = await runDoctor(octokit, { fetchImpl, env: {} });
+  const result = await runDoctor(octokit, { fetchImpl, env: {}, tenantsOverride: [] });
   const githubCheck = result.checks.find((c) => c.label === 'GLOBAL_GITHUB_TOKEN');
   check('reports not configured', githubCheck.ok === false && githubCheck.detail === 'not configured');
   check('no GET /rate_limit request was made', !octokit.calls.request.some((c) => c.route === 'GET /rate_limit'));
@@ -134,7 +134,7 @@ async function testSpokeMissingCallHubWorkflowIsFlagged() {
     repos: { 'adamberneche-afk/tso': { reachable: true, hasCallHubWorkflow: false, secretNames: ['VERCEL_URL'] } }
   });
   const fetchImpl = makeFakeFetch(200);
-  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' }, tenantsOverride: [] });
   const workflowCheck = result.checks.find((c) => c.label.includes('tso') && c.label.includes('call-hub.yml'));
   check('a call-hub.yml check exists for tso and fails', !!workflowCheck && workflowCheck.ok === false);
   check('overall allOk is false', result.allOk === false);
@@ -155,7 +155,7 @@ async function testCallHubWorkflowCheckDistinguishesNotFoundFromOtherErrors() {
     return originalGetContent(params);
   };
   const fetchImpl = makeFakeFetch(200);
-  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' }, tenantsOverride: [] });
   const workflowCheck = result.checks.find((c) => c.label.includes('tso') && c.label.includes('call-hub.yml'));
   check('reports the real error, not "not wired up"', workflowCheck.ok === false && /couldn't check/.test(workflowCheck.detail) && !/not wired up/.test(workflowCheck.detail));
 }
@@ -166,7 +166,7 @@ async function testSpokeMissingHubUrlSecretIsFlagged() {
     repos: { 'adamberneche-afk/tso': { reachable: true, hasCallHubWorkflow: true, secretNames: [] } }
   });
   const fetchImpl = makeFakeFetch(200);
-  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' }, tenantsOverride: [] });
   const secretCheck = result.checks.find((c) => c.label.includes('tso') && c.label.includes('secret'));
   check('a secret-presence check exists for tso and fails', !!secretCheck && secretCheck.ok === false);
   check('overall allOk is false', result.allOk === false);
@@ -178,7 +178,7 @@ async function testSpokeWithApsScriptUrlInsteadOfVercelUrlPasses() {
     repos: { 'adamberneche-afk/tso': { reachable: true, hasCallHubWorkflow: true, secretNames: ['APPS_SCRIPT_URL'] } }
   });
   const fetchImpl = makeFakeFetch(200);
-  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' }, tenantsOverride: [] });
   const secretCheck = result.checks.find((c) => c.label.includes('tso') && c.label.includes('secret'));
   check('the secret-presence check passes', !!secretCheck && secretCheck.ok === true);
 }
@@ -205,8 +205,43 @@ async function testNoOctokitFactoryFallsBackToTheSingleOctokitUnchanged() {
   console.log('Multi-tenancy: omitting octokitFactory entirely (no tenant awareness needed) behaves exactly like before - single octokit for everything');
   const octokit = makeFakeOctokit({ repos: { 'adamberneche-afk/tso': { reachable: true, hasCallHubWorkflow: true, secretNames: ['VERCEL_URL'] } } });
   const fetchImpl = makeFakeFetch(200);
-  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' } });
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' }, tenantsOverride: [] });
   check('still runs and passes using the one octokit for every spoke', result.allOk === true);
+}
+
+async function testTenantCredentialLivenessCheckPassesForAResolvableCredential() {
+  console.log("credential-liveness: an active tenant whose githubCredentialRef resolves gets an ok check");
+  process.env.ACME_LIVENESS_TOKEN = 'acme-live-token';
+  const octokit = makeFakeOctokit({});
+  const fetchImpl = makeFakeFetch(200);
+  const tenantsOverride = [{ tenantId: 'acme', name: 'Acme', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:ACME_LIVENESS_TOKEN', createdAt: '2026-08-13T00:00:00Z' }];
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' }, spokesOverride: [], tenantsOverride });
+  const tenantCheck = result.checks.find((c) => c.label.includes("tenant 'acme'"));
+  check('a credential-liveness check exists for tenant acme and passes', !!tenantCheck && tenantCheck.ok === true);
+  delete process.env.ACME_LIVENESS_TOKEN;
+}
+
+async function testTenantCredentialLivenessCheckFailsForAnUnresolvableCredential() {
+  console.log("credential-liveness: an active tenant whose githubCredentialRef does NOT resolve (revoked/unset/typo) is flagged, and fails the whole doctor run");
+  const octokit = makeFakeOctokit({});
+  const fetchImpl = makeFakeFetch(200);
+  const tenantsOverride = [{ tenantId: 'broken-tenant', name: 'Broken', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:SOME_TOTALLY_UNSET_VAR_XYZ', createdAt: '2026-08-13T00:00:00Z' }];
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' }, spokesOverride: [], tenantsOverride });
+  const tenantCheck = result.checks.find((c) => c.label.includes("tenant 'broken-tenant'"));
+  check('the credential-liveness check exists for the broken tenant and fails', !!tenantCheck && tenantCheck.ok === false);
+  check('the detail names the actual ref, not just a generic message', tenantCheck.detail.includes('env:SOME_TOTALLY_UNSET_VAR_XYZ'));
+  check('overall allOk is false because of this', result.allOk === false);
+}
+
+async function testSuspendedTenantsAreSkippedNotFlagged() {
+  console.log("credential-liveness: a tenant with status !== 'active' is never checked at all - a broken credential nobody expects to work right now shouldn't fail the doctor run");
+  const octokit = makeFakeOctokit({});
+  const fetchImpl = makeFakeFetch(200);
+  const tenantsOverride = [{ tenantId: 'suspended-tenant', name: 'Suspended', status: 'suspended', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:SOME_TOTALLY_UNSET_VAR_ABC', createdAt: '2026-08-13T00:00:00Z' }];
+  const result = await runDoctor(octokit, { fetchImpl, env: { GLOBAL_GITHUB_TOKEN: 'ghp_good', AI_API_KEY: 'sk-good', AI_BASE_URL: 'https://ai.example.com' }, spokesOverride: [], tenantsOverride });
+  const tenantCheck = result.checks.find((c) => c.label.includes("tenant 'suspended-tenant'"));
+  check('no credential-liveness check was created for a suspended tenant', !tenantCheck);
+  check('overall allOk stays true - a suspended tenant\'s broken credential is expected, not a failure', result.allOk === true);
 }
 
 async function main() {
@@ -221,6 +256,9 @@ async function main() {
   await testSpokeWithApsScriptUrlInsteadOfVercelUrlPasses();
   await testEachSpokeIsCheckedWithItsOwnTenantCredentialNotTheHubToken();
   await testNoOctokitFactoryFallsBackToTheSingleOctokitUnchanged();
+  await testTenantCredentialLivenessCheckPassesForAResolvableCredential();
+  await testTenantCredentialLivenessCheckFailsForAnUnresolvableCredential();
+  await testSuspendedTenantsAreSkippedNotFlagged();
 
   console.log('');
   if (failures > 0) {

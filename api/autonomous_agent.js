@@ -1,6 +1,7 @@
 import { Octokit } from '@octokit/rest';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
 // Caps how much diff text gets forwarded to the LLM per run - keeps prompt
 // size and API cost bounded.
@@ -59,9 +60,6 @@ const DECISION_LOG_MAX_ENTRIES = 500;
 // context, so the model doesn't re-report something already logged.
 const PRIOR_DECISIONS_CONTEXT_COUNT = 5;
 
-const SPOKES_REGISTRY_PATH = 'spokes.json';
-const TENANTS_REGISTRY_PATH = 'tenants.json';
-const DEFAULT_TENANT_ID = 'default';
 const USAGE_LOG_MAX_ENTRIES = 5000;
 
 // This hub's own identity, for writing its own usage/{tenantId}.json logs -
@@ -81,68 +79,10 @@ const MODE_INSTRUCTIONS = {
 // spokes.json/tenants.json are both hub-root files, read from local disk the
 // same way universal_lessons.md/north_star_framework.md already are - no
 // octokit call needed, since this Vercel function's own checkout already
-// has them. Both are architecture/data-model additions only this pass (see
-// lessons.md's dated entry) - no real tenant self-service onboarding UI, no
-// real secrets store, no payment processor. What's real: every spoke is now
-// unambiguously scoped to one tenant, credential resolution has a real seam
-// instead of one shared global token, and usage gets attributed per tenant.
-
-function loadJsonArrayFromDisk(path) {
-  const fullPath = join(process.cwd(), path);
-  if (!existsSync(fullPath)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(fullPath, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-// Finds which tenant a given owner/repo belongs to. Used to fall back to
-// DEFAULT_TENANT_ID for anything not found in spokes.json - a deliberate
-// backward-compatibility choice, not a security feature: it preserved
-// pre-deployment behavior (no registration required to get a response) for
-// spokes nobody had migrated into the tenant model yet. Once the gas/ twin
-// of this file went live with a publicly-reachable "Anyone" deployment,
-// that same fallback meant any caller on the internet could name an
-// arbitrary owner/repo and have this hub fetch it with GLOBAL_GITHUB_TOKEN.
-// Returns null now instead, so processRequest() can reject an unmatched
-// spoke outright - see its own tenant-resolution comment below.
-function resolveTenantIdForSpoke(owner, repo, spokes) {
-  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return match ? match.tenantId : null;
-}
-
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
-
-// githubCredentialRef/callerKeyRef use a `scheme:value` format:
-//   env:VAR_NAME - reads an env var directly. This is what keeps the
-//     "default" tenant working exactly as before with zero migration -
-//     tenants.json seeds it with "env:GLOBAL_GITHUB_TOKEN".
-//   kv:some/path - a pointer into a real dynamic secrets store (Vercel KV,
-//     a database, a secrets manager) that DOES NOT EXIST YET. Provisioning
-//     one is required, separate infrastructure work before any tenant
-//     beyond "default" can actually go live - a git-committed JSON file
-//     can't hold a raw secret without permanently leaking it into git
-//     history, so there is deliberately no local fallback for this scheme.
-// TODO: wire the kv: branch to a real secrets store before onboarding a
-// second tenant for real.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null; // see TODO above
-  return null;
-}
-
-function loadSpokesRegistry() {
-  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
-}
-
-function loadTenantsRegistry() {
-  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
-}
+// has them. loadSpokesRegistry/loadTenantsRegistry/resolveTenantIdForSpoke/
+// findTenant/resolveSecretRef now live in ../lib/secrets.js (imported
+// above) - deduped out of what used to be 6 byte-identical Node-side
+// copies of the same functions, see that file's header comment.
 
 // Counts issues carrying HUB_ISSUE_LABEL that were created since UTC
 // midnight today, for the rate cap below. Derived on-demand from GitHub's
@@ -331,6 +271,17 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   const tenantId = resolveTenantIdForSpoke(owner, repo, spokes);
   const tenant = tenantId ? findTenant(tenantId, tenants) : null;
 
+  // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
+  // env var never files a real issue by accident - DRY_RUN_MODE has to be
+  // explicitly set to the string "false" in Vercel to go live. Every
+  // response from this point on carries `dryRun` so callers (and the
+  // decision log / health report built on top of this) can always tell
+  // which mode produced it. Computed up front (moved ahead of tenant/
+  // credential handling below) so the tenant-status gate can use it too.
+  const dryRun = dryRunOverride !== undefined
+    ? dryRunOverride
+    : process.env.DRY_RUN_MODE !== 'false';
+
   // Reject an owner/repo that isn't a registered spoke outright, before any
   // GitHub call runs with GLOBAL_GITHUB_TOKEN under it. owner/repo is
   // caller-supplied and spoofable, so this alone doesn't stop someone
@@ -343,30 +294,50 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
     return { httpStatus: 403, body: { error: 'owner/repo is not a registered spoke of this hub' } };
   }
 
-  const requiredCallerKey = resolveSecretRef(tenant.callerKeyRef);
+  // CALLER-KEY AUTH runs before the tenant-status gate below, not after: an
+  // unauthenticated caller who names/spoofs a real owner+repo pair must not
+  // be able to learn anything about that tenant (e.g. that it's suspended)
+  // from a request it never proved it was allowed to make.
+  const requiredCallerKey = await resolveSecretRef(tenant.callerKeyRef);
   if (requiredCallerKey && callerKey !== requiredCallerKey) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
 
+  // TENANT STATUS GATE: an explicitly non-'active' tenant (suspended, e.g.
+  // for a failed payment) must never be served, checked before any
+  // GitHub call - including the credential resolution below - so a
+  // suspended tenant costs nothing beyond the caller-key check above.
+  // `status` is optional for backward compat: a record with no `status`
+  // field, or the "default" tenant's seeded "active", is always served -
+  // only an EXPLICIT non-'active' value skips. `tenant` is guaranteed
+  // non-null past the reject above. (Found while building the GitHub App
+  // credential path: `status` was defined in tenants.json's own schema but
+  // never actually read anywhere in this handler until now.)
+  if (tenant.status && tenant.status !== 'active') {
+    return { httpStatus: 200, body: { status: 'Skipped', reason: `Tenant status is '${tenant.status}', not 'active'`, dryRun } };
+  }
+
   // Credential for this request's SPOKE operations - the tenant's own
   // token (decision #1), resolved via the same env:/kv: scheme as the
-  // caller key above. `tenant` is guaranteed non-null past the reject
-  // above; this still falls back to GLOBAL_GITHUB_TOKEN when the ref itself
-  // can't be resolved (e.g. a kv: ref with no secrets store behind it yet)
-  // - fails toward "use the one credential that's always been used" rather
-  // than toward a silent, harder-to-diagnose 401 from GitHub itself.
-  const spokeToken = resolveSecretRef(tenant.githubCredentialRef) || process.env.GLOBAL_GITHUB_TOKEN;
+  // caller key above. A tenant with no githubCredentialRef configured at
+  // all (e.g. the seeded "default"/test tenants) falls back to
+  // GLOBAL_GITHUB_TOKEN, same as before real per-tenant credentials
+  // existed. A tenant that DID configure one but whose ref fails to
+  // resolve (unset env var, revoked/misconfigured ref) is a hard skip
+  // instead - silently widening to the hub's own broad GLOBAL_GITHUB_TOKEN
+  // here would be exactly backwards: a tenant whose credential is broken
+  // or was just revoked should lose access, not gain the operator's own
+  // token against their repo.
+  let spokeToken;
+  if (tenant.githubCredentialRef) {
+    spokeToken = await resolveSecretRef(tenant.githubCredentialRef);
+    if (!spokeToken) {
+      return { httpStatus: 200, body: { status: 'Skipped', reason: `Could not resolve GitHub credential for tenant '${tenantId}'`, dryRun } };
+    }
+  } else {
+    spokeToken = process.env.GLOBAL_GITHUB_TOKEN;
+  }
   const octokit = octokitFactory(spokeToken);
-
-  // SAFETY RAIL 1: dry-run mode. Defaults to true so a missing/misconfigured
-  // env var never files a real issue by accident - DRY_RUN_MODE has to be
-  // explicitly set to the string "false" in Vercel to go live. Every
-  // response from this point on carries `dryRun` so callers (and the
-  // decision log / health report built on top of this) can always tell
-  // which mode produced it.
-  const dryRun = dryRunOverride !== undefined
-    ? dryRunOverride
-    : process.env.DRY_RUN_MODE !== 'false';
 
   // Fetch Global Context from Hub
   const universalLessonsPath = join(process.cwd(), 'universal_lessons.md');

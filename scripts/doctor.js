@@ -28,49 +28,10 @@
 // Usage: node scripts/doctor.js
 
 import { Octokit } from '@octokit/rest';
-import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
 
-const SPOKES_REGISTRY_PATH = join(process.cwd(), 'spokes.json');
-const TENANTS_REGISTRY_PATH = join(process.cwd(), 'tenants.json');
-const DEFAULT_TENANT_ID = 'default';
 const CALL_HUB_WORKFLOW_PATH = '.github/workflows/call-hub.yml';
 const HUB_URL_SECRET_NAMES = ['VERCEL_URL', 'APPS_SCRIPT_URL'];
-
-function loadJsonArrayFromDisk(path) {
-  if (!existsSync(path)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (e) {
-    return [];
-  }
-}
-
-function loadSpokesRegistry() {
-  return loadJsonArrayFromDisk(SPOKES_REGISTRY_PATH);
-}
-
-function loadTenantsRegistry() {
-  return loadJsonArrayFromDisk(TENANTS_REGISTRY_PATH);
-}
-
-// Same env:/kv: scheme and TODO as api/autonomous_agent.js's resolveSecretRef.
-function resolveSecretRef(ref) {
-  if (!ref || typeof ref !== 'string') return null;
-  if (ref.startsWith('env:')) return process.env[ref.slice(4)] || null;
-  if (ref.startsWith('kv:')) return null;
-  return null;
-}
-
-function resolveTenantIdForSpoke(owner, repo, spokes) {
-  const match = spokes.find(s => s && s.owner === owner && s.repo === repo);
-  return (match && match.tenantId) || DEFAULT_TENANT_ID;
-}
-
-function findTenant(tenantId, tenants) {
-  return tenants.find(t => t && t.tenantId === tenantId) || null;
-}
 
 // This exact repo's own GLOBAL_GITHUB_TOKEN, readable at Actions runtime -
 // a 401 here is precisely this session's own confirmed incident.
@@ -158,6 +119,26 @@ async function checkSpokeHasHubUrlSecret(octokit, spoke) {
   }
 }
 
+// Catches exactly the class of bug this whole file exists to catch, now
+// for the credential model itself: a bad App ID, a revoked/uninstalled
+// GitHub App installation, a malformed private key, or a plain typo in a
+// tenant's githubCredentialRef, surfaced before it accumulates into a
+// silent, live failure the next time that tenant's spoke is actually
+// served. Only checks tenants that would actually be served today
+// (status !== 'active' is a deliberate, separate suspension, not a
+// misconfiguration - excluded here so a doctor run on a suspended tenant
+// doesn't cry wolf about a credential nobody expects to work right now).
+async function checkTenantCredentialResolves(tenant) {
+  const label = `tenant '${tenant.tenantId}': githubCredentialRef resolves`;
+  const ref = tenant.githubCredentialRef;
+  if (!ref || typeof ref !== 'string') {
+    return { label, ok: false, detail: 'no githubCredentialRef configured' };
+  }
+  const token = await resolveSecretRef(ref);
+  if (token) return { label, ok: true, detail: `resolves (${ref})` };
+  return { label, ok: false, detail: `does not resolve to a working credential (${ref}) - check for a revoked/uninstalled GitHub App installation, an unset env var, or a typo` };
+}
+
 // Core check, testable without any real network access. Returns a plain
 // result object rather than exiting - only the CLI wrapper below does
 // that, matching processRequest/buildFullReport/pruneAllSpokes's existing
@@ -176,16 +157,28 @@ export async function runDoctor(octokit, { fetchImpl = fetch, env = process.env,
 
   const spokes = spokesOverride || loadSpokesRegistry();
   const tenants = tenantsOverride || loadTenantsRegistry();
-  const resolveOctokitForSpoke = (spoke) => {
+
+  for (const tenant of tenants) {
+    if (tenant && tenant.status && tenant.status !== 'active') continue;
+    checks.push(await checkTenantCredentialResolves(tenant));
+  }
+
+  // Read-only diagnostic tool, not request-serving credential resolution -
+  // best-effort-with-some-token is the right behavior here (matches
+  // health-report.js/prune-logs.js/collect-issue-feedback.js's identical,
+  // deliberate fallback), unlike the hard-skip rule in
+  // api/autonomous_agent.js/api/recursive_learning.js.
+  const resolveOctokitForSpoke = async (spoke) => {
     if (!octokitFactory) return octokit;
     const tenantId = resolveTenantIdForSpoke(spoke.owner, spoke.repo, spokes);
     const tenant = findTenant(tenantId, tenants);
-    const token = (tenant && resolveSecretRef(tenant.githubCredentialRef)) || env.GLOBAL_GITHUB_TOKEN;
+    const resolved = tenant ? await resolveSecretRef(tenant.githubCredentialRef) : null;
+    const token = resolved || env.GLOBAL_GITHUB_TOKEN;
     return octokitFactory(token);
   };
 
   for (const spoke of spokes) {
-    const spokeOctokit = resolveOctokitForSpoke(spoke);
+    const spokeOctokit = await resolveOctokitForSpoke(spoke);
     checks.push(await checkSpokeRepoReachable(spokeOctokit, spoke));
     checks.push(await checkSpokeHasCallHubWorkflow(spokeOctokit, spoke));
     checks.push(await checkSpokeHasHubUrlSecret(spokeOctokit, spoke));
