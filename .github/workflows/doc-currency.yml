@@ -3,7 +3,7 @@ name: Documentation Currency Check
 # Floor check 6 (see CICD_FLOOR.md). Catches a doc that cites a function or
 # a file which no longer exists in this repo. Adapted from TSO's
 # tools/doc-currency, itself a narrow slice of KOS's original - see the
-# header of scripts/doc-currency.js for why TSO's is the base rather than
+# header of scripts/doc-currency.mjs for why TSO's is the base rather than
 # KOS's more capable version.
 #
 # WHY THIS IS NOT REDUNDANT WITH ci.yml's docs-check: docs-check asks
@@ -45,8 +45,8 @@ jobs:
         with:
           node-version: '20'
 
-      # No `npm ci` - scripts/doc-currency.js imports only node builtins,
+      # No `npm ci` - scripts/doc-currency.mjs imports only node builtins,
       # on purpose, so this check cannot be taken down by a dependency
       # install failing.
       - name: Check docs for stale file and function citations
-        run: node scripts/doc-currency.js
+        run: node scripts/doc-currency.mjs

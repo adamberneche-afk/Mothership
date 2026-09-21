@@ -44,8 +44,8 @@ jobs:
         with:
           node-version: '20'
 
-      # No `npm ci` - scripts/coverage-gaps.js imports only node builtins, on
+      # No `npm ci` - scripts/coverage-gaps.mjs imports only node builtins, on
       # purpose, so this check cannot be taken down by a dependency install
       # failing.
       - name: Check every scheduled job's script has real, CI-reachable test coverage
-        run: node scripts/coverage-gaps.js
+        run: node scripts/coverage-gaps.mjs

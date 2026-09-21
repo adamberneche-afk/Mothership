@@ -1,4 +1,4 @@
-// Local verification harness for scripts/coverage-gaps.js (floor check 9 -
+// Local verification harness for scripts/coverage-gaps.mjs (floor check 9 -
 // see CICD_FLOOR.md). Adapted from TSO's tests/coverage-gaps.test.js to this
 // repo's plain check()-based harness convention.
 //
@@ -15,6 +15,7 @@
 
 import {
   loadConfig,
+  repoRootLooksValid,
   globToRegExp,
   matchesAnyGlob,
   listWorkflowFiles,
@@ -30,7 +31,7 @@ import {
   evaluateScript,
   runCoverageGaps,
   renderReport
-} from './coverage-gaps.js';
+} from './coverage-gaps.mjs';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join } from 'path';
@@ -186,7 +187,7 @@ function testThisHarnessesOwnImportsAreReadCorrectly() {
   console.log("\nextractRelativeImports - against this harness's own source");
   const own = readFileSync(new URL(import.meta.url), 'utf8');
   const found = extractRelativeImports(own);
-  check('finds the one real relative import this file makes', found.includes('./coverage-gaps.js'));
+  check('finds the one real relative import this file makes', found.includes('./coverage-gaps.mjs'));
   check(
     `finds ONLY that one, not the quoted fixtures (found: ${found.join(', ') || 'none'})`,
     found.length === 1
@@ -426,11 +427,28 @@ function testThisRepoIsCovered() {
   check('no findings', !result.hasFindings);
 }
 
+// A floor artifact is copied verbatim into other repos, so the one failure
+// it cannot have is computing the wrong repo root and then printing "clean"
+// about a tree it never walked. Pinned because the first shipment nearly
+// produced exactly that: the target spoke keeps its own tooling at
+// tools/<name>/check.js, one level deeper than the canonical
+// scripts/<name>.mjs, where ROOT would have resolved to tools/.
+function testRepoRootGuard() {
+  console.log('\nrepoRootLooksValid - refuses to answer for a tree that is not a repo');
+  check('this repo\'s real root passes', repoRootLooksValid() === true);
+  const notARepo = mkdtempSync(join(tmpdir(), 'floor-not-a-repo-'));
+  check('a directory with no .github/ fails', repoRootLooksValid(notARepo) === false);
+  mkdirSync(join(notARepo, '.github'));
+  check('the same directory passes once .github/ exists', repoRootLooksValid(notARepo) === true);
+  rmSync(notARepo, { recursive: true, force: true });
+}
+
 // --- main ---------------------------------------------------------------
 
 function main() {
   console.log('coverage-gaps (floor check 9) - local verification\n');
 
+  testRepoRootGuard();
   testGlobToRegExp();
   testHasScheduleTrigger();
   testExtractNodeScriptInvocations();
