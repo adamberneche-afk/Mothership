@@ -36,7 +36,7 @@ between work outstanding and a decision already made.
 | 7 | **doc-link-check** | No dead relative links between Markdown files. |
 | 8 | **doc-placeholder-check** | No unedited template text (`[Your Company Name]`, lorem ipsum). A line carrying a `floor-allow-placeholder` marker is skipped — for docs that describe the check and therefore must contain its patterns. <!-- floor-allow-placeholder: this row documents the patterns --> |
 | 9 | **coverage-gaps** | Every scheduled job's script has test coverage CI can actually reach. Distinguishes "no test exists" from "a real test exists that `npm test` never runs" — the second is the one that reads green. A scheduled workflow invoking no local script is named in the report rather than silently dropped. |
-| 10 | **doctor** | Dispatch-only pre-flight that the secrets each workflow needs actually resolve. |
+| 10 | **secrets-doctor** | Dispatch-only pre-flight that every secret the repo's workflows reference is configured and non-empty, using **static** references so a job receives only the secret it names. Its list is generated from the workflow files and drift-gated on every PR — see below. |
 
 ### Conventions that come with them
 
@@ -60,6 +60,13 @@ between work outstanding and a decision already made.
 **No floor check counts as installed until it has been shown to go red on a
 deliberately planted violation, then green once removed.** Record the
 planted case in the PR that installs it.
+
+**A dispatch-only check is the one case this cannot be done in the PR.** A
+`workflow_dispatch` workflow cannot be dispatched until it exists on the
+default branch, so check 10's proof is a dispatch *after* merge, recorded on
+the PR once it runs. Its harness covers every status the check can report in
+the meantime — that is evidence, not the proof, and the two are not
+interchangeable.
 
 This is not ceremony. Every significant failure in this portfolio's history
 was a green check that meant nothing:
@@ -133,6 +140,76 @@ tests in its own idiom (Mothership's `scripts/dev-test-*.mjs`, Argoloth's
 `tests/*.test.js` under `node --test`). The floor is the ten checks, not a
 test style.
 
+### How `secrets-doctor` checks a secret, and why its list is generated
+
+Worth writing down, because the two designs that look right are both wrong
+and CodeQL caught each of them.
+
+GitHub gives a repo **no way to list its own secrets**. The REST endpoint
+needs a PAT, and `GITHUB_TOKEN` has no permission scope that covers it —
+there is no `secrets:` key in a workflow's `permissions` block.
+
+| attempt | what it did | why `js/excessive-secrets-exposure` was right |
+|---|---|---|
+| 1 | passed the whole context as JSON, reduced to names with `jq` | hands every secret value to the runner, to learn a list of names |
+| 2 | a matrix over the derived names, with a **dynamic** `secrets[…]` index collapsed to a boolean inside the expression | looked airtight and was not. With a dynamic index the Actions service cannot know before dispatch which secret a job will read, so it ships the job every secret it might need. Only the boolean reached the step; the values were in the job payload |
+
+A **static** `${{ secrets.NAME != '' }}` is resolvable before dispatch, so
+the job receives that secret and nothing else. It is what Mothership's own
+`doctor.yml` has always used and what CodeQL has never flagged there. The
+comparison still happens inside the expression, so what lands in the
+environment is `true` or `false` rather than a credential.
+
+**That puts the list back in the workflow, and nothing human maintains it:**
+
+| command | does |
+|---|---|
+| `--sync` | rewrites the env block from the names the workflow files reference |
+| `--check` | fails if that block has fallen behind, in **either** direction |
+
+`--check` runs on every pull request through the test suite, so a workflow
+that starts needing a new secret turns a PR red until the block is
+regenerated. Same generate-then-verify shape
+`scripts/sync-installer-copies.py` already uses for `setup_hub.py`.
+
+This answers the real objection to a hand-written list. The problem was
+never that the list lived in a file — it was that a human had to remember
+to extend it, and nobody did. It also splits the check by what can be
+answered when: *is the list current?* is a question about files, caught
+before merge; *are the secrets set?* needs the secrets context, so it stays
+on dispatch.
+
+**One subtlety, found by a failing test.** The doctor's own workflow is
+excluded from the reference scan. Its generated block necessarily names
+every secret it checks, so counting those as uses would make the expected
+set self-fulfilling: a secret would stay "referenced" forever once wired,
+and a stale entry could never be found.
+
+**Nothing is echoed when the wiring is wrong.** The script rejects any
+`CONFIGURED_<NAME>` that is not exactly `true` or `false`, and reports only
+its *shape* — unset, empty, or present-but-not-a-boolean. That branch fires
+only when the variable is not a boolean, and the most plausible cause is a
+mis-wiring that drops the `!= ''` and puts the real credential there. So the
+one case where printing the value would help debugging is the case where it
+might be a secret. CodeQL's `js/clear-text-logging` rule flagged the
+revision that echoed it, which was a real finding and not a taint-tracking
+false positive. A test pins it, so it cannot come back as a debugging
+convenience.
+
+**A real, disclosed limit.** This confirms a secret exists and is non-empty,
+never that its value is correct. It would have caught every incident that
+motivated it — a `VERCEL_URL` never set, a `VERCEL_TOKEN` that never existed
+— and it would **not** catch a token that is set but expired. Mothership's
+hub doctor exercises a few credentials live for exactly that reason; doing
+the same generically would mean firing real side effects (a hub review, an
+email) to validate a credential, which is worse than the gap it closes.
+
+**Not byte-identical, and that is the point.** `secrets-doctor.yml` carries
+a per-repo generated block, so unlike checks 6–9 it is not the same bytes
+everywhere. The *script* is. A generated file with a drift gate is a
+stronger guarantee than an identical one, because it cannot be correct-
+looking and stale at the same time.
+
 ### Why runtime config instead of templating
 
 The floor is not byte-identical by nature: `docs-check` watches different
@@ -164,6 +241,7 @@ grows a key each time a check is adopted. The shape:
   "docExcludePaths": ["node_modules"],
   "docCurrency": { "excludeDirs": [], "exemptDocs": [], "codeExtensions": [], "knownAbsentPaths": {} },
   "coverageGaps": { "testFilePatterns": [], "testCommandGlobs": [], "exemptScripts": {} },
+  "doctor": { "optionalSecrets": {} },
   "placeholderPatterns": []
 }
 ```
@@ -204,7 +282,7 @@ DoD above; the other four repos' columns are unchanged since that audit.
 | 7 doc-link-check | ✅ | ❌ | ❌ | ✅ | ✅ |
 | 8 doc-placeholder-check | ✅ | ❌ | ❌ | ✅ | ✅ |
 | 9 coverage-gaps | ✅ | ✅ | ❌ | ✅ | ❌ |
-| 10 doctor | ✅ | ❌ | ❌ | ✅ | ❌ |
+| 10 secrets-doctor | ✅ | ❌ | ❌ | ⚠️ | ❌ |
 
 **The hub was not compliant, and that blocked everything.** A distributor
 can only distribute what it has, so bringing this repo to full compliance was
@@ -225,6 +303,25 @@ by reputation:
   unchanged in five repos. Porting the two checks it kept
   (`cited-file-missing`, `cited-function-missing`) is a deliberate floor,
   not a shortfall: a repo wanting KOS's other twelve can still have them.
+- **`secrets-doctor` written fresh**, and the only one of the ten that is.
+  Both existing doctors — Mothership's `scripts/doctor.js` and TSO's
+  `tools/doctor/check.js` — name their secrets **in source**. That is right <!-- doc-currency:ignore: TSO's file, cited for contrast - deliberately not this repo's -->
+  for a hub, which checks *other* repos and has to be told which, but for a
+  repo checking itself it puts the same list in two or three places (the
+  script, the doctor workflow's own `env:` block, and the workflows that
+  really use the secret) with nothing reconciling them.
+
+  It has already drifted, which is why this one is derived rather than
+  ported. TSO's doctor checks `VERCEL_URL`, `VERCEL_BYPASS_TOKEN` and
+  `CRON_SECRET`. TSO's `db-backup.yml` also references
+  `BACKUP_DATABASE_URL` and `BACKUP_PASSPHRASE`, and its doctor has never
+  looked at either — so a database backup failing on an unset passphrase is
+  invisible to the exact tool built to see it. A list a human has to
+  remember to extend is the same shape as the bug.
+
+  Mothership's hub doctor stays, as an additional repo-specific tool: it
+  exercises credentials live and walks the spoke and tenant registries,
+  neither of which generalizes. The floor artifact is the generic one.
 - **`coverage-gaps` from TSO**, whose module-graph resolution supersedes
   KOS's VM-instrumented original. KOS's answers "was this Apps Script
   trigger handler's body ever entered", using V8 coverage instrumentation
@@ -251,6 +348,14 @@ had no drift protection since it was written and may already disagree with
 what this repo considers current. Generalizing the sync tool closes this as
 a side effect of step 3 above — but it is a real, pre-existing hole, not
 newly introduced by the floor work.
+
+## Partial credit
+
+**TSO, check 10 (⚠️).** TSO has a doctor and it works, but it hand-lists
+three secrets while its workflows reference six — `BACKUP_DATABASE_URL` and
+`BACKUP_PASSPHRASE` from `db-backup.yml` are unchecked. It is not absent and
+it is not compliant: replacing it with the generic `secrets-doctor` closes
+the gap and removes the hand-maintained list at the same time.
 
 ## Exemptions
 
