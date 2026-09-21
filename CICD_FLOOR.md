@@ -68,6 +68,23 @@ the PR once it runs. Its harness covers every status the check can report in
 the meantime — that is evidence, not the proof, and the two are not
 interchangeable.
 
+**That dispatch has now run, in all four repos (2026-09-21).** Every
+`probe` went red, and every finding was real — no false positives, and the
+declared-optional entries warned without failing exactly as configured:
+
+| repo | secrets checked | verdict |
+|---|---|---|
+| Mothership | 11 | `APPS_SCRIPT_URL`, `TENANT_CALLER_KEY` missing; 8 optional warned; `GLOBAL_GITHUB_TOKEN` ok |
+| Argoloth | 2 | both missing (`APPS_SCRIPT_URL`, `TENANT_CALLER_KEY`) |
+| KOS | 4 | the same two missing; 2 sandbox secrets warned |
+| TSO | 5 | `BACKUP_DATABASE_URL`, `BACKUP_PASSPHRASE`, `VERCEL_URL` missing; `VERCEL_BYPASS_TOKEN` warned; `CRON_SECRET` ok |
+
+The check is proven by what it found rather than by a plant. `call-hub.yml`
+in Argoloth and KOS has failed **every run since it was created** — 16 and 17
+runs, zero successes — on `curl: (3) URL rejected: No host part in the URL`,
+because `APPS_SCRIPT_URL` expands to nothing. Three days of a dead heartbeat
+that no other check reported.
+
 This is not ceremony. Every significant failure in this portfolio's history
 was a green check that meant nothing:
 
