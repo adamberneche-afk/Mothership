@@ -9,6 +9,6 @@
     "@octokit/auth-app": "^6.1.4",
     "@octokit/rest": "^22.0.1",
     "resend": "^4.8.0",
-    "stripe": "^17.7.0"
+    "stripe": "^22.6.2"
   }
 }
