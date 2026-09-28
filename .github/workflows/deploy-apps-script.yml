@@ -152,7 +152,7 @@ jobs:
 
       - name: Comment the staging URL on the PR
         if: steps.configured.outputs.ready == 'true' && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const url = `${{ steps.target.outputs.web_app_url }}`;
