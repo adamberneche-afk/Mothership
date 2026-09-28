@@ -83,7 +83,7 @@ jobs:
             echo "::notice::CLASPRC_JSON and/or GAS_SCRIPT_ID are not configured yet - skipping the actual deploy. See README's Apps Script setup steps."
           fi
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.configured.outputs.ready == 'true'
         with:
           node-version: '20'
