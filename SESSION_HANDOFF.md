@@ -160,7 +160,7 @@ Items 2, 4, 6 and 10 are now resolved (see each row above), and [KOS Audit Docke
 
 | Repo | `main` | Open work from this session |
 |---|---|---|
-| Mothership | `ba19888` (#53 merged) | none |
+| Mothership | `e85aa69` (#64 merged) | `claude/readme-live-review-note` carries a README clarification (the live-review skill is still on-demand only; the new weekly Routine is a separate mechanism) — PR to follow in this same pass. |
 | Argoloth | `114e2c7` (#14 merged) | none |
 | KOS | `cf3002f` (#128 merged, checked 2026-10-10) | none from Mothership's side. KOS itself has its own live queue — see `meta/HANDOFF_2026-10-10.md` in that repo: everything through PR #128 is merged to its `main` but not yet `clasp push`ed to any of its Apps Script projects. |
 | TSO | `75498c9` (#2054 merged) | none |
