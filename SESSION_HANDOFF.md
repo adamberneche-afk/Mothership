@@ -1,6 +1,6 @@
 # Session Handoff — 2026-09-06
 
-*Last updated 2026-09-21 (CI/CD floor session). The dated update notes below are cumulative — read them in order; the original 09-06 body is kept as the record of what prompted all of it, not as current status.*
+*Last updated 2026-10-11 (the weekly-Routine / KOS Audit Docket III session). The dated update notes below are cumulative — read them in order; the original 09-06 body is kept as the record of what prompted all of it, not as current status.*
 
 Written for whoever (human or a fresh Claude Code session) picks this up next. Read the "Start here" section first — everything else is context for *why*, not things to do before that.
 
@@ -15,6 +15,8 @@ Written for whoever (human or a fresh Claude Code session) picks this up next. R
 > **Update (2026-10-10):** Cloned KOS fresh to check on it — it had moved from PR #30 to PR #128 since this file last looked (KOS now holds `cas-ccps`, `kos-personal` and `leader-hub` as one repo, live with real students in two courses). Found that **items 2, 4, 6 and 10 below were already resolved on 2026-09-21**, in the exact PRs the 2026-09-21 banner above already names (#23–25, #27) — the banner said so three paragraphs up, but the table further down this file was never updated to match, so it has been silently wrong for three weeks. Fixed inline below, each against the real commit. Item 2 also picked up a second, independent layer of defense on 2026-10-10 itself (KOS PR #122), found while the operator's own new PRD was being checked against the code there — worth reading as this account's own version of the lesson in The Pivot Ledger's "auditing the audit" section: a banner announcing a fix is not the same as the table agreeing with it, and nobody had reread this file end-to-end to notice. Went on to correct [KOS Audit Docket II](https://claude.ai/code/artifact/a34064f3-f903-4c6d-9834-e845057c9053) itself against the same evidence, plus two more findings it had never caught up on either (leader-hub's `doPost()` auth, the cas-ccps intake-email validator — both already fixed by earlier sessions). No Mothership-side code changed this pass; this is a doc correction plus a fresh look at a repo that drifted far out of sync again, the same failure mode flagged in the "lesson learned the hard way" note at the bottom of this file.
 
 > **Update (2026-10-10, later the same day):** Set up a weekly account-level Routine to stop this kind of gap from recurring (see The Pivot Ledger's "on-demand auditing" entry), test-fired it manually, and used what that test surfaced (`main` was itself three weeks stale — see PR #63) to go do the thing the gap had actually been hiding: a real backward-looking audit of the ~98-PR window between KOS Audit Docket II and today, split three ways across parallel passes. Filed as **[KOS Audit Docket III](https://claude.ai/artifact/8ZoidoFagTThhbQSTmrYCf)**. Headline result: every security-relevant issue the audit found inside that window — including a Critical cross-student FERPA exposure (every doc shared with the whole class) and a High stored-XSS via a student's own name — had already been found and fixed by a later commit inside that same window, before any Mothership session ever looked. That's the account's "fixes forward" habit working as intended, not luck. **Four new items are open** (18–21 below), none previously tracked, none severe enough to need the owner's sign-off first — they're queued as this file's own next work, not flagged decisions.
+
+> **Update (2026-10-11):** The whole 2026-10-10 arc above — the stale-tracker discovery, the Routine, Docket III, the Pivot Ledger corrections — is pulled into one consolidated account below, **"What the 2026-10-10/11 session did,"** rather than left scattered across three banners and an open-items footnote. Read that section for the full shape in one place; these banners stay as the dated record of how it unfolded. One small doc fix also went out the same pass: README's on-demand-live-review section could be misread as implying the new Routine schedules AI commit review — it doesn't, and the README now says so (PR #65).
 
 ---
 
@@ -120,6 +122,24 @@ Merged: Mothership #48–#52, Argoloth #13–#14, KOS #30, TSO #2054.
 
 ---
 
+## What the 2026-10-10/11 session did
+
+The whole arc in one place — three banners and an open-items footnote above tell it piecemeal as it happened; this is the version to actually read.
+
+**It started with a correction, not a finding.** Asked to review the diffs behind four KOS fixes, the first write-up led with "commit citations didn't propagate to the tracker" — true, but the repo owner correctly called it out as missing the real cause: **nobody had run a Mothership-side check on KOS for 19 days**, during which it took ~98 more PRs. Items 2, 4, 6, and 10 below had all been fixed on 2026-09-21 — the 2026-09-21 banner above even named the PRs — but the table itself was never updated to match. Fixed, with each row cited against its real commit, and [KOS Audit Docket II](https://claude.ai/code/artifact/a34064f3-f903-4c6d-9834-e845057c9053) corrected to match (plus two more items it had never caught up on either). All on `main` via **[PR #63](https://github.com/adamberneche-afk/Mothership/pull/63)**.
+
+**The fix for the gap itself was a weekly Routine, not a one-time catch-up.** Account-level (not a repo workflow), covering Mothership/KOS/Argoloth/TSO, firing into a fresh session every Monday to diff each repo against its last-recorded SHA and update the tracked docs. Deliberately a different mechanism from `mothership-live-review` (see README's updated note) — it tracks whether anyone's looked, it doesn't review commits with an LLM.
+
+**Tested immediately rather than waiting for Monday, and the test earned its keep.** The manual fire ran for real (~98K tokens, genuine cost) but produced zero detectable output anywhere checked. Investigating why, instead of shrugging it off, found that `main` was itself three weeks stale — the exact gap PR #63 had just fixed, meaning the test likely read a wrong baseline on its very first run. That's now fixed; the Routine's first scheduled run is 2026-10-12, starting from a correct baseline.
+
+**That stale-main discovery pointed straight at the real unstarted work: the ~98-PR window itself had never been audited for new findings**, only re-checked for four already-known ones. Three parallel passes (one per third of the range, 86 merges total) found that every security-relevant issue inside the window — including a **Critical** cross-student FERPA exposure and a **High** stored-XSS via a student's own name — had already been found and fixed by a later commit in that same window, before any Mothership session looked. Filed as **[KOS Audit Docket III](https://claude.ai/artifact/8ZoidoFagTThhbQSTmrYCf)**, with four new open items (18–21 below) and a confirming data point on The Pivot Ledger's "fixes forward" lesson. Merged as **[PR #64](https://github.com/adamberneche-afk/Mothership/pull/64)**.
+
+**One durable lesson went into [The Pivot Ledger](https://claude.ai/code/artifact/324d94db-64b1-4e3d-904f-16de245a2f79) beyond the cadence correction**: a privacy/safety rule written only as prompt text for a human to follow (KOS's `rtp-core-router` mail-privacy rule, found regressed during the Docket III pass) drifts exactly like a doc does, and needs the same audit a code change would get.
+
+**Net state at end of session:** `main` is current through PR #64 (`e85aa69`). **[PR #65](https://github.com/adamberneche-afk/Mothership/pull/65) is open, green, and awaiting merge** — the README clarification plus a third same-day fix to the repo-state table below, which drifted stale *again* while this very section was being written. Worth naming plainly for whoever reads this next: that happened **three separate times in one session**. The pattern is real, not a fluke — see the Pivot Ledger entry on self-citing commits and the cadence lesson for why, and don't assume a fourth time won't happen without someone deliberately re-reading this file end to end before trusting it.
+
+---
+
 ## Open items, roughly in priority order
 
 | # | Item | Where | Status |
@@ -154,13 +174,13 @@ Items 2, 4, 6 and 10 are now resolved (see each row above), and [KOS Audit Docke
 
 ## Repo state as of this handoff
 
-**Updated 2026-09-21.** Everything this session touched is merged.
+**Updated 2026-10-11.** Everything this session touched is merged except PR #65, open and green (see its own row below).
 
 > **Correction (2026-09-21, later same day):** this table originally said the branch below was "1 commit ahead, pushed, no PR opened." That was true when written and stale by the time anyone read it — PR #53 carrying that exact commit merged at 23:20:18 UTC the same day, before this file's own next read. Recorded here rather than silently fixed, since a table whose own subject changes out from under it while the file is being edited is the same class of mistake this document exists to catch.
 
 | Repo | `main` | Open work from this session |
 |---|---|---|
-| Mothership | `e85aa69` (#64 merged) | `claude/readme-live-review-note` carries a README clarification (the live-review skill is still on-demand only; the new weekly Routine is a separate mechanism) — PR to follow in this same pass. |
+| Mothership | `e85aa69` (#64 merged) | **[PR #65](https://github.com/adamberneche-afk/Mothership/pull/65) open, green, awaiting merge** — README clarification (the live-review skill is still on-demand only; the new weekly Routine is a separate mechanism) plus this very table's own SHA refresh. Open a PR or merge it; don't let it rot on the branch, same note this table has had to give itself before. |
 | Argoloth | `114e2c7` (#14 merged) | none |
 | KOS | `cf3002f` (#128 merged, checked 2026-10-10) | none from Mothership's side. KOS itself has its own live queue — see `meta/HANDOFF_2026-10-10.md` in that repo: everything through PR #128 is merged to its `main` but not yet `clasp push`ed to any of its Apps Script projects. |
 | TSO | `75498c9` (#2054 merged) | none |
@@ -195,3 +215,5 @@ Only Mothership is cloned locally in this session (`/home/user/Mothership`). The
 - **The Pivot Ledger is the durable index** — when in doubt about "has this already been looked at / fixed," check it before re-deriving from scratch.
 - **A docket/audit is a dated filing, not a rolling document** — when a repo has moved substantially since its last audit, file a new, cross-referenced docket rather than editing the old one in place. The Pivot Ledger *is* the rolling document; audit dockets are snapshots.
 - **Ground every finding in code you actually read**, never a commit message's own claim about itself — this is what caught both the ENOENT watchdog bug and the two doc-drift items fixed this session.
+- **A weekly account-level Routine now sweeps Mothership/KOS/Argoloth/TSO**, firing into a fresh session every Monday (~07:47 UTC) to diff each repo against its last-recorded SHA and update this file plus the relevant audit docket. It finds and tracks; it never fixes code or merges anything on its own. First real run: 2026-10-12. If a Monday goes by with no sign of it having run, that's worth checking directly (`list_triggers`/`get_trigger` on `trig_01Xs2SNKQfAwunWvCMdxxXsR`) rather than assumed fine — the manual test run it got before this went live produced silent zero output once already, for a real and fixable reason (see "What the 2026-10-10/11 session did" above), and a repeat with no obvious cause would be worth treating the same way: investigate, don't shrug.
+- **A self-citing commit message ("Closes Open Items #N") only pays off once someone on the tracking side actually reads it.** Four KOS fixes named the exact item they closed and none of those citations reached this file for three weeks, because nothing was checking. The citation is good practice; it is not the mechanism that closes the item.
