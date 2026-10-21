@@ -18,6 +18,8 @@ Written for whoever (human or a fresh Claude Code session) picks this up next. R
 
 > **Update (2026-10-11):** The whole 2026-10-10 arc above — the stale-tracker discovery, the Routine, Docket III, the Pivot Ledger corrections — is pulled into one consolidated account below, **"What the 2026-10-10/11 session did,"** rather than left scattered across three banners and an open-items footnote. Read that section for the full shape in one place; these banners stay as the dated record of how it unfolded. One small doc fix also went out the same pass: README's on-demand-live-review section could be misread as implying the new Routine schedules AI commit review — it doesn't, and the README now says so (PR #65).
 
+> **Update (2026-10-21):** The weekly Routine has fired (2026-10-12, 2026-10-19) but **nothing it found reached this repo**. The 10-19 run reports `ROUTINE_RUN_STATUS_SUCCEEDED`, yet its push was refused by the git proxy (403: Mothership is not in the Routine's repository sources), so its doc commit (`647af48` on `claude/weekly-sweep-2026-10-19`) existed only in a container that has since been reclaimed. "Succeeded" there means the session ended cleanly, not that the sweep landed. Its summary, recovered from the run transcript and **not re-verified here**: KOS moved 207 commits (`cf3002f` → `a4a126f`) with nothing High/Critical; items 18–21 untouched; Argoloth unreachable (private, no connector). **Owner action:** add Mothership and Argoloth to the Routine's repository sources, or every future run will repeat this.
+
 ---
 
 ## Start here: manual steps only the repo owner can do
@@ -174,13 +176,15 @@ Items 2, 4, 6 and 10 are now resolved (see each row above), and [KOS Audit Docke
 
 ## Repo state as of this handoff
 
-**Updated 2026-10-11.** Everything this session touched is merged except PR #65, open and green (see its own row below).
+**Updated 2026-10-21.** Everything is merged; nothing from a Mothership session is open. Only the Mothership row was re-verified this pass — the other rows are as last recorded and have not been re-checked here.
+
+> **Correction (2026-10-21):** the Mothership row said PR #65 was "open, green, awaiting merge." It merged 2026-10-10 as `fc9e702`, the same day the row was written — the fourth time this table has gone stale on its own subject, exactly as the 2026-10-10/11 section predicted.
 
 > **Correction (2026-09-21, later same day):** this table originally said the branch below was "1 commit ahead, pushed, no PR opened." That was true when written and stale by the time anyone read it — PR #53 carrying that exact commit merged at 23:20:18 UTC the same day, before this file's own next read. Recorded here rather than silently fixed, since a table whose own subject changes out from under it while the file is being edited is the same class of mistake this document exists to catch.
 
 | Repo | `main` | Open work from this session |
 |---|---|---|
-| Mothership | `e85aa69` (#64 merged) | **[PR #65](https://github.com/adamberneche-afk/Mothership/pull/65) open, green, awaiting merge** — README clarification (the live-review skill is still on-demand only; the new weekly Routine is a separate mechanism) plus this very table's own SHA refresh. Open a PR or merge it; don't let it rot on the branch, same note this table has had to give itself before. |
+| Mothership | `fc9e702` (#65 merged, checked 2026-10-21) | none — #65 merged 2026-10-10; the row above was stale (a fourth time, see below). |
 | Argoloth | `114e2c7` (#14 merged) | none |
 | KOS | `cf3002f` (#128 merged, checked 2026-10-10) | none from Mothership's side. KOS itself has its own live queue — see `meta/HANDOFF_2026-10-10.md` in that repo: everything through PR #128 is merged to its `main` but not yet `clasp push`ed to any of its Apps Script projects. |
 | TSO | `75498c9` (#2054 merged) | none |
