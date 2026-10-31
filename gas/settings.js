@@ -289,3 +289,25 @@ function renderFormHtml_(token, currentValues) {
     '</body></html>'
   );
 }
+
+// Installs every time-driven trigger this hub runs on, so a deploy can
+// finish setup without anyone opening the editor. Called through
+// doPost(?endpoint=install-triggers) by the deploy path - CI
+// (scripts/install-hub-triggers.mjs) or KOS's run.js on the operator's
+// machine - right after a deploy. The web app runs as its owner, so
+// ScriptApp can create triggers here; `clasp run` can't, because it needs
+// a Google Cloud project and GCP is disabled on this account. Each
+// installer is idempotent by handler name, so calling this on every
+// deploy never duplicates a trigger. Same gate as the settings page.
+function installHubTriggers(token) {
+  const adminToken = PropertiesService.getScriptProperties().getProperty('ADMIN_SETTINGS_TOKEN');
+  if (!adminToken || token !== adminToken) {
+    throw new Error('Unauthorized');
+  }
+  const before = ScriptApp.getProjectTriggers().map((t) => t.getHandlerFunction());
+  installReviewQueueTriggers();
+  installDeployVersionReportTrigger();
+  installSpokePollerTriggers();
+  const after = ScriptApp.getProjectTriggers().map((t) => t.getHandlerFunction());
+  return { installed: after.filter((h) => before.indexOf(h) === -1), present: after };
+}

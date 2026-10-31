@@ -77,11 +77,17 @@ function doPost(e) {
   try {
     if (endpoint === 'recursive_learning') {
       result = runRecursiveLearning(reqBody, { githubFactory, hubGithub, base64Encode, base64Decode, config });
+    } else if (endpoint === 'install-triggers') {
+      // POST only, token in the body, so it never lands in a URL or a log.
+      // See installHubTriggers() in settings.js.
+      result = { httpStatus: 200, body: installHubTriggers(reqBody.adminToken) };
     } else {
       result = processRequest(reqBody, { githubFactory, hubGithub, base64Encode, base64Decode, config });
     }
   } catch (err) {
-    result = { httpStatus: 500, body: { error: err.message } };
+    result = err.message === 'Unauthorized'
+      ? { httpStatus: 401, body: { error: 'Unauthorized' } }
+      : { httpStatus: 500, body: { error: err.message } };
   }
 
   const responseBody = Object.assign({}, result.body, { _httpStatus: result.httpStatus });

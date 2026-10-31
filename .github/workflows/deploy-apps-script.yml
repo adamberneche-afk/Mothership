@@ -1,15 +1,24 @@
 name: Deploy to Google Apps Script
 
 # Real CD for the Apps Script backend: push to main -> production
-# (GAS_PROD_DEPLOYMENT_ID); a pull request targeting main -> a separate,
-# persistent staging deployment (GAS_STAGING_DEPLOYMENT_ID) - Apps
-# Script's equivalent of a PR preview. Both are existing Apps Script
-# deployments, created once by hand via the IDE (see README's "Alternative:
-# Deploy Without Vercel" section) - `clasp deploy -i <id>` updates a
-# specific deployment's code in place rather than minting a new one, which
-# is what keeps each deployment's Web App URL stable across every CD run
-# instead of changing on every deploy the way a plain `clasp deploy` (no
-# `-i`) would.
+# (GAS_PROD_DEPLOYMENT_ID), an existing Apps Script deployment created once
+# by hand via the IDE (see README's "Alternative: Deploy Without Vercel"
+# section) - `clasp deploy -i <id>` updates that deployment's code in place
+# rather than minting a new one, which keeps its Web App URL stable.
+#
+# MAIN ONLY (2026-10-31). This used to deploy every pull request to a
+# staging deployment. That was unsafe once the hub runs time-driven
+# triggers (gas/spoke_poller.js): staging and production are deployments of
+# ONE Apps Script project, and a trigger always runs the project's latest
+# pushed code, not a deployment's pinned version - so a PR's `clasp push`
+# would have run unmerged code in production on the next poll. A staging
+# that needs isolation needs its own script project.
+#
+# After the deploy, the hub installs its own triggers
+# (scripts/install-hub-triggers.mjs -> doPost ?endpoint=install-triggers),
+# so nobody has to open the editor. That step needs ADMIN_SETTINGS_TOKEN as
+# a repository secret, matching the hub's Script Property of the same name,
+# and skips cleanly without it.
 #
 # NOT live-verified end-to-end: no Google account/clasp credential is
 # reachable from this environment. clasp's own OAuth credential file has
@@ -18,10 +27,6 @@ name: Deploy to Google Apps Script
 # decoded CLASPRC_JSON secret to both paths to hedge against that, but
 # which one a real `clasp push`/`clasp deploy` actually reads has never
 # been confirmed from this session. Flagged honestly.
-#
-# Known, disclosed limitation: a pull_request from a fork doesn't receive
-# repository secrets, so a staging deploy only works for PRs from branches
-# within this same repository.
 #
 # Degrades to a clean, honest skip - not a red failure - until an operator
 # has actually provisioned the real infrastructure this depends on (the
@@ -35,29 +40,22 @@ name: Deploy to Google Apps Script
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
-# NOT scoped per-ref (github.ref): unlike a Vercel-style deploy where every
-# branch/PR gets its own isolated preview, this workflow's `clasp push`
-# always pushes to the ONE shared Apps Script project - there is no
-# per-branch namespace on that side. Scoping the group per-ref would let a
-# PR's staging deploy and main's production deploy run concurrently and
-# race on that same shared `clasp push`, each one able to overwrite the
-# other's source between its own push and deploy steps. One global group
-# serializes every deploy against this project, staging or production,
-# newest cancels oldest.
+# One global group: `clasp push` always targets the ONE shared Apps Script
+# project, so two deploys must never overlap. Newest cancels oldest.
 concurrency:
   group: deploy-apps-script
   cancel-in-progress: true
 
 jobs:
   deploy:
+    # A manual dispatch from another branch must not push unmerged code
+    # into the shared project either.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write # only used to comment the staging URL back onto the PR
     steps:
       - uses: actions/checkout@v4
 
@@ -110,27 +108,6 @@ jobs:
           { "scriptId": "$GAS_SCRIPT_ID", "rootDir": "." }
           CLASPJSON
 
-      # Step output, not an inline ternary expression repeated in every
-      # later step. A workflow_dispatch run is NOT a pull_request event, so
-      # it must not be lumped in with "everything that isn't a PR is
-      # production": dispatching this workflow by hand against a
-      # non-main branch (to test a staging deploy manually, say) needs to
-      # land on staging too, same as a real PR would - only a dispatch run
-      # against main itself, or an actual push to main, is production.
-      - name: Determine deploy target
-        if: steps.configured.outputs.ready == 'true'
-        id: target
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ] || [ "${{ github.ref }}" != "refs/heads/main" ]; then
-            echo "deployment_id=${{ secrets.GAS_STAGING_DEPLOYMENT_ID }}" >> "$GITHUB_OUTPUT"
-            echo "web_app_url=${{ secrets.GAS_STAGING_WEB_APP_URL }}" >> "$GITHUB_OUTPUT"
-            echo "label=staging" >> "$GITHUB_OUTPUT"
-          else
-            echo "deployment_id=${{ secrets.GAS_PROD_DEPLOYMENT_ID }}" >> "$GITHUB_OUTPUT"
-            echo "web_app_url=${{ secrets.GAS_WEB_APP_URL }}" >> "$GITHUB_OUTPUT"
-            echo "label=production" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Push source to the Apps Script project
         if: steps.configured.outputs.ready == 'true'
         working-directory: gas
@@ -139,7 +116,9 @@ jobs:
       - name: Update the target deployment in place
         if: steps.configured.outputs.ready == 'true'
         working-directory: gas
-        run: clasp deploy -i "${{ steps.target.outputs.deployment_id }}" -d "Deployed from ${{ github.sha }} (${{ steps.target.outputs.label }})"
+        env:
+          GAS_PROD_DEPLOYMENT_ID: ${{ secrets.GAS_PROD_DEPLOYMENT_ID }}
+        run: clasp deploy -i "$GAS_PROD_DEPLOYMENT_ID" -d "Deployed from ${{ github.sha }}"
 
       - name: Smoke test the deployment
         if: steps.configured.outputs.ready == 'true'
@@ -148,17 +127,18 @@ jobs:
         # renderHealthResponse comment), and scripts/smoke-test.js already
         # treats that as a real, disclosed platform difference rather than
         # a mismatch.
-        run: node scripts/smoke-test.js "${{ steps.target.outputs.web_app_url }}?endpoint=health"
+        env:
+          GAS_WEB_APP_URL: ${{ secrets.GAS_WEB_APP_URL }}
+        run: node scripts/smoke-test.js "$GAS_WEB_APP_URL?endpoint=health"
 
-      - name: Comment the staging URL on the PR
-        if: steps.configured.outputs.ready == 'true' && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const url = `${{ steps.target.outputs.web_app_url }}`;
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `**Apps Script staging deployment updated and smoke-tested:** ${url}?endpoint=health\n\nThis is a persistent staging deployment (stable URL, unlike a fresh Vercel preview) updated in place by this PR.`
-            });
+      - name: Install the hub's triggers
+        if: steps.configured.outputs.ready == 'true'
+        env:
+          ADMIN_SETTINGS_TOKEN: ${{ secrets.ADMIN_SETTINGS_TOKEN }}
+          GAS_WEB_APP_URL: ${{ secrets.GAS_WEB_APP_URL }}
+        run: |
+          if [ -z "$ADMIN_SETTINGS_TOKEN" ]; then
+            echo "::notice::ADMIN_SETTINGS_TOKEN is not a repository secret - skipping trigger install. Run installSpokePollerTriggers() etc. from the editor instead, or add the secret."
+            exit 0
+          fi
+          node scripts/install-hub-triggers.mjs "$GAS_WEB_APP_URL"
