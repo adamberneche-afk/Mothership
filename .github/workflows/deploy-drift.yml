@@ -38,8 +38,12 @@ jobs:
         # into this run: script's text, so a hostile payload value can't
         # inject shell syntax. deploy-drift.js re-validates the sha itself
         # before using it for anything, including in an issue body.
+        # The built-in token: the only write is this repo's own drift issue.
+        # GLOBAL_GITHUB_TOKEN's Actions-secret copy went bad, and every daily
+        # report from the live hub failed on 401 here even though the hub's
+        # own copy (a Script Property) was fine.
         env:
-          GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEPLOY_DRIFT_SHA: ${{ github.event.client_payload.sha }}
           DEPLOY_DRIFT_REPORTED_AT: ${{ github.event.client_payload.reportedAt }}
         run: node scripts/deploy-drift.js

@@ -161,7 +161,7 @@ export async function publishWatchdogReport(octokit, body) {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+  const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN || process.env.GLOBAL_GITHUB_TOKEN });
   const yamlFindings = runActionlint();
   checkScheduledWorkflowRuns(octokit, HUB_OWNER, HUB_REPO)
     .then(async (runFindings) => {

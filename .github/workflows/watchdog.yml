@@ -15,6 +15,7 @@ jobs:
     permissions:
       contents: read
       issues: write
+      actions: read # listing this repo's own workflow runs
     steps:
       - uses: actions/checkout@v7
 
@@ -30,8 +31,13 @@ jobs:
         run: bash <(curl -s https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
 
       - name: Check every workflow file is valid and every scheduled workflow's last run succeeded
+        # The built-in token, not GLOBAL_GITHUB_TOKEN: everything this job
+        # reads and writes is in this repo. On the shared secret, the alarm
+        # died with the jobs it watches - GLOBAL_GITHUB_TOKEN went bad and
+        # this job failed on 401 every week from 2026-09-08 to 10-27
+        # without raising anything.
         env:
-          GLOBAL_GITHUB_TOKEN: ${{ secrets.GLOBAL_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           export PATH="$PWD:$PATH"
           node scripts/watchdog.js
