@@ -1,6 +1,6 @@
 # Session Handoff — 2026-09-06
 
-*Last updated 2026-10-11 (the weekly-Routine / KOS Audit Docket III session). The dated update notes below are cumulative — read them in order; the original 09-06 body is kept as the record of what prompted all of it, not as current status.*
+*Last updated 2026-10-31, evening (the pull-model session; see its banner and "What the 2026-10-31 session did"). The dated update notes below are cumulative — read them in order; the original 09-06 body is kept as the record of what prompted all of it, not as current status.*
 
 Written for whoever (human or a fresh Claude Code session) picks this up next. Read the "Start here" section first — everything else is context for *why*, not things to do before that.
 
@@ -28,6 +28,8 @@ Written for whoever (human or a fresh Claude Code session) picks this up next. R
 > - **Item 14 was narrower than recorded:** the hub's own token works; only Mothership's GitHub Actions copy is bad. Watchdog and deploy-drift moved to the built-in token (Mothership #74).
 > - **Floor sync:** KOS never had checks 7–8 and TSO ran its own copies; both now match the hub (KOS #341, TSO #2064). Argoloth already did.
 > - **Item 22 corrected:** the owner confirmed the catalog spreadsheets hold no real data; it is a Medium scanner gap.
+> - **The spokes know:** KOS, Argoloth and TSO each say in their own docs that the hub pulls and `call-hub.yml` is being retired, and not to repair it (KOS #349, Argoloth #15, TSO #2065).
+> - **Reviews still need the Flow.** The poller queues commits, but the Workspace Flow that answers the queue was never built (item 30). Build it before or soon after the run in step 1.
 
 ---
 
@@ -40,6 +42,7 @@ Nothing below is a technical blocker — all of it is code that is merged and wa
    - Create `clasp-registry\mothership-hub\` beside the KOS registry entries: `.clasp.json` (from `clasp clone <the hub's scriptId>`), `deployments.txt` (the hub's existing deployment ID, so its `/exec` URL is kept), `admin-token.txt` (the value above).
    - Download Mothership's zip, then `node run.js --latest --hub latest`. The summary should end `mothership-hub … triggers ok`.
    - Check: `showSpokePollStatus()` in the hub's editor (or wait for the 6-hourly poll). Every active spoke should read `settled` or `unchanged`. Then `call-hub.yml` and its two secrets can come out of KOS, Argoloth and TSO (item 28).
+   - **Know what this turns on.** From here the hub queues every active spoke's new commits for review, but nothing answers the queue until the ReviewQueue Flow exists (item 30, README "Native Workspace Inference" step 2). Until then rows wait at `READY` and no review comes out. Safest is to build the Flow first; the queue Sheet already exists. Keep `DRY_RUN_MODE` on either way.
 
 > **Superseded (2026-10-31):** this step used to be "set `DEFAULT_TENANT_CALLER_KEY`, redeploy, and add `APPS_SCRIPT_URL`/`TENANT_CALLER_KEY` to every spoke." None of that was ever done, and every spoke heartbeat failed on every run from 2026-09-19 (KOS: 233 of 233). The pull model removes the need: spokes no longer call the hub. The redeploy that step asked for happens as part of the run above, which also puts the PR #43 auth fix live.
 
@@ -155,7 +158,9 @@ The whole arc in one place — three banners and an open-items footnote above te
 
 **Item 14 was narrower than recorded.** The hub's own token works (GitHub accepts its daily dispatch); only Mothership's Actions-secret copy is bad. Watchdog and deploy-drift only touch Mothership, so they now use the built-in token (Mothership #74). Two jobs still need a cross-repo token (item 29).
 
-**Net state:** everything above is merged. What remains is the owner run in "Start here" step 1, then removing the spokes' `call-hub.yml` (item 28) and moving two jobs into the hub (item 29). The weekly Routine still loses its output until Mothership and Argoloth are added to its repository sources.
+**Telling the spokes.** Each spoke's own docs still called the heartbeat's secrets required, so a session there would have tried to repair it. KOS's README, Argoloth's `CLAUDE.md` and TSO's `HANDOFF.md` now say the hub pulls, not to repair `call-hub.yml`, and what its removal must touch (KOS #349, Argoloth #15, TSO #2065). A last documentation pass corrected this repo's README (its spoke list, a superseded setup step, and the Flow's role now that polling is automatic), marked `tais` as `archived` in `spokes.json` so the poller skips it, and fixed Argoloth's stale test count.
+
+**Net state:** everything above is merged. What remains is the owner run in "Start here" step 1, building the ReviewQueue Flow (item 30), then removing the spokes' `call-hub.yml` (item 28) and moving two jobs into the hub (item 29). The weekly Routine still loses its output until Mothership and Argoloth are added to its repository sources.
 
 ---
 
@@ -190,8 +195,9 @@ The whole arc in one place — three banners and an open-items footnote above te
 | 25 | Three new prompt-input paths skip `findSystemText_` (Flow 4 answers, `[ALSO_SHOWN]`, Flow 2 earlier parts) | KOS, cas-ccps (40, 13, 37, 00) | Open, Medium. |
 | 26 | Family Mail Sentinel: one "not family" verdict unlabels a whole thread; scan reads 100 messages then advances its watermark | KOS, cas-ccps (60) | Open, Medium ×2. |
 | 27 | Third parties' cell numbers still in public git history (removed at HEAD in #129) | KOS, leader-hub | Open, Low — owner's call whether to purge. |
-| 28 | Spoke heartbeats (`call-hub.yml`) fail on every run; replaced by the hub's pull model | KOS ↔ Mothership | 🟡 **Built and merged (2026-10-31), not yet live.** KOS's heartbeat never succeeded once (233 of 233 runs). `gas/spoke_poller.js` (Mothership #73) has the hub review every active spoke on its own timer with its own credential. Deploying it and installing its triggers is one owner run: **"Start here" step 1** (`run.js --hub`, KOS #348; install endpoint, Mothership #75). **Then:** once every active spoke reads `settled`/`unchanged`, remove `call-hub.yml` and its two secrets from KOS, Argoloth and TSO. That turns KOS's watchdog green and makes item 15 (TSO's heartbeat silently stopping) moot. |
+| 28 | Spoke heartbeats (`call-hub.yml`) fail on every run; replaced by the hub's pull model | KOS ↔ Mothership | 🟡 **Built and merged (2026-10-31), not yet live.** KOS's heartbeat never succeeded once (233 of 233 runs). `gas/spoke_poller.js` (Mothership #73) has the hub review every active spoke on its own timer with its own credential. Deploying it and installing its triggers is one owner run: **"Start here" step 1** (`run.js --hub`, KOS #348; install endpoint, Mothership #75). **Then:** once every active spoke reads `settled`/`unchanged`, remove `call-hub.yml` and its two secrets from KOS, Argoloth and TSO. That turns KOS's watchdog green and makes item 15 (TSO's heartbeat silently stopping) moot. **Spoke docs done (2026-10-31):** KOS #349, Argoloth #15 and TSO #2065 tell each repo not to repair `call-hub.yml` and list what its removal touches (for TSO, also `tools/doctor/` and `floor.json`). |
 | 29 | `health-report` and `collect-issue-feedback` still use the stale `GLOBAL_GITHUB_TOKEN` Actions secret | Mothership | Open. Both read every spoke (including private Argoloth), so the built-in token can't replace it. Plan: move them into the hub as Apps Script triggers, like the spoke poller, so they use the token that already works and the Actions secret can be deleted. Stopgap: paste the hub's token into the Actions secret (two copies of one token again). |
+| 30 | The ReviewQueue/LearningQueue Workspace Flow has never been built, so nothing answers queued reviews | Mothership (owner-only) | Open. Studio/Flow has no deploy API, so only the owner can build it (README "Native Workspace Inference" step 2). It mattered little while nothing queued; once the poller is live every active spoke's commits queue automatically and wait at `READY`. `checkReviewQueueLiveness()` reports it; the canary proves the rest of the pipeline without it. Also open: `thinkos-server` is still `active` in `spokes.json` though its work is parked (item 9) - the owner's call whether the hub should review it. |
 
 **Correction, same day:** the first write-up of this in [The Pivot Ledger](https://claude.ai/code/artifact/324d94db-64b1-4e3d-904f-16de245a2f79) led with a documentation-mechanics framing — four fixing commits each cited the exact tracked item they closed, and none of those citations turned into a tracker edit. True, but the repo owner correctly called out that it missed the actual cause: **nobody ran a Mothership-side check on KOS at all for the 19 days between this handoff's 2026-09-21 update and today**, full stop, during which KOS took on ~98 more PRs. On-demand-only auditing (no schedule, by design — see "watch the watchers" in that ledger) means the account's audit function only runs when someone remembers to ask; three weeks of nobody asking is why four already-real fixes sat untracked, not a citation-propagation bug. **The real open item this surfaced**: that ~98-PR window has had no fresh-findings pass the way the prior ~100-commit gap got KOS Audit Docket II. Today's work closed the books on four previously-known items — it did not audit the window that produced them. That's unstarted, not done.
 
@@ -209,10 +215,10 @@ Items 2, 4, 6 and 10 are now resolved (see each row above), and [KOS Audit Docke
 
 | Repo | `main` | Open work from this session |
 |---|---|---|
-| Mothership | `2e943c1` (#75 merged, checked 2026-10-31) | this PR (the evening handoff). |
-| Argoloth | `114e2c7` (#14 merged; unchanged since 2026-09-21, checked 2026-10-31) | none. All seven floor files byte-identical to the hub's. |
-| KOS | PR #348, `9127bdf` (checked 2026-10-31) | none open. #341 (floor checks 7–8) and #348 (`run.js --hub`) merged today. **History was rewritten after 2026-10-20 more than once** — cite KOS by PR number, never by SHA. Audited through #339 in [KOS Audit Docket IV](https://claude.ai/artifact/5Ty6HdRBxwr2fYYUYuPVX7). |
-| TSO | `7c2a09d` (#2064 merged, checked 2026-10-31) | none. |
+| Mothership | `1e799ec` (#76 merged, checked 2026-10-31) | this PR (the documentation-currency pass). |
+| Argoloth | `c344f65` (#15 merged, checked 2026-10-31) | a one-line test-count fix (150 → 151). All seven floor files byte-identical to the hub's. |
+| KOS | PR #349, `3227639` (checked 2026-10-31) | none open. #341 (floor checks 7–8), #348 (`run.js --hub`) and #349 (the hub pulls; `call-hub.yml` retiring) merged today. **History was rewritten after 2026-10-20 more than once** — cite KOS by PR number, never by SHA. Audited through #339 in [KOS Audit Docket IV](https://claude.ai/artifact/5Ty6HdRBxwr2fYYUYuPVX7). |
+| TSO | `b341f6e` (#2065 merged, checked 2026-10-31) | none. |
 | ThinkOS-Server | — | **PR #6 open as a draft, parked at the owner's request.** Revive when asked; see open item 9. |
 | Tais | — | **Archived. Out of scope permanently** — do not re-add it to any floor status table. |
 
