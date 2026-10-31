@@ -60,7 +60,8 @@ function makeFakeUrlFetchApp({ aiJsonContent, githubResponses = {} } = {}) {
 function makeFakePropertiesService(props) {
   return {
     getScriptProperties: () => ({
-      getProperty: (key) => (props[key] !== undefined ? props[key] : null)
+      getProperty: (key) => (props[key] !== undefined ? props[key] : null),
+      setProperty: (key, value) => { props[key] = String(value); }
     })
   };
 }
@@ -125,9 +126,10 @@ function loadCodeWithFakes({ props = {}, aiJsonContent = NO_FINDING_JSON, github
     HtmlService: makeFakeHtmlService(),
     Utilities: makeFakeUtilities(),
     SpreadsheetApp: trackedSpreadsheetApp,
+    LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
     Logger: { log: () => {} }
   };
-  const context = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js', 'recursive_learning.js', 'deploy_version_marker.js', 'deploy_version_report.js', 'Code.js', seed);
+  const context = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js', 'recursive_learning.js', 'deploy_version_marker.js', 'deploy_version_report.js', 'spoke_poller.js', 'Code.js', seed);
   return { context, urlFetchApp, openByIdCalls };
 }
 
@@ -237,6 +239,21 @@ function testGetWithNoRecognizedEndpointStillReturnsAPlainInfoPage() {
   check('returns the generic HtmlService page, not JSON', typeof output._text === 'string' && output._text.includes('webhook endpoint'));
 }
 
+// gas/spoke_poller.js's trigger handler builds its own dependencies the way
+// doPost() does (buildHubDeps_). With every GitHub read 404ing, the
+// registry is empty, so the run polls nothing - but it has to get that far
+// through the real loadConfig/makeGithubClient/Script Properties wiring
+// and leave a status record behind.
+function testSpokePollerTriggerHandlerRunsThroughRealWiring() {
+  console.log('pollSpokesDebug() runs through the same config/github wiring as doPost and records its run');
+  const props = { GLOBAL_GITHUB_TOKEN: 'ghp_fake' };
+  const { context } = loadCodeWithFakes({ props });
+  const record = context.pollSpokesDebug();
+  check('returns a run record', record && record.mode === 'debug' && Array.isArray(record.results));
+  check('an unreadable registry polls no spokes', record.results.length === 0);
+  check('SPOKE_POLL_STATUS was written to Script Properties', JSON.parse(props.SPOKE_POLL_STATUS).mode === 'debug');
+}
+
 function main() {
   testDefaultsToAutonomousAgentWhenNoEndpointGiven();
   testExplicitEndpointRoutesToRecursiveLearning();
@@ -245,6 +262,7 @@ function main() {
   testConfigIsReadFromScriptPropertiesNotHardcoded();
   testHealthEndpointRespondsOkWithNoOtherCallsAtAll();
   testGetWithNoRecognizedEndpointStillReturnsAPlainInfoPage();
+  testSpokePollerTriggerHandlerRunsThroughRealWiring();
 
   console.log('');
   if (failures > 0) {
