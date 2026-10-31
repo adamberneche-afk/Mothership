@@ -23,4 +23,4 @@
 //   4. clasp push, then clasp deploy -i <id> -V <n> to actually promote it
 //      (pushing HEAD alone does not update the live web app's /exec
 //      deployment).
-const DEPLOY_VERSION_SHA = 'd84591d76e2d34f823bc45e8268802171d113923'; // stamped by scripts/deploy-drift-stamp.js - never hand-edit
+const DEPLOY_VERSION_SHA = 'aa2b62dde236ffee2765bf7ca3e899c7200b553e'; // stamped by scripts/deploy-drift-stamp.js - never hand-edit
