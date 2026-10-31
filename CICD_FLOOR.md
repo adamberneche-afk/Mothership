@@ -311,6 +311,16 @@ sections down in the same file.
 
 Verified 2026-09-21 by direct inspection, not by reading docs.
 
+**Correction (2026-10-31):** two rows below were never true as written. KOS
+never had checks 7 or 8: neither workflow appears anywhere in its history,
+and KOS #30 installed secrets-doctor only. TSO had both, but its own
+originals, not the canonical copies, so "byte-identical in every repo" held
+for `scripts/secrets-doctor.mjs` alone. Found by hashing every floor file
+in every spoke against this repo's copy. Fixed by KOS #341 (installs both)
+and TSO #2064 (swaps in the canonical copies, settings moved to
+`floor.json`); the cells below say *pending* until those merge. Argoloth
+was already byte-identical on all seven floor files.
+
 | | Mothership | KOS | Argoloth | TSO | ThinkOS |
 |---|---|---|---|---|---|
 | 1 CodeQL | ✅ | ✅ | ⛔ | ✅ | ✅ |
@@ -319,8 +329,8 @@ Verified 2026-09-21 by direct inspection, not by reading docs.
 | 4 tests in CI | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 5 docs-check | ✅ | ✅ | ✅ | ❌ | ❌ |
 | 6 doc-currency | ✅ | pre-existing own | ✅ | pre-existing own | ❌ |
-| 7 doc-link-check | ✅ | ✅ | ✅ | ✅ | non-canonical |
-| 8 doc-placeholder-check | ✅ | ✅ | ✅ | ✅ | non-canonical |
+| 7 doc-link-check | ✅ | pending KOS #341 | ✅ | pending TSO #2064 (own copy) | non-canonical |
+| 8 doc-placeholder-check | ✅ | pending KOS #341 | ✅ | pending TSO #2064 (own copy) | non-canonical |
 | 9 coverage-gaps | ✅ | pre-existing own | ✅ | ✅ | ❌ |
 | 10 secrets-doctor | ✅ | ✅ | ✅ | ✅ | PR #6, draft |
 
