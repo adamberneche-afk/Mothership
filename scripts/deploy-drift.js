@@ -114,7 +114,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.error(`Rejected report: ${result.reason}`);
     process.exitCode = 1;
   } else {
-    const octokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
+    const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN || process.env.GLOBAL_GITHUB_TOKEN });
     publishDriftStatus(octokit, result)
       .then((publishResult) => {
         console.log(`Issue ${publishResult.action}${publishResult.issueUrl ? ': ' + publishResult.issueUrl : ''}`);
