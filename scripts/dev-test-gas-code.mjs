@@ -7,6 +7,7 @@
 //
 // Usage: node scripts/dev-test-gas-code.mjs
 
+import { readFileSync } from 'fs';
 import { loadGasGlobals } from './gas-test-harness.mjs';
 import { makeFakeSpreadsheet, makeFakeSpreadsheetApp } from './gas-sheet-fakes.mjs';
 
@@ -254,6 +255,19 @@ function testSpokePollerTriggerHandlerRunsThroughRealWiring() {
   check('SPOKE_POLL_STATUS was written to Script Properties', JSON.parse(props.SPOKE_POLL_STATUS).mode === 'debug');
 }
 
+// The manifest is not code, so nothing else here reads it. A misspelled key
+// is not ignored: `clasp push` rejected `timezone` (the field is `timeZone`)
+// on the owner's first deploy of the hub (KOS meta/HANDOFF_2026-11-01.md),
+// and the push only went through from a hand-edited copy.
+function testManifestUsesOnlyKnownTopLevelKeys() {
+  console.log('gas/appsscript.json uses only manifest keys Apps Script accepts');
+  const manifest = JSON.parse(readFileSync(new URL('../gas/appsscript.json', import.meta.url), 'utf8'));
+  const known = ['timeZone', 'dependencies', 'exceptionLogging', 'runtimeVersion', 'webapp', 'oauthScopes', 'executionApi', 'urlFetchWhitelist', 'addOns', 'sheets', 'dataStudio', 'chat'];
+  const unknown = Object.keys(manifest).filter((k) => known.indexOf(k) === -1);
+  check(`no unknown keys (found: ${unknown.join(', ') || 'none'})`, unknown.length === 0);
+  check('timeZone is set, so trigger hours mean what installSpokePollerTriggers() says', typeof manifest.timeZone === 'string' && manifest.timeZone.length > 0);
+}
+
 function main() {
   testDefaultsToAutonomousAgentWhenNoEndpointGiven();
   testExplicitEndpointRoutesToRecursiveLearning();
@@ -263,6 +277,7 @@ function main() {
   testHealthEndpointRespondsOkWithNoOtherCallsAtAll();
   testGetWithNoRecognizedEndpointStillReturnsAPlainInfoPage();
   testSpokePollerTriggerHandlerRunsThroughRealWiring();
+  testManifestUsesOnlyKnownTopLevelKeys();
 
   console.log('');
   if (failures > 0) {
