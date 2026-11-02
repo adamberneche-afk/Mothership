@@ -6,7 +6,9 @@
 
 import { loadGasGlobals } from './gas-test-harness.mjs';
 import { makeFakeLogger } from './gas-sheet-fakes.mjs';
-import { installHubTriggers as callHub } from './install-hub-triggers.mjs';
+import { installHubTriggers as callHub, isMainModule } from './install-hub-triggers.mjs';
+import { pathToFileURL as toUrl } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 let failures = 0;
 function check(name, condition) {
@@ -135,6 +137,22 @@ async function testCallerFailures() {
   check('a missing token stops before any request', /ADMIN_SETTINGS_TOKEN is not set/.test(noTok));
 }
 
+function testRunsAsAScript() {
+  console.log('the script runs when node is asked to run it, by any spelling of its path');
+  const self = new URL('./install-hub-triggers.mjs', import.meta.url);
+  const abs = decodeURIComponent(self.pathname);
+  check('an absolute path matches', isMainModule(toUrl(abs).href, abs));
+  check('a relative path matches', isMainModule(toUrl(abs).href, 'scripts/install-hub-triggers.mjs') ===
+    (process.cwd() + '/scripts/install-hub-triggers.mjs' === abs));
+  check('an import (another argv[1]) does not', !isMainModule(toUrl(abs).href, '/elsewhere/run.js'));
+  check('no argv[1] does not', !isMainModule(toUrl(abs).href, undefined));
+  // End to end: run it with no URL. It must reach the caller and fail loudly,
+  // not exit 0 having done nothing (what Windows saw).
+  const r = spawnSync(process.execPath, [abs], { encoding: 'utf8', env: { ...process.env, ADMIN_SETTINGS_TOKEN: '' } });
+  check('run directly, it reaches the caller and exits 1', r.status === 1 && /install-hub-triggers: No web app URL given/.test(r.stderr));
+}
+
+testRunsAsAScript();
 testInstallsEveryHubTriggerOnce();
 testReportsOnlyWhatItAdded();
 testRejectsWrongOrMissingToken();
