@@ -1,0 +1,10 @@
+[
+  {
+    "tenantId": null,
+    "timestamp": "2026-11-02T19:43:34.907Z",
+    "eventType": "review_run",
+    "mode": "fixture",
+    "owner": "_fixture",
+    "repo": "_fixture"
+  }
+]
