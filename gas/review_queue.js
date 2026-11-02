@@ -594,6 +594,40 @@ function runLearningQueueCanaryNow() {
   return result;
 }
 
+// The liveness checks take `config` because doPost-style callers already
+// have one. Run from the editor's function picker they get none, open no
+// spreadsheet and log nothing - the owner's first check of a newly built Flow
+// (2026-11-02) came back as an empty execution log for exactly that reason.
+// These wrappers load the config the way the binding check does and log a
+// sentence a person can act on, not just the raw counts.
+function describeLiveness_(report, queueConfigured) {
+  if (!queueConfigured) return 'No queue spreadsheet: QUEUE_SHEET_ID is not set, so there is nothing to check yet.';
+  if (report.stuckAtReady > 0) return report.stuckAtReady + ' row(s) have an answer but are still READY - the Flow\'s update step must also set ReadyStatus to EVALUATED.';
+  if (report.everAnswered) return 'A Flow has answered: ' + report.answered + ' answered row(s), ' + report.ready + ' waiting' + (report.ready ? ' (oldest ' + report.oldestReadyMins + ' min)' : '') + '.';
+  if (report.ready > 0) return 'No Flow has answered yet: ' + report.ready + ' row(s) waiting, oldest ' + report.oldestReadyMins + ' min.';
+  return 'The queue is empty: nothing waiting and nothing answered.';
+}
+
+function runReviewQueueLivenessNow() {
+  const config = loadConfig();
+  config.scriptProperties = PropertiesService.getScriptProperties();
+  // Checked here rather than left to openQueueSpreadsheet_, which would
+  // create a new spreadsheet: a check should not change what it checks.
+  const report = config.queueSheetId ? checkReviewQueueLiveness(config) : { ...LIVENESS_ZERO_REPORT };
+  Logger.log('[ReviewQueue] Liveness: ' + describeLiveness_(report, !!config.queueSheetId) + ' ' + JSON.stringify(report));
+  return report;
+}
+
+function runLearningQueueLivenessNow() {
+  const config = loadConfig();
+  config.scriptProperties = PropertiesService.getScriptProperties();
+  // Checked here rather than left to openQueueSpreadsheet_, which would
+  // create a new spreadsheet: a check should not change what it checks.
+  const report = config.queueSheetId ? checkLearningQueueLiveness(config) : { ...LIVENESS_ZERO_REPORT };
+  Logger.log('[LearningQueue] Liveness: ' + describeLiveness_(report, !!config.queueSheetId) + ' ' + JSON.stringify(report));
+  return report;
+}
+
 function runReviewQueueBindingCheckNow() {
   const config = loadConfig();
   config.scriptProperties = PropertiesService.getScriptProperties();

@@ -281,6 +281,46 @@ function testLivenessFailsSafeWithNoQueueSheetConfigured() {
   check('all-zero, not a throw', report.ready === 0 && report.answered === 0 && report.everAnswered === false);
 }
 
+// The editor has no config to pass, so the bare checks returned zeros and
+// logged nothing there (2026-11-02). The *Now wrappers load it themselves.
+function testLivenessNowWrappersLoadConfigAndLogASentence() {
+  console.log('runReviewQueueLivenessNow/runLearningQueueLivenessNow load the config themselves and log an actionable sentence');
+  const Logger = makeFakeLogger();
+  const props = { QUEUE_SHEET_ID: 'sheet-1' };
+  const ctx = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js', 'recursive_learning.js', {
+    Logger,
+    loadConfig: () => ({ queueSheetId: props.QUEUE_SHEET_ID || null }),
+    PropertiesService: { getScriptProperties: () => ({ getProperty: (k) => (props[k] !== undefined ? props[k] : null), setProperty: (k, v) => { props[k] = v; } }) }
+  });
+  const rq = makeFakeSheet([
+    ['Timestamp', 'Owner', 'Repo', 'Mode', 'CommitSha', 'ReadyStatus', 'PromptText', 'GeminiFullOutput'],
+    [new Date(Date.now() - 10 * 60 * 1000), '_fixture', '_fixture', 'debug', 'sha1', 'READY', 'prompt', '']
+  ]);
+  const lq = makeFakeSheet([['Timestamp', 'Kind', 'TenantId', 'ReadyStatus', 'PromptText', 'GeminiFullOutput', 'ContextJson']]);
+  ctx.SpreadsheetApp = makeFakeSpreadsheetApp({ 'sheet-1': makeFakeSpreadsheet({ ReviewQueue: rq, LearningQueue: lq }) });
+  const logged = () => Logger.lines.map(String).join('\n');
+
+  const report = ctx.runReviewQueueLivenessNow();
+  check('reads the real queue with no argument (1 waiting)', report.ready === 1);
+  check('logs that no Flow has answered yet', /\[ReviewQueue\] Liveness: No Flow has answered yet: 1 row\(s\) waiting/.test(logged()));
+
+  rq._rows[1][5] = 'HARVESTED'; rq._rows[1][7] = 'a real answer';
+  ctx.runReviewQueueLivenessNow();
+  check('logs that a Flow has answered', /A Flow has answered: 1 answered/.test(logged()));
+
+  rq._rows[1][5] = 'READY';
+  ctx.runReviewQueueLivenessNow();
+  check('logs the missing EVALUATED write as its own case', /still READY - the Flow's update step must also set ReadyStatus to EVALUATED/.test(logged()));
+
+  ctx.runLearningQueueLivenessNow();
+  check('the learning wrapper reports an empty queue', /\[LearningQueue\] Liveness: The queue is empty/.test(logged()));
+
+  delete props.QUEUE_SHEET_ID;
+  ctx.runReviewQueueLivenessNow();
+  check('an unset QUEUE_SHEET_ID is said plainly, not reported as an empty queue', /No queue spreadsheet: QUEUE_SHEET_ID is not set/.test(logged()));
+  check('and no spreadsheet is created by checking', !props.QUEUE_SHEET_ID);
+}
+
 // --- installReviewQueueTriggers: idempotent by handler name -----------------
 
 function makeFakeScriptApp(existingHandlerNames = []) {
@@ -526,6 +566,7 @@ function main() {
   testLivenessCatchesARowStuckAtReadyWithRealOutput();
   testLearningQueueLivenessSameShape();
   testLivenessFailsSafeWithNoQueueSheetConfigured();
+  testLivenessNowWrappersLoadConfigAndLogASentence();
   testInstallTriggersCreatesBothOnAFreshProject();
   testInstallTriggersIsIdempotent();
   testInstallTriggersOnlyCreatesTheMissingOne();
