@@ -7,6 +7,9 @@ on:
 jobs:
   self-check:
     runs-on: ubuntu-latest
+    # No checkout and no GitHub API call: this job only curls the hub, so
+    # the built-in token gets no scopes at all.
+    permissions: {}
     steps:
       - name: Ping Hub for self-analysis
         env:
