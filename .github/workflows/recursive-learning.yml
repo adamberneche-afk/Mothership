@@ -19,6 +19,9 @@ on:
 jobs:
   aggregate:
     runs-on: ubuntu-latest
+    # No checkout and no GitHub API call: this job only curls the hub, so
+    # the built-in token gets no scopes at all.
+    permissions: {}
     steps:
       - name: Ping Hub for cross-spoke aggregation
         env:

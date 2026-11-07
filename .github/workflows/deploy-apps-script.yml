@@ -88,7 +88,11 @@ jobs:
 
       - name: Install clasp
         if: steps.configured.outputs.ready == 'true'
-        run: npm install --global @google/clasp@latest
+        # Pinned, not @latest: this step runs next to CLASPRC_JSON (the
+        # owner's Google OAuth credential), so a new npm release must not
+        # reach it unreviewed. 3.4.1 is what @latest resolved to on
+        # 2026-11-07; bump it on purpose, in its own PR.
+        run: npm install --global @google/clasp@3.4.1
 
       - name: Restore clasp credentials
         if: steps.configured.outputs.ready == 'true'

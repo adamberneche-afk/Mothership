@@ -3716,6 +3716,9 @@ on:
 jobs:
   self-check:
     runs-on: ubuntu-latest
+    # No checkout and no GitHub API call: this job only curls the hub, so
+    # the built-in token gets no scopes at all.
+    permissions: {}
     steps:
       - name: Ping Hub for self-analysis
         env:
@@ -3754,6 +3757,10 @@ on:
 jobs:
   prune:
     runs-on: ubuntu-latest
+    # GLOBAL_GITHUB_TOKEN (a PAT secret) does every cross-repo read and
+    # write; the built-in token only needs to check this repo out.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
 
@@ -3827,6 +3834,10 @@ on:
 jobs:
   collect-feedback:
     runs-on: ubuntu-latest
+    # GLOBAL_GITHUB_TOKEN (a PAT secret) does every cross-repo read and
+    # write; the built-in token only needs to check this repo out.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
 
@@ -3863,6 +3874,10 @@ on:
 jobs:
   doctor:
     runs-on: ubuntu-latest
+    # GLOBAL_GITHUB_TOKEN (a PAT secret) does every cross-repo read and
+    # write; the built-in token only needs to check this repo out.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
 
@@ -3915,6 +3930,9 @@ on:
 jobs:
   aggregate:
     runs-on: ubuntu-latest
+    # No checkout and no GitHub API call: this job only curls the hub, so
+    # the built-in token gets no scopes at all.
+    permissions: {}
     steps:
       - name: Ping Hub for cross-spoke aggregation
         env:

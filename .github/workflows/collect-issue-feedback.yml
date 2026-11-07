@@ -8,6 +8,10 @@ on:
 jobs:
   collect-feedback:
     runs-on: ubuntu-latest
+    # GLOBAL_GITHUB_TOKEN (a PAT secret) does every cross-repo read and
+    # write; the built-in token only needs to check this repo out.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
 
