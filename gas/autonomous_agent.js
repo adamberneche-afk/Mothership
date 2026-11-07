@@ -333,8 +333,20 @@ function processRequest(reqBody, {
   // unauthenticated caller must not be able to learn anything about a
   // tenant (e.g. that it's suspended) from a request it never proved it
   // was allowed to make.
-  const requiredCallerKey = resolveSecretRef(tenant.callerKeyRef, config.scriptProperties);
-  if (requiredCallerKey && callerKey !== requiredCallerKey) {
+  //
+  // FAIL CLOSED: a tenant with no callerKeyRef, or a ref that resolves to
+  // nothing (an unset Script Property), is refused with a 401 naming the
+  // missing setting - never served. It used to be opt-in per tenant, which
+  // left the live hub open to any caller while DEFAULT_TENANT_CALLER_KEY
+  // was unset. The comparison is constant-time (secretsEqual_, constants.js).
+  if (!tenant.callerKeyRef) {
+    return { httpStatus: 401, body: { error: `caller auth is not configured for tenant '${tenantId}': add a callerKeyRef to its tenants.json entry; refusing until it has one` } };
+  }
+  const requiredCallerKey = config.scriptProperties ? resolveSecretRef(tenant.callerKeyRef, config.scriptProperties) : null;
+  if (!requiredCallerKey) {
+    return { httpStatus: 401, body: { error: `caller auth is not configured for tenant '${tenantId}': ${describeSecretRef_(tenant.callerKeyRef)} is not set; refusing until it is` } };
+  }
+  if (!secretsEqual_(callerKey, requiredCallerKey)) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
 

@@ -130,7 +130,7 @@ function loadCodeWithFakes({ props = {}, aiJsonContent = NO_FINDING_JSON, github
     LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
     Logger: { log: () => {} }
   };
-  const context = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js', 'recursive_learning.js', 'deploy_version_marker.js', 'deploy_version_report.js', 'spoke_poller.js', 'Code.js', seed);
+  const context = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js', 'recursive_learning.js', 'deploy_version_marker.js', 'deploy_version_report.js', 'spoke_poller.js', 'settings.js', 'Code.js', seed);
   return { context, urlFetchApp, openByIdCalls };
 }
 
@@ -140,7 +140,8 @@ function loadCodeWithFakes({ props = {}, aiJsonContent = NO_FINDING_JSON, github
 const NOT_FOUND = { getResponseCode: () => 404, getContentText: () => '{}' };
 
 // Registers 'o'/'r' (every generic doPost test below's owner/repo) as a
-// real spoke on a tenant with no callerKeyRef - processRequest() now
+// real spoke on a tenant whose caller key is GENERIC_TEST_CALLER_KEY (caller
+// auth fails closed, so every tenant needs one) - processRequest() now
 // rejects an owner/repo that isn't a registered spoke outright (see
 // autonomous_agent.js's resolveTenantIdForSpoke), and these tests exist to
 // exercise doPost's routing/config-loading, not tenant resolution. Longer
@@ -155,17 +156,17 @@ const GENERIC_SPOKE_RESPONSES = {
     { tenantId: 'generic', owner: 'o', repo: 'r', addedAt: '2026-08-13T00:00:00Z', status: 'active' }
   ]),
   'contents/tenants.json': jsonFileResponse([
-    { tenantId: 'generic', name: 'Generic test tenant', status: 'active', plan: 'internal', quota: { reviewsPerMonth: null }, createdAt: '2026-08-13T00:00:00Z' }
+    { tenantId: 'generic', name: 'Generic test tenant', status: 'active', plan: 'internal', quota: { reviewsPerMonth: null }, callerKeyRef: 'env:GENERIC_TEST_CALLER_KEY', createdAt: '2026-08-13T00:00:00Z' }
   ])
 };
 
 function testDefaultsToAutonomousAgentWhenNoEndpointGiven() {
   console.log("doPost defaults to autonomous_agent when no ?endpoint= is given (matches Vercel's original default route)");
   const { context } = loadCodeWithFakes({
-    props: { DRY_RUN_MODE: 'true' },
+    props: { DRY_RUN_MODE: 'true', GENERIC_TEST_CALLER_KEY: 'generic-caller-key' },
     githubResponses: { '/commits': NOT_FOUND, '/contents/': NOT_FOUND, ...GENERIC_SPOKE_RESPONSES }
   });
-  const e = { parameter: {}, postData: { contents: JSON.stringify({ owner: 'o', repo: 'r', mode: 'debug' }) } };
+  const e = { parameter: {}, postData: { contents: JSON.stringify({ owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' }) } };
   const output = context.doPost(e);
   const body = JSON.parse(output._text);
   check('routed to autonomous_agent (a diff-shaped Skipped response, not a spokes.json one)', body.reason === 'No usable code diff found for the latest commit');
@@ -173,15 +174,46 @@ function testDefaultsToAutonomousAgentWhenNoEndpointGiven() {
 }
 
 function testExplicitEndpointRoutesToRecursiveLearning() {
-  console.log('doPost routes to recursive_learning when ?endpoint=recursive_learning is given');
+  console.log('doPost routes to recursive_learning when ?endpoint=recursive_learning is given with the right admin token');
   const { context } = loadCodeWithFakes({
-    props: { DRY_RUN_MODE: 'true' },
+    props: { DRY_RUN_MODE: 'true', ADMIN_SETTINGS_TOKEN: 'admin-tok' },
     githubResponses: { 'spokes.json': { getResponseCode: () => 200, getContentText: () => JSON.stringify({ content: b64('[]') }) } }
   });
-  const e = { parameter: { endpoint: 'recursive_learning' }, postData: { contents: '{}' } };
+  const e = { parameter: { endpoint: 'recursive_learning' }, postData: { contents: JSON.stringify({ adminToken: 'admin-tok' }) } };
   const output = context.doPost(e);
   const body = JSON.parse(output._text);
   check('routed to runRecursiveLearning (its distinct "no spokes" message)', /no spokes/i.test(body.reason || ''));
+}
+
+// ?endpoint=recursive_learning used to run for any caller on a web app
+// anyone can reach. It now takes the same POST-body admin token as
+// install-triggers.
+function testRecursiveLearningRefusesWithoutTheAdminToken() {
+  console.log('doPost(?endpoint=recursive_learning) refuses a missing or wrong admin token with 401, and never runs');
+  const cases = [
+    { name: 'no token', contents: '{}' },
+    { name: 'wrong token', contents: JSON.stringify({ adminToken: 'guess' }) },
+    { name: 'token in the URL instead of the body', contents: '{}', param: 'admin-tok' }
+  ];
+  for (const c of cases) {
+    const { context, urlFetchApp } = loadCodeWithFakes({ props: { DRY_RUN_MODE: 'true', ADMIN_SETTINGS_TOKEN: 'admin-tok' } });
+    const parameter = { endpoint: 'recursive_learning' };
+    if (c.param) parameter.token = c.param;
+    const body = JSON.parse(context.doPost({ parameter, postData: { contents: c.contents } })._text);
+    check(`${c.name}: _httpStatus is 401`, body._httpStatus === 401);
+    check(`${c.name}: error is Unauthorized`, body.error === 'Unauthorized');
+    check(`${c.name}: nothing was fetched (runRecursiveLearning never ran)`, urlFetchApp.calls.length === 0);
+  }
+}
+
+function testRecursiveLearningRefusesWhenAdminTokenIsUnset() {
+  console.log('doPost(?endpoint=recursive_learning) fails closed when ADMIN_SETTINGS_TOKEN is unset, naming the setting');
+  const { context, urlFetchApp } = loadCodeWithFakes({ props: { DRY_RUN_MODE: 'true' } });
+  const e = { parameter: { endpoint: 'recursive_learning' }, postData: { contents: JSON.stringify({ adminToken: '' }) } };
+  const body = JSON.parse(context.doPost(e)._text);
+  check('_httpStatus is 401', body._httpStatus === 401);
+  check('error names ADMIN_SETTINGS_TOKEN', /ADMIN_SETTINGS_TOKEN/.test(body.error || ''));
+  check('nothing was fetched', urlFetchApp.calls.length === 0);
 }
 
 function testResponseBodyCarriesHttpStatusSinceApsScriptCannotSetARealOne() {
@@ -207,13 +239,13 @@ function testConfigIsReadFromScriptPropertiesNotHardcoded() {
   console.log('QUEUE_SHEET_ID actually comes from PropertiesService, not a hardcoded default baked into Code.js - and doPost queues into it, no more inline AI call');
   const reviewQueue = makeFakeSpreadsheet();
   const { context, openByIdCalls } = loadCodeWithFakes({
-    props: { DRY_RUN_MODE: 'true', QUEUE_SHEET_ID: 'my-real-sheet-id' },
+    props: { DRY_RUN_MODE: 'true', QUEUE_SHEET_ID: 'my-real-sheet-id', GENERIC_TEST_CALLER_KEY: 'generic-caller-key' },
     spreadsheetsById: { 'my-real-sheet-id': reviewQueue },
     githubResponses: { '/commits': { getResponseCode: () => 200, getContentText: () => JSON.stringify([{ sha: 'abc123' }]) },
                         '/commits/abc123': { getResponseCode: () => 200, getContentText: () => JSON.stringify({ files: [{ filename: 'x', status: 'modified', patch: '@@ -1 +1 @@\n-a\n+b' }] }) },
                         '/contents/': NOT_FOUND, ...GENERIC_SPOKE_RESPONSES }
   });
-  const e = { parameter: {}, postData: { contents: JSON.stringify({ owner: 'o', repo: 'r', mode: 'debug' }) } };
+  const e = { parameter: {}, postData: { contents: JSON.stringify({ owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' }) } };
   const output = context.doPost(e);
   const body = JSON.parse(output._text);
   check('SpreadsheetApp.openById was called with the QUEUE_SHEET_ID read from Script Properties', openByIdCalls.includes('my-real-sheet-id'));
@@ -271,6 +303,8 @@ function testManifestUsesOnlyKnownTopLevelKeys() {
 function main() {
   testDefaultsToAutonomousAgentWhenNoEndpointGiven();
   testExplicitEndpointRoutesToRecursiveLearning();
+  testRecursiveLearningRefusesWithoutTheAdminToken();
+  testRecursiveLearningRefusesWhenAdminTokenIsUnset();
   testResponseBodyCarriesHttpStatusSinceApsScriptCannotSetARealOne();
   testMissingPostDataDoesNotThrow();
   testConfigIsReadFromScriptPropertiesNotHardcoded();

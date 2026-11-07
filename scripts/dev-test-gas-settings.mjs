@@ -65,7 +65,7 @@ function makeFakeUrlFetchApp(responsesByUrlSubstring = {}) {
 function loadSettingsWithFakes(props, urlFetchResponses) {
   const propertiesService = makeFakePropertiesService(props);
   const urlFetchApp = makeFakeUrlFetchApp(urlFetchResponses);
-  const context = loadGasGlobals('settings.js', {
+  const context = loadGasGlobals('constants.js', 'settings.js', {
     PropertiesService: propertiesService,
     HtmlService: makeFakeHtmlService(),
     UrlFetchApp: urlFetchApp

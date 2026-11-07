@@ -232,6 +232,28 @@ function testEndToEndPassesCallerKeyGate() {
   check('a wrong key is a retry, not settled', r2.results[0].outcome === 'retry' && /^401/.test(r2.results[0].detail));
 }
 
+// The live hub's state before this fix: tenants.json gives "default" a
+// callerKeyRef, but DEFAULT_TENANT_CALLER_KEY was never set, and caller
+// auth failed open. It now fails closed, so the poller's own request is
+// refused too: a retry whose detail names the setting to fill in, and the
+// watermark stays put so nothing is skipped once it is set.
+function testUnsetCallerKeyIsARetryNamingTheSetting() {
+  console.log('end to end: with the tenant caller key unset, the poll is a 401 retry naming the setting, and the watermark does not move');
+  const ctx = freshContext();
+  const props = makeProps({});
+  const spokeGithub = { repos: { listCommits: () => ({ data: [{ sha: 'sha-real' }] }) } };
+  const tenants = [{ tenantId: 't', status: 'active', quota: { reviewsPerMonth: null }, callerKeyRef: 'env:DEFAULT_TENANT_CALLER_KEY' }];
+  const r = ctx.pollSpokes_('debug', {
+    githubFactory: () => spokeGithub, hubGithub: null, base64Encode: b64, base64Decode: unb64,
+    config: { scriptProperties: props }, props,
+    spokesOverride: [SPOKES[0]], tenantsOverride: tenants,
+    reviewQueueSheet: makeFakeSheet(), dryRunOverride: true, now: new Date('2026-10-31T12:00:00Z')
+  });
+  check('outcome is retry', r.results[0].outcome === 'retry');
+  check('detail is a 401 naming DEFAULT_TENANT_CALLER_KEY', /^401/.test(r.results[0].detail) && /DEFAULT_TENANT_CALLER_KEY/.test(r.results[0].detail));
+  check('the watermark did not advance', props.getProperty('SPOKE_POLL_LAST_o/a:debug') === null);
+}
+
 function testInstallTriggersIsIdempotent() {
   console.log('installSpokePollerTriggers installs the three handlers once and never duplicates them');
   const created = [];
@@ -272,6 +294,7 @@ testInactiveSpokeIsSkippedWithoutApiCalls();
 testStatusRecordIsWritten();
 testUnknownModeThrows();
 testEndToEndPassesCallerKeyGate();
+testUnsetCallerKeyIsARetryNamingTheSetting();
 testInstallTriggersIsIdempotent();
 testOverlappingRunIsSkipped();
 

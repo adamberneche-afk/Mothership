@@ -544,7 +544,7 @@ export async function sendEmail({ to, subject, html }, {
             "content": """import { Octokit } from '@octokit/rest';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef, secretsEqual, describeSecretRef } from '../lib/secrets.js';
 
 // Caps how much diff text gets forwarded to the LLM per run - keeps prompt
 // size and API cost bounded.
@@ -798,13 +798,10 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   // Real, disclosed gap this closes a first step toward: spoke-to-hub POSTs
   // carried ZERO credential before this - any caller who knew the hub URL
   // could trigger a review for any registered owner/repo. The check below
-  // is deliberately opt-in per tenant: a tenant with no `callerKeyRef` set
-  // skips verification entirely. "default" now has one set (tenants.json),
-  // since it's the tenant every registered spoke currently maps to and this
-  // hub has a live, publicly-reachable deployment (the gas/ twin) - a
-  // tenant with no key configured at all would otherwise stay silently
-  // open. Migrating a NEW tenant to enforced caller-auth is then just a
-  // config change, not a breaking flag day for spokes already working.
+  // fails closed (2026-11-07): every tenant must have a `callerKeyRef` that
+  // resolves to a real value, or every request for it is refused with 401.
+  // It used to be opt-in per tenant, which left a tenant with no key, or an
+  // unset env var behind its key, open to any caller.
   //
   // spokesOverride/tenantsOverride let tests inject a registry instead of
   // reading this checkout's real spokes.json/tenants.json - same
@@ -841,8 +838,18 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   // unauthenticated caller who names/spoofs a real owner+repo pair must not
   // be able to learn anything about that tenant (e.g. that it's suspended)
   // from a request it never proved it was allowed to make.
+  //
+  // FAIL CLOSED (see the tenant-resolution comment above): no callerKeyRef,
+  // or a ref that resolves to nothing, is a 401 naming the missing setting.
+  // The comparison is constant-time (secretsEqual).
+  if (!tenant.callerKeyRef) {
+    return { httpStatus: 401, body: { error: `caller auth is not configured for tenant '${tenantId}': add a callerKeyRef to its tenants.json entry; refusing until it has one` } };
+  }
   const requiredCallerKey = await resolveSecretRef(tenant.callerKeyRef);
-  if (requiredCallerKey && callerKey !== requiredCallerKey) {
+  if (!requiredCallerKey) {
+    return { httpStatus: 401, body: { error: `caller auth is not configured for tenant '${tenantId}': ${describeSecretRef(tenant.callerKeyRef)} is not set; refusing until it is` } };
+  }
+  if (!secretsEqual(callerKey, requiredCallerKey)) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
 
@@ -1227,7 +1234,7 @@ export default async function handler(req, res) {
             "content": """import { Octokit } from '@octokit/rest';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { SPOKES_REGISTRY_PATH, TENANTS_REGISTRY_PATH, DEFAULT_TENANT_ID, findTenant, resolveSecretRef } from '../lib/secrets.js';
+import { SPOKES_REGISTRY_PATH, TENANTS_REGISTRY_PATH, DEFAULT_TENANT_ID, findTenant, resolveSecretRef, secretsEqual } from '../lib/secrets.js';
 
 // How many of a spoke's most recent decision-log entries get included in
 // the cross-spoke summary prompt - enough to see a pattern, not so much
@@ -1776,11 +1783,23 @@ export async function runRecursiveLearning(reqBody, { octokitFactory, hubOctokit
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
+  // Operator-only, same gate as the Apps Script twin (gas/Code.js,
+  // requireAdminToken_ in gas/settings.js): ADMIN_SETTINGS_TOKEN as
+  // `adminToken` in the POST body, compared in constant time, failing
+  // closed when the env var is unset. The token goes no further.
+  const { adminToken, ...learningBody } = req.body || {};
+  if (!process.env.ADMIN_SETTINGS_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized: ADMIN_SETTINGS_TOKEN is not set on the hub; refusing until it is' });
+  }
+  if (!secretsEqual(adminToken, process.env.ADMIN_SETTINGS_TOKEN)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
   const octokitFactory = (token) => new Octokit({ auth: token });
   const hubOctokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
 
   try {
-    const { httpStatus, body } = await runRecursiveLearning(req.body, { octokitFactory, hubOctokit, fetchImpl: fetch });
+    const { httpStatus, body } = await runRecursiveLearning(learningBody, { octokitFactory, hubOctokit, fetchImpl: fetch });
     return res.status(httpStatus).json(body);
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -3879,10 +3898,13 @@ jobs:
 # workflow still pointing at the retired Vercel URL; gas/recursive-learning.
 # apps-script.example.yml is the template it was brought over from.
 #
-# NOTE: ?endpoint=recursive_learning has no caller-key check on the hub side
-# (only ?endpoint=autonomous_agent does), so no TENANT_CALLER_KEY is sent
-# here. Sending one the hub ignores would imply an authentication that is
-# not happening.
+# ?endpoint=recursive_learning is operator-only: the hub refuses it (401)
+# unless the POST body carries `adminToken` equal to the hub's
+# ADMIN_SETTINGS_TOKEN Script Property - the same token and the same check
+# as ?endpoint=install-triggers (gas/settings.js, requireAdminToken_). It
+# reads this repo's ADMIN_SETTINGS_TOKEN secret, the one
+# deploy-apps-script.yml already uses. jq builds the body so the token is
+# never spliced into JSON or the command line by hand.
 name: Recursive Learning
 
 on:
@@ -3897,10 +3919,12 @@ jobs:
       - name: Ping Hub for cross-spoke aggregation
         env:
           APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          ADMIN_SETTINGS_TOKEN: ${{ secrets.ADMIN_SETTINGS_TOKEN }}
         run: |
-          curl --fail-with-body -sS -X POST "${APPS_SCRIPT_URL}?endpoint=recursive_learning" \\
-            -H "Content-Type: application/json" \\
-            -d '{}'"""
+          jq -n --arg t "$ADMIN_SETTINGS_TOKEN" '{adminToken: $t}' \\
+            | curl --fail-with-body -sS -X POST "${APPS_SCRIPT_URL}?endpoint=recursive_learning" \\
+                -H "Content-Type: application/json" \\
+                --data-binary @-"""
         },
 
         # Operator-driven, workflow_dispatch-only tenant provisioning.

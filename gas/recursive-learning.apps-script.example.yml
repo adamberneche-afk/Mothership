@@ -1,6 +1,11 @@
 # Example recursive-learning workflow targeting the Apps Script deployment
 # instead of Vercel. NOT active CI - see call-hub.apps-script.example.yml's
 # header comment for why this lives here and what to do with it.
+#
+# The hub refuses ?endpoint=recursive_learning (401) without `adminToken`
+# in the POST body equal to its ADMIN_SETTINGS_TOKEN Script Property - the
+# same gate as ?endpoint=install-triggers. Set an ADMIN_SETTINGS_TOKEN
+# repository secret to that value.
 name: Recursive Learning
 
 on:
@@ -15,7 +20,9 @@ jobs:
       - name: Ping Hub for cross-spoke aggregation
         env:
           APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          ADMIN_SETTINGS_TOKEN: ${{ secrets.ADMIN_SETTINGS_TOKEN }}
         run: |
-          curl --fail-with-body -sS -X POST "${APPS_SCRIPT_URL}?endpoint=recursive_learning" \
-            -H "Content-Type: application/json" \
-            -d '{}'
+          jq -n --arg t "$ADMIN_SETTINGS_TOKEN" '{adminToken: $t}' \
+            | curl --fail-with-body -sS -X POST "${APPS_SCRIPT_URL}?endpoint=recursive_learning" \
+                -H "Content-Type: application/json" \
+                --data-binary @-

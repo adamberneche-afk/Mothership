@@ -78,8 +78,8 @@ function testRejectsWrongOrMissingToken() {
   check('nothing installed', ScriptApp._handlers.length === 0);
   const unset = hubContext({ adminToken: null });
   let threw2 = false;
-  try { unset.ctx.installHubTriggers(undefined); } catch (e) { threw2 = e.message === 'Unauthorized'; }
-  check('unset token rejects even an undefined token', threw2);
+  try { unset.ctx.installHubTriggers(undefined); } catch (e) { threw2 = /^Unauthorized: ADMIN_SETTINGS_TOKEN is not set/.test(e.message); }
+  check('unset token rejects even an undefined token, naming the missing setting', threw2);
 }
 
 // doPost routing: Code.js must answer 200 with the result for the right

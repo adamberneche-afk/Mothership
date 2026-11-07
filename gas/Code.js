@@ -76,7 +76,13 @@ function doPost(e) {
   let result;
   try {
     if (endpoint === 'recursive_learning') {
-      result = runRecursiveLearning(reqBody, { githubFactory, hubGithub, base64Encode, base64Decode, config });
+      // Operator-only, same gate as install-triggers: ADMIN_SETTINGS_TOKEN
+      // as `adminToken` in the POST body. It used to have no check at all
+      // on a web app anyone can reach. The token is dropped before the
+      // body goes any further. See requireAdminToken_() in settings.js.
+      requireAdminToken_(reqBody.adminToken);
+      const { adminToken, ...learningBody } = reqBody;
+      result = runRecursiveLearning(learningBody, { githubFactory, hubGithub, base64Encode, base64Decode, config });
     } else if (endpoint === 'install-triggers') {
       // POST only, token in the body, so it never lands in a URL or a log.
       // See installHubTriggers() in settings.js.
@@ -85,8 +91,8 @@ function doPost(e) {
       result = processRequest(reqBody, { githubFactory, hubGithub, base64Encode, base64Decode, config });
     }
   } catch (err) {
-    result = err.message === 'Unauthorized'
-      ? { httpStatus: 401, body: { error: 'Unauthorized' } }
+    result = /^Unauthorized(:|$)/.test(err.message)
+      ? { httpStatus: 401, body: { error: err.message } }
       : { httpStatus: 500, body: { error: err.message } };
   }
 
