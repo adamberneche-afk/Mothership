@@ -75,7 +75,7 @@ function renderSettingsPage(token) {
   if (!adminToken) {
     return HtmlService.createHtmlOutput(renderBootstrapNeededHtml_());
   }
-  if (token !== adminToken) {
+  if (!secretsEqual_(token, adminToken)) {
     return HtmlService.createHtmlOutput(renderNotFoundHtml_());
   }
 
@@ -92,7 +92,7 @@ function renderSettingsPage(token) {
 function saveSettings(token, values) {
   const props = PropertiesService.getScriptProperties();
   const adminToken = props.getProperty('ADMIN_SETTINGS_TOKEN');
-  if (!adminToken || token !== adminToken) {
+  if (!adminToken || !secretsEqual_(token, adminToken)) {
     throw new Error('Unauthorized');
   }
 
@@ -156,7 +156,7 @@ function checkAiKey_(baseUrl, apiKey) {
 function checkConfig(token) {
   const props = PropertiesService.getScriptProperties();
   const adminToken = props.getProperty('ADMIN_SETTINGS_TOKEN');
-  if (!adminToken || token !== adminToken) {
+  if (!adminToken || !secretsEqual_(token, adminToken)) {
     throw new Error('Unauthorized');
   }
   return {
@@ -300,14 +300,28 @@ function renderFormHtml_(token, currentValues) {
 // installer is idempotent by handler name, so calling this on every
 // deploy never duplicates a trigger. Same gate as the settings page.
 function installHubTriggers(token) {
-  const adminToken = PropertiesService.getScriptProperties().getProperty('ADMIN_SETTINGS_TOKEN');
-  if (!adminToken || token !== adminToken) {
-    throw new Error('Unauthorized');
-  }
+  requireAdminToken_(token);
   const before = ScriptApp.getProjectTriggers().map((t) => t.getHandlerFunction());
   installReviewQueueTriggers();
   installDeployVersionReportTrigger();
   installSpokePollerTriggers();
   const after = ScriptApp.getProjectTriggers().map((t) => t.getHandlerFunction());
   return { installed: after.filter((h) => before.indexOf(h) === -1), present: after };
+}
+
+// The POST-body token gate shared by every operator-only doPost endpoint:
+// ?endpoint=install-triggers and ?endpoint=recursive_learning. The token
+// is ADMIN_SETTINGS_TOKEN, sent in the JSON body as `adminToken` (never a
+// URL parameter, so it stays out of URLs and logs). Fails closed: an unset
+// ADMIN_SETTINGS_TOKEN refuses every caller, with a message naming the
+// setting, since only the owner can see it; a wrong token gets the plain
+// 'Unauthorized'. Code.js maps both to a 401.
+function requireAdminToken_(token) {
+  const adminToken = PropertiesService.getScriptProperties().getProperty('ADMIN_SETTINGS_TOKEN');
+  if (!adminToken) {
+    throw new Error('Unauthorized: ADMIN_SETTINGS_TOKEN is not set on the hub (Script Properties); refusing until it is');
+  }
+  if (!secretsEqual_(token, adminToken)) {
+    throw new Error('Unauthorized');
+  }
 }

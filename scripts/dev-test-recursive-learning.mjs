@@ -7,7 +7,7 @@
 //
 // Usage: node scripts/dev-test-recursive-learning.mjs
 
-import { runRecursiveLearning } from '../api/recursive_learning.js';
+import handler, { runRecursiveLearning } from '../api/recursive_learning.js';
 
 let failures = 0;
 
@@ -597,7 +597,35 @@ async function testOptedInSpokeStillRunsInItsOwnTenantsPrivatePassToo() {
   delete process.env.GLOBEX_TEST_TOKEN;
 }
 
+// The Vercel handler is operator-only, same gate as the Apps Script twin:
+// ADMIN_SETTINGS_TOKEN as `adminToken` in the POST body. Every refusal
+// returns before any Octokit client or GitHub call exists.
+function makeFakeRes() {
+  const res = { statusCode: null, payload: null };
+  res.status = (code) => { res.statusCode = code; return res; };
+  res.json = (body) => { res.payload = body; return res; };
+  res.send = (body) => { res.payload = body; return res; };
+  return res;
+}
+
+async function testHandlerRefusesWithoutTheAdminToken() {
+  console.log('handler: no admin token, a wrong one, or an unset ADMIN_SETTINGS_TOKEN is a 401');
+  process.env.ADMIN_SETTINGS_TOKEN = 'admin-tok';
+  for (const [name, body] of [['no token', {}], ['wrong token', { adminToken: 'guess' }], ['no body', undefined]]) {
+    const res = makeFakeRes();
+    await handler({ method: 'POST', body }, res);
+    check(`${name}: 401`, res.statusCode === 401);
+    check(`${name}: Unauthorized`, res.payload && res.payload.error === 'Unauthorized');
+  }
+  delete process.env.ADMIN_SETTINGS_TOKEN;
+  const res = makeFakeRes();
+  await handler({ method: 'POST', body: { adminToken: '' } }, res);
+  check('unset ADMIN_SETTINGS_TOKEN: 401', res.statusCode === 401);
+  check('unset ADMIN_SETTINGS_TOKEN: the error names the setting', /ADMIN_SETTINGS_TOKEN/.test(res.payload && res.payload.error));
+}
+
 async function main() {
+  await testHandlerRefusesWithoutTheAdminToken();
   await testNoSpokesRegisteredSkips();
   await testNoProposalSkips();
   await testDryRunNeverOpensAPR();

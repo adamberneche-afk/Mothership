@@ -1,7 +1,7 @@
 import { Octokit } from '@octokit/rest';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef } from '../lib/secrets.js';
+import { loadSpokesRegistry, loadTenantsRegistry, resolveTenantIdForSpoke, findTenant, resolveSecretRef, secretsEqual, describeSecretRef } from '../lib/secrets.js';
 
 // Caps how much diff text gets forwarded to the LLM per run - keeps prompt
 // size and API cost bounded.
@@ -255,13 +255,10 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   // Real, disclosed gap this closes a first step toward: spoke-to-hub POSTs
   // carried ZERO credential before this - any caller who knew the hub URL
   // could trigger a review for any registered owner/repo. The check below
-  // is deliberately opt-in per tenant: a tenant with no `callerKeyRef` set
-  // skips verification entirely. "default" now has one set (tenants.json),
-  // since it's the tenant every registered spoke currently maps to and this
-  // hub has a live, publicly-reachable deployment (the gas/ twin) - a
-  // tenant with no key configured at all would otherwise stay silently
-  // open. Migrating a NEW tenant to enforced caller-auth is then just a
-  // config change, not a breaking flag day for spokes already working.
+  // fails closed (2026-11-07): every tenant must have a `callerKeyRef` that
+  // resolves to a real value, or every request for it is refused with 401.
+  // It used to be opt-in per tenant, which left a tenant with no key, or an
+  // unset env var behind its key, open to any caller.
   //
   // spokesOverride/tenantsOverride let tests inject a registry instead of
   // reading this checkout's real spokes.json/tenants.json - same
@@ -298,8 +295,18 @@ export async function processRequest(reqBody, { octokitFactory, hubOctokit, fetc
   // unauthenticated caller who names/spoofs a real owner+repo pair must not
   // be able to learn anything about that tenant (e.g. that it's suspended)
   // from a request it never proved it was allowed to make.
+  //
+  // FAIL CLOSED (see the tenant-resolution comment above): no callerKeyRef,
+  // or a ref that resolves to nothing, is a 401 naming the missing setting.
+  // The comparison is constant-time (secretsEqual).
+  if (!tenant.callerKeyRef) {
+    return { httpStatus: 401, body: { error: `caller auth is not configured for tenant '${tenantId}': add a callerKeyRef to its tenants.json entry; refusing until it has one` } };
+  }
   const requiredCallerKey = await resolveSecretRef(tenant.callerKeyRef);
-  if (requiredCallerKey && callerKey !== requiredCallerKey) {
+  if (!requiredCallerKey) {
+    return { httpStatus: 401, body: { error: `caller auth is not configured for tenant '${tenantId}': ${describeSecretRef(tenant.callerKeyRef)} is not set; refusing until it is` } };
+  }
+  if (!secretsEqual(callerKey, requiredCallerKey)) {
     return { httpStatus: 401, body: { error: 'invalid or missing caller key for this tenant' } };
   }
 

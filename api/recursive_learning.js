@@ -1,7 +1,7 @@
 import { Octokit } from '@octokit/rest';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { SPOKES_REGISTRY_PATH, TENANTS_REGISTRY_PATH, DEFAULT_TENANT_ID, findTenant, resolveSecretRef } from '../lib/secrets.js';
+import { SPOKES_REGISTRY_PATH, TENANTS_REGISTRY_PATH, DEFAULT_TENANT_ID, findTenant, resolveSecretRef, secretsEqual } from '../lib/secrets.js';
 
 // How many of a spoke's most recent decision-log entries get included in
 // the cross-spoke summary prompt - enough to see a pattern, not so much
@@ -550,11 +550,23 @@ export async function runRecursiveLearning(reqBody, { octokitFactory, hubOctokit
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
+  // Operator-only, same gate as the Apps Script twin (gas/Code.js,
+  // requireAdminToken_ in gas/settings.js): ADMIN_SETTINGS_TOKEN as
+  // `adminToken` in the POST body, compared in constant time, failing
+  // closed when the env var is unset. The token goes no further.
+  const { adminToken, ...learningBody } = req.body || {};
+  if (!process.env.ADMIN_SETTINGS_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized: ADMIN_SETTINGS_TOKEN is not set on the hub; refusing until it is' });
+  }
+  if (!secretsEqual(adminToken, process.env.ADMIN_SETTINGS_TOKEN)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
   const octokitFactory = (token) => new Octokit({ auth: token });
   const hubOctokit = new Octokit({ auth: process.env.GLOBAL_GITHUB_TOKEN });
 
   try {
-    const { httpStatus, body } = await runRecursiveLearning(req.body, { octokitFactory, hubOctokit, fetchImpl: fetch });
+    const { httpStatus, body } = await runRecursiveLearning(learningBody, { octokitFactory, hubOctokit, fetchImpl: fetch });
     return res.status(httpStatus).json(body);
   } catch (err) {
     return res.status(500).json({ error: err.message });

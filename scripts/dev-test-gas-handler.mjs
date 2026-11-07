@@ -17,7 +17,13 @@ import { loadGasGlobals } from './gas-test-harness.mjs';
 import { makeFakeSheet } from './gas-sheet-fakes.mjs';
 import { strict as assert } from 'assert';
 
-const { processRequest, finalizeReviewResult_ } = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js');
+// LockService always reports the create-lock as contended, so a test with
+// no QUEUE_SHEET_ID and no reviewQueueSheet override reaches the "nothing
+// to queue into" skip instead of trying to create a real spreadsheet.
+const { processRequest, finalizeReviewResult_ } = loadGasGlobals('constants.js', 'github.js', 'review_queue.js', 'autonomous_agent.js', {
+  LockService: { getScriptLock: () => ({ tryLock: () => false, releaseLock: () => {} }) },
+  Logger: { log: () => {} }
+});
 
 let failures = 0;
 
@@ -167,7 +173,8 @@ const NO_FINDING_JSON = JSON.stringify({
 });
 
 // Registers the plain 'o'/'r' owner/repo pair every non-multi-tenancy test
-// below uses, as a real registered spoke on a tenant with no callerKeyRef -
+// below uses, as a real registered spoke on a tenant whose caller key is set (caller
+// auth fails closed now, so every tenant needs one) -
 // these tests exist to exercise queuing/dedup/dry-run/etc., not tenant
 // resolution, and processRequest() now rejects an owner/repo that isn't a
 // registered spoke outright (see autonomous_agent.js's resolveTenantIdForSpoke
@@ -180,11 +187,12 @@ const GENERIC_SPOKE = [
   { tenantId: 'generic', owner: 'o', repo: 'r', addedAt: '2026-08-13T00:00:00Z', status: 'active' }
 ];
 const GENERIC_TENANT = [
-  { tenantId: 'generic', name: 'Generic test tenant', status: 'active', plan: 'internal', quota: { reviewsPerMonth: null }, createdAt: '2026-08-13T00:00:00Z' }
+  { tenantId: 'generic', name: 'Generic test tenant', status: 'active', plan: 'internal', quota: { reviewsPerMonth: null }, callerKeyRef: 'env:GENERIC_TEST_CALLER_KEY', createdAt: '2026-08-13T00:00:00Z' }
 ];
 
 const BASE_DEPS = {
   base64Encode: b64, base64Decode: unb64,
+  config: { scriptProperties: { getProperty: (key) => (key === 'GENERIC_TEST_CALLER_KEY' ? 'generic-caller-key' : null) } },
   spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT
 };
 
@@ -193,13 +201,18 @@ const TWO_TENANT_SPOKES = [
   { tenantId: 'globex', owner: 'globex-org', repo: 'globex-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active' }
 ];
 const TWO_TENANTS = [
-  { tenantId: 'acme', name: 'Acme', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:ACME_TEST_TOKEN', createdAt: '2026-08-13T00:00:00Z' },
+  { tenantId: 'acme', name: 'Acme', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:ACME_TEST_TOKEN', callerKeyRef: 'env:ACME_TEST_CALLER_KEY', createdAt: '2026-08-13T00:00:00Z' },
   { tenantId: 'globex', name: 'Globex', status: 'active', plan: 'trial', quota: { reviewsPerMonth: 2 }, githubCredentialRef: 'env:GLOBEX_TEST_TOKEN', callerKeyRef: 'env:GLOBEX_TEST_CALLER_KEY', createdAt: '2026-08-13T00:00:00Z' }
 ];
 
-// A fake Script Properties store for resolveSecretRef's env: scheme.
+// A fake Script Properties store for resolveSecretRef's env: scheme. Caller
+// auth fails closed, so the generic and acme fixture tenants' caller keys
+// are always present unless a test overrides them (set one to undefined to
+// simulate an unset property).
+const FIXTURE_CALLER_KEYS = { GENERIC_TEST_CALLER_KEY: 'generic-caller-key', ACME_TEST_CALLER_KEY: 'acme-caller-key' };
 function makeFakeScriptProperties(props) {
-  return { getProperty: (key) => (props[key] !== undefined ? props[key] : null) };
+  const all = { ...FIXTURE_CALLER_KEYS, ...props };
+  return { getProperty: (key) => (all[key] !== undefined ? all[key] : null) };
 }
 
 // --- Enqueue half: processRequest() only queues, never answers directly ----
@@ -209,7 +222,7 @@ function testProcessRequestQueuesInsteadOfAnswering() {
   const github = makeFakeGithub();
   const sheet = makeFakeSheet();
   const { httpStatus, body } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
   check('httpStatus is 200', httpStatus === 200);
@@ -224,18 +237,18 @@ function testProcessRequestDedupsARepeatedQueueAttempt() {
   console.log('processRequest() does not queue a second row for the same owner/repo/mode/commit while one is still pending');
   const github = makeFakeGithub();
   const sheet = makeFakeSheet();
-  processRequest({ owner: 'o', repo: 'r', mode: 'debug' }, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true });
-  const { body } = processRequest({ owner: 'o', repo: 'r', mode: 'debug' }, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true });
+  processRequest({ owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' }, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true });
+  const { body } = processRequest({ owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' }, { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true });
   check('still only one row queued', sheet._rows.length === 1);
   check('second call reports already queued', /already queued/i.test(body.reason || ''));
 }
 
 function testProcessRequestSkipsCleanlyWhenNoQueueSheetConfigured() {
-  console.log('processRequest() fails safe (Skipped, not a crash) when QUEUE_SHEET_ID is not configured and no override is given');
+  console.log('processRequest() fails safe (Skipped, not a crash) when QUEUE_SHEET_ID is not configured, no override is given and none can be created');
   const github = makeFakeGithub();
   const { httpStatus, body } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
-    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true, config: {} }
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true, config: { scriptProperties: BASE_DEPS.config.scriptProperties } }
   );
   check('httpStatus is 200', httpStatus === 200);
   check('status is Skipped', body.status === 'Skipped');
@@ -252,7 +265,7 @@ function testDecisionLogSkipsAlreadyDecidedCommit() {
   const github = makeFakeGithub({ decisionLog, commitSha: 'abc123' });
   const sheet = makeFakeSheet();
   const { body } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
   check('nothing was queued', sheet._rows.length === 0);
@@ -268,7 +281,7 @@ function testAiErrorDoesNotBlockRetry() {
   const github = makeFakeGithub({ decisionLog, commitSha: 'abc123' });
   const sheet = makeFakeSheet();
   const { body } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
   check('a fresh row was queued (not skipped)', sheet._rows.length === 1);
@@ -283,7 +296,7 @@ function testReplayOfACreatedDecisionSurfacesIssueUrlAtTopLevel() {
   const github = makeFakeGithub({ decisionLog, commitSha: 'abc123' });
   const sheet = makeFakeSheet();
   const { body } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
   check('nothing was queued', sheet._rows.length === 0);
@@ -299,7 +312,7 @@ function testReplayWithoutAnIssueUrlOmitsTheField() {
   const github = makeFakeGithub({ decisionLog, commitSha: 'abc123' });
   const sheet = makeFakeSheet();
   const { body } = processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
   check('no top-level issueUrl field', body.issueUrl === undefined);
@@ -383,7 +396,7 @@ function testRegisteredSpokeResolvesItsOwnTenantCredential() {
   const sheet = makeFakeSheet();
   const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
   processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'acme-caller-key' },
     { ...BASE_DEPS, githubFactory: factory, hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { globalGithubToken: 'the-global-token', scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
   check("resolved to acme's own token, not the global one", factory.tokensUsed[0] === 'acme-secret-token');
@@ -397,7 +410,7 @@ function testSuspendedTenantIsSkippedBeforeAnyGithubCall() {
   const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
   const suspendedTenants = TWO_TENANTS.map(t => t.tenantId === 'acme' ? { ...t, status: 'suspended' } : t);
   const { httpStatus, body } = processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'acme-caller-key' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: suspendedTenants }
   );
   check('httpStatus is 200 (a quiet skip, not an error)', httpStatus === 200);
@@ -416,7 +429,7 @@ function testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobal
   // misconfigured/revoked credential ref for a tenant that DOES exist.
   const scriptProperties = makeFakeScriptProperties({});
   const { httpStatus, body } = processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'acme-caller-key' },
     { ...BASE_DEPS, githubFactory: factory, hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { globalGithubToken: 'the-global-token', scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
   check('httpStatus is 200 (a quiet skip, not an error)', httpStatus === 200);
@@ -425,17 +438,56 @@ function testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobal
   check('nothing was queued once the credential is unresolvable', sheet._rows.length === 0);
 }
 
-function testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured() {
-  console.log('Multi-tenancy: a tenant with no callerKeyRef set (acme) accepts any/no callerKey - backward compatible');
+function testTenantWithNoCallerKeyRefIsRefused() {
+  console.log('Caller auth fails closed: a tenant with no callerKeyRef at all is refused with 401, before queuing');
   const github = makeFakeGithub();
   const hubGithub = makeFakeHubGithub();
   const sheet = makeFakeSheet();
   const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
+  const noKeyTenants = TWO_TENANTS.map(t => {
+    if (t.tenantId !== 'acme') return t;
+    const { callerKeyRef, ...rest } = t;
+    return rest;
+  });
+  const { httpStatus, body } = processRequest(
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'anything' },
+    { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: noKeyTenants }
+  );
+  check('httpStatus is 401', httpStatus === 401);
+  check('error names the missing callerKeyRef', /callerKeyRef/.test(body.error || ''));
+  check('nothing was queued', sheet._rows.length === 0);
+  check('no GitHub call ran', github.calls.getContent.length === 0);
+}
+
+function testUnsetCallerKeyPropertyIsRefused() {
+  console.log('Caller auth fails closed: a callerKeyRef whose Script Property is unset is refused with 401 naming it');
+  const github = makeFakeGithub();
+  const hubGithub = makeFakeHubGithub();
+  const sheet = makeFakeSheet();
+  const scriptProperties = makeFakeScriptProperties({ GLOBEX_TEST_TOKEN: 'globex-secret-token' });
+  for (const callerKey of [undefined, '', 'some-guess']) {
+    const { httpStatus, body } = processRequest(
+      { owner: 'globex-org', repo: 'globex-repo', mode: 'debug', callerKey },
+      { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+    );
+    check(`callerKey ${JSON.stringify(callerKey)}: httpStatus is 401`, httpStatus === 401);
+    check(`callerKey ${JSON.stringify(callerKey)}: error names GLOBEX_TEST_CALLER_KEY`, /GLOBEX_TEST_CALLER_KEY/.test(body.error || ''));
+  }
+  check('nothing was queued', sheet._rows.length === 0);
+}
+
+function testMissingCallerKeyIsRefused() {
+  console.log('Caller auth: no callerKey at all, for a tenant whose key is set, is refused with 401');
+  const github = makeFakeGithub();
+  const hubGithub = makeFakeHubGithub();
+  const sheet = makeFakeSheet();
+  const scriptProperties = makeFakeScriptProperties({ GLOBEX_TEST_TOKEN: 'globex-secret-token', GLOBEX_TEST_CALLER_KEY: 'globex-caller-key' });
   const { httpStatus } = processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { owner: 'globex-org', repo: 'globex-repo', mode: 'debug' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
-  check('request proceeds (200), no caller-key requirement for this tenant', httpStatus === 200);
+  check('httpStatus is 401', httpStatus === 401);
+  check('nothing was queued', sheet._rows.length === 0);
 }
 
 function testQuotaUnderLimitProceedsToQueuing() {
@@ -462,7 +514,7 @@ function testNullQuotaMeansUnlimited() {
   const sheet = makeFakeSheet();
   const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
   processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'acme-caller-key' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, reviewQueueSheet: sheet, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
   check('a row was queued despite 500 prior events - null quota is unlimited', sheet._rows.length === 1);
@@ -482,7 +534,7 @@ function testDiffOrdersCodeFilesBeforeDocFilesWhenBothCantFit() {
   const github = makeFakeGithub({ diffFiles });
   const sheet = makeFakeSheet();
   processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
   const prompt = lastQueuedPrompt(sheet);
@@ -500,7 +552,7 @@ function testDiffCapsAnySingleFileSoItCannotStarveTheRest() {
   const github = makeFakeGithub({ diffFiles });
   const sheet = makeFakeSheet();
   processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
   const prompt = lastQueuedPrompt(sheet);
@@ -518,7 +570,7 @@ function testDiffNotesOmittedFilesWhenTheyDontFit() {
   const github = makeFakeGithub({ diffFiles });
   const sheet = makeFakeSheet();
   processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), reviewQueueSheet: sheet, dryRunOverride: true }
   );
   const prompt = lastQueuedPrompt(sheet);
@@ -533,7 +585,7 @@ function testFinalizeDryRunNeverCreatesIssue() {
   console.log('finalizeReviewResult_: dry-run mode never calls issues.create');
   const github = makeFakeGithub();
   const result = finalizeReviewResult_(
-    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key', commitSha: 'abc123', rawContent: FINDING_JSON },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true }
   );
   check('status is DryRunFinding', result.status === 'DryRunFinding');
@@ -548,7 +600,7 @@ function testFinalizeRateCapBlocksAtLimit() {
   const todayIssues = Array.from({ length: cap }, (_, i) => ({ created_at: new Date().toISOString(), number: i }));
   const github = makeFakeGithub({ issuesCreatedToday: todayIssues });
   const result = finalizeReviewResult_(
-    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key', commitSha: 'abc123', rawContent: FINDING_JSON },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: false, config: { rateCapPerRepoPerDay: cap } }
   );
   check('status is Skipped once at cap', result.status === 'Skipped');
@@ -560,7 +612,7 @@ function testFinalizeRateCapAllowsUnderLimit() {
   console.log('finalizeReviewResult_: live mode creates an issue when under the daily cap');
   const github = makeFakeGithub({ issuesCreatedToday: [] });
   const result = finalizeReviewResult_(
-    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key', commitSha: 'abc123', rawContent: FINDING_JSON },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: false, config: { rateCapPerRepoPerDay: 3 } }
   );
   check('status is Success', result.status === 'Success');
@@ -573,7 +625,7 @@ function testFinalizeNoFindingsResponseCarriesDryRun() {
   console.log('finalizeReviewResult_: a no-findings response still carries dryRun');
   const github = makeFakeGithub();
   const result = finalizeReviewResult_(
-    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: NO_FINDING_JSON },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key', commitSha: 'abc123', rawContent: NO_FINDING_JSON },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true }
   );
   check('status is Skipped', result.status === 'Skipped');
@@ -584,7 +636,7 @@ function testFinalizeInvalidJsonIsSkippedNotThrown() {
   console.log('finalizeReviewResult_: malformed GeminiFullOutput is a clean Skipped, not a thrown error');
   const github = makeFakeGithub();
   const result = finalizeReviewResult_(
-    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: 'not json at all' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key', commitSha: 'abc123', rawContent: 'not json at all' },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true }
   );
   check('status is Skipped', result.status === 'Skipped');
@@ -595,7 +647,7 @@ function testFinalizeWritesDecisionLogEntry() {
   console.log('finalizeReviewResult_: a normal run appends a well-formed entry to the decision log');
   const github = makeFakeGithub({ decisionLog: null, commitSha: 'abc123' }); // no log file yet
   finalizeReviewResult_(
-    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key', commitSha: 'abc123', rawContent: FINDING_JSON },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true }
   );
   const writes = github.calls.createOrUpdateFileContents;
@@ -612,7 +664,7 @@ function testFinalizeRecordsUsageForTheCorrectTenantOnly() {
   const hubGithub = makeFakeHubGithub();
   const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
   finalizeReviewResult_(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', commitSha: 'abc123', rawContent: NO_FINDING_JSON },
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'acme-caller-key', commitSha: 'abc123', rawContent: NO_FINDING_JSON },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), hubGithub, dryRunOverride: true, config: { scriptProperties }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
   check('exactly one usage write happened', hubGithub._writes.length === 1);
@@ -629,7 +681,7 @@ function testFinalizeReResolvesTheCorrectTenantCredential() {
   const hubGithub = makeFakeHubGithub();
   const scriptProperties = makeFakeScriptProperties({ ACME_TEST_TOKEN: 'acme-secret-token' });
   finalizeReviewResult_(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'acme-caller-key', commitSha: 'abc123', rawContent: FINDING_JSON },
     { ...BASE_DEPS, githubFactory: factory, hubGithub, dryRunOverride: false, config: { scriptProperties, rateCapPerRepoPerDay: 3 }, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
   check("resolved to acme's own token at finalize time", factory.tokensUsed.includes('acme-secret-token'));
@@ -641,7 +693,7 @@ function testBase64RoundTripsThroughInjectedFunctions() {
   console.log('Platform port: content written to the decision log round-trips through base64Encode/Decode correctly');
   const github = makeFakeGithub({ decisionLog: [], commitSha: 'abc123' });
   finalizeReviewResult_(
-    { owner: 'o', repo: 'r', mode: 'debug', commitSha: 'abc123', rawContent: FINDING_JSON },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key', commitSha: 'abc123', rawContent: FINDING_JSON },
     { ...BASE_DEPS, githubFactory: makeFakeGithubFactory(github), dryRunOverride: true }
   );
   const writes = github.calls.createOrUpdateFileContents;
@@ -660,7 +712,9 @@ async function main() {
   testQuotaExceededBlocksBeforeQueuing();
   testSuspendedTenantIsSkippedBeforeAnyGithubCall();
   testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken();
-  testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured();
+  testTenantWithNoCallerKeyRefIsRefused();
+  testUnsetCallerKeyPropertyIsRefused();
+  testMissingCallerKeyIsRefused();
   testCallerKeyRejectedWhenWrongForATenantThatRequiresOne();
   testCallerKeyAcceptedWhenCorrect();
   testUnregisteredSpokeIsRejectedOutright();

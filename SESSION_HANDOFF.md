@@ -37,6 +37,11 @@ Written for whoever (human or a fresh Claude Code session) picks this up next. R
 > - **Deploy-drift issue #78** was opened by the 04:59 UTC self-report, which ran *before* the deploy and still showed the September code (`f9b3af1`). It is the first drift report that could reach GitHub at all (#74's token fix); the 43 runs before it failed on the bad token. It closes itself once a self-report matches; run `runReportDeployVersionNow()` in the editor to check without waiting.
 > - **Not yet recorded:** Argoloth's and TSO's poll results. Their `call-hub.yml` removal waits on `showSpokePollStatus()` showing them `settled` or `unchanged`.
 
+> **Update (2026-11-07):** **Caller auth now fails closed; set two Script Properties before the next `--hub latest`.** Until this change the live hub accepted any caller: `?endpoint=recursive_learning` had no check at all, and `?endpoint=autonomous_agent` skipped the caller-key check whenever the tenant's key resolved to nothing, which it always did because `DEFAULT_TENANT_CALLER_KEY` was never set. Now a missing key is a 401 naming the setting, the comparison is constant-time, and recursive_learning takes `ADMIN_SETTINGS_TOKEN` as `adminToken` in the POST body (the install-triggers gate). **Before deploying it:**
+> - Set the hub's `DEFAULT_TENANT_CALLER_KEY` Script Property (a long random string; Script Properties or `?endpoint=settings`). The poller sends it on every poll; without it every spoke reads `retry` / `401 ... DEFAULT_TENANT_CALLER_KEY ... is not set` in `showSpokePollStatus()` and no review is queued. Nothing is skipped: the watermark waits, so the first poll after it is set catches up.
+> - `ADMIN_SETTINGS_TOKEN` is already set (the deploy uses it). For the monthly `recursive-learning.yml` to pass, Mothership's `ADMIN_SETTINGS_TOKEN` and `APPS_SCRIPT_URL` repository secrets must be set; `APPS_SCRIPT_URL` never was (item 1).
+> - `self-reflect.yml` still sends `TENANT_CALLER_KEY`; it passes only if that repository secret equals the new property.
+
 ---
 
 ## Start here: manual steps only the repo owner can do

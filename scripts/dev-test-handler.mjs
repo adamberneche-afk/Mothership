@@ -9,6 +9,7 @@
 // Usage: node scripts/dev-test-handler.mjs
 
 import { processRequest } from '../api/autonomous_agent.js';
+import { secretsEqual } from '../lib/secrets.js';
 import { strict as assert } from 'assert';
 
 // Sprint 0/1 tests below don't override spokes/tenants, so they resolve to
@@ -21,6 +22,10 @@ import { strict as assert } from 'assert';
 // tests further down set/delete their own tenant-specific tokens and don't
 // rely on this value.
 process.env.GLOBAL_GITHUB_TOKEN = 'the-global-token';
+// Caller auth fails closed, so the fixture tenants below each need their
+// caller key set for the whole run.
+process.env.GENERIC_TEST_CALLER_KEY = 'generic-caller-key';
+process.env.ACME_TEST_CALLER_KEY = 'acme-caller-key';
 
 let failures = 0;
 
@@ -168,7 +173,8 @@ const NO_FINDING_JSON = JSON.stringify({
 });
 
 // Registers the plain 'o'/'r' owner/repo pair every non-multi-tenancy test
-// below uses, as a real registered spoke on a tenant with no callerKeyRef -
+// below uses, as a real registered spoke on a tenant whose caller key is set (caller
+// auth fails closed now, so every tenant needs one) -
 // these tests exist to exercise dry-run/rate-cap/decision-log/diff-ordering
 // logic, not tenant resolution, and processRequest() now rejects an
 // owner/repo that isn't a registered spoke outright (see
@@ -180,7 +186,7 @@ const GENERIC_SPOKE = [
   { tenantId: 'generic', owner: 'o', repo: 'r', addedAt: '2026-08-13T00:00:00Z', status: 'active' }
 ];
 const GENERIC_TENANT = [
-  { tenantId: 'generic', name: 'Generic test tenant', status: 'active', plan: 'internal', quota: { reviewsPerMonth: null }, createdAt: '2026-08-13T00:00:00Z' }
+  { tenantId: 'generic', name: 'Generic test tenant', status: 'active', plan: 'internal', quota: { reviewsPerMonth: null }, callerKeyRef: 'env:GENERIC_TEST_CALLER_KEY', createdAt: '2026-08-13T00:00:00Z' }
 ];
 
 // A registry with two distinct tenants, each with one spoke - used by every
@@ -191,7 +197,7 @@ const TWO_TENANT_SPOKES = [
   { tenantId: 'globex', owner: 'globex-org', repo: 'globex-repo', addedAt: '2026-08-13T00:00:00Z', status: 'active' }
 ];
 const TWO_TENANTS = [
-  { tenantId: 'acme', name: 'Acme', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:ACME_TEST_TOKEN', createdAt: '2026-08-13T00:00:00Z' },
+  { tenantId: 'acme', name: 'Acme', status: 'active', plan: 'pro', quota: { reviewsPerMonth: null }, githubCredentialRef: 'env:ACME_TEST_TOKEN', callerKeyRef: 'env:ACME_TEST_CALLER_KEY', createdAt: '2026-08-13T00:00:00Z' },
   { tenantId: 'globex', name: 'Globex', status: 'active', plan: 'trial', quota: { reviewsPerMonth: 2 }, githubCredentialRef: 'env:GLOBEX_TEST_TOKEN', callerKeyRef: 'env:GLOBEX_TEST_CALLER_KEY', createdAt: '2026-08-13T00:00:00Z' }
 ];
 
@@ -202,7 +208,7 @@ async function testDryRunNeverCreatesIssue() {
   const octokit = makeFakeOctokit();
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { httpStatus, body } = await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('httpStatus is 200', httpStatus === 200);
@@ -225,7 +231,7 @@ async function testRateCapBlocksAtLimit() {
   const octokit = makeFakeOctokit({ issuesCreatedToday: todayIssues });
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: false, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('status is Skipped once at cap', body.status === 'Skipped');
@@ -240,7 +246,7 @@ async function testRateCapAllowsUnderLimit() {
   const octokit = makeFakeOctokit({ issuesCreatedToday: [] });
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: false, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('status is Success', body.status === 'Success');
@@ -257,7 +263,7 @@ async function testNoFindingsResponseCarriesDryRun() {
   const octokit = makeFakeOctokit();
   const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
   const { body } = await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('status is Skipped', body.status === 'Skipped');
@@ -274,7 +280,7 @@ async function testDecisionLogSkipsAlreadyDecidedCommit() {
   const octokit = makeFakeOctokit({ decisionLog, commitSha: 'abc123' });
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('AI was never called', fetchImpl.callCount() === 0);
@@ -290,7 +296,7 @@ async function testAiErrorDoesNotBlockRetry() {
   const octokit = makeFakeOctokit({ decisionLog, commitSha: 'abc123' });
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('AI was called (not skipped)', fetchImpl.callCount() === 1);
@@ -302,7 +308,7 @@ async function testDecisionLogWritesEntryOnNormalRun() {
   const octokit = makeFakeOctokit({ decisionLog: null, commitSha: 'abc123' }); // no log file yet
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   const writes = octokit.calls.createOrUpdateFileContents;
@@ -321,7 +327,7 @@ async function testReplayOfACreatedDecisionSurfacesIssueUrlAtTopLevel() {
   const octokit = makeFakeOctokit({ decisionLog, commitSha: 'abc123' });
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('AI was never called', fetchImpl.callCount() === 0);
@@ -337,7 +343,7 @@ async function testReplayWithoutAnIssueUrlOmitsTheField() {
   const octokit = makeFakeOctokit({ decisionLog, commitSha: 'abc123' });
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('no top-level issueUrl field', body.issueUrl === undefined);
@@ -374,7 +380,7 @@ async function testRegisteredSpokeResolvesItsOwnTenantCredential() {
   const factory = makeFakeOctokitFactory(octokit);
   const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
   await processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'acme-caller-key' },
     { octokitFactory: factory, fetchImpl, dryRunOverride: true, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
   check("resolved to acme's own token, not GLOBAL_GITHUB_TOKEN", factory.tokensUsed[0] === 'acme-secret-token');
@@ -389,7 +395,7 @@ async function testSuspendedTenantIsSkippedBeforeAnyGithubCall() {
   const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
   const suspendedTenants = TWO_TENANTS.map(t => t.tenantId === 'acme' ? { ...t, status: 'suspended' } : t);
   const { httpStatus, body } = await processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'acme-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: suspendedTenants }
   );
   check('httpStatus is 200 (a quiet skip, not an error)', httpStatus === 200);
@@ -408,7 +414,7 @@ async function testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackTo
   const factory = makeFakeOctokitFactory(octokit);
   const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
   const { httpStatus, body } = await processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'acme-caller-key' },
     { octokitFactory: factory, fetchImpl, dryRunOverride: true, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
   check('httpStatus is 200 (a quiet skip, not an error)', httpStatus === 200);
@@ -418,17 +424,70 @@ async function testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackTo
   delete process.env.GLOBAL_GITHUB_TOKEN;
 }
 
-async function testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured() {
-  console.log('Multi-tenancy: a tenant with no callerKeyRef set (acme) accepts any/no callerKey - backward compatible');
+async function testTenantWithNoCallerKeyRefIsRefused() {
+  console.log('Caller auth fails closed: a tenant with no callerKeyRef at all is refused with 401, not served');
   process.env.ACME_TEST_TOKEN = 'acme-secret-token';
   const octokit = makeFakeOctokit();
   const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
+  const noKeyTenants = TWO_TENANTS.map(t => {
+    if (t.tenantId !== 'acme') return t;
+    const { callerKeyRef, ...rest } = t;
+    return rest;
+  });
+  const { httpStatus, body } = await processRequest(
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'anything' },
+    { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: noKeyTenants }
+  );
+  check('httpStatus is 401', httpStatus === 401);
+  check('error names the missing callerKeyRef', /callerKeyRef/.test(body.error || ''));
+  check('no GitHub call ran', octokit.calls.getContent.length === 0);
+  check('the AI was never called', fetchImpl.callCount() === 0);
+  delete process.env.ACME_TEST_TOKEN;
+}
+
+async function testUnsetCallerKeySettingIsRefused() {
+  console.log('Caller auth fails closed: a callerKeyRef whose env var is unset is refused with 401 naming the setting');
+  process.env.GLOBEX_TEST_TOKEN = 'globex-secret-token';
+  delete process.env.GLOBEX_TEST_CALLER_KEY;
+  const octokit = makeFakeOctokit();
+  const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
+  for (const callerKey of [undefined, '', 'some-guess']) {
+    const { httpStatus, body } = await processRequest(
+      { owner: 'globex-org', repo: 'globex-repo', mode: 'debug', callerKey },
+      { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
+    );
+    check(`callerKey ${JSON.stringify(callerKey)}: httpStatus is 401`, httpStatus === 401);
+    check(`callerKey ${JSON.stringify(callerKey)}: error names GLOBEX_TEST_CALLER_KEY`, /GLOBEX_TEST_CALLER_KEY/.test(body.error || ''));
+  }
+  check('the AI was never called', fetchImpl.callCount() === 0);
+  delete process.env.GLOBEX_TEST_TOKEN;
+}
+
+async function testMissingCallerKeyIsRefused() {
+  console.log('Caller auth: a request with no callerKey for a tenant whose key is set is refused with 401');
+  process.env.GLOBEX_TEST_TOKEN = 'globex-secret-token';
+  process.env.GLOBEX_TEST_CALLER_KEY = 'globex-caller-key';
+  const octokit = makeFakeOctokit();
+  const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
   const { httpStatus } = await processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' }, // no callerKey field at all
+    { owner: 'globex-org', repo: 'globex-repo', mode: 'debug' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
-  check('request proceeds (200), no caller-key requirement for this tenant', httpStatus === 200);
-  delete process.env.ACME_TEST_TOKEN;
+  check('httpStatus is 401', httpStatus === 401);
+  check('the AI was never called', fetchImpl.callCount() === 0);
+  delete process.env.GLOBEX_TEST_TOKEN;
+  delete process.env.GLOBEX_TEST_CALLER_KEY;
+}
+
+function testSecretsEqual() {
+  console.log('secretsEqual: constant-time comparison matches only an identical non-empty string');
+  check('identical strings match', secretsEqual('abc123', 'abc123'));
+  check('a different string of the same length does not', !secretsEqual('abc124', 'abc123'));
+  check('a prefix does not', !secretsEqual('abc', 'abc123'));
+  check('a longer string does not', !secretsEqual('abc1234', 'abc123'));
+  check('undefined does not', !secretsEqual(undefined, 'abc123'));
+  check('empty against empty does not', !secretsEqual('', ''));
+  check('a non-string does not', !secretsEqual(123, '123'));
 }
 
 async function testCallerKeyRejectedWhenWrongForATenantThatRequiresOne() {
@@ -471,7 +530,7 @@ async function testUsageEventRecordedForTheCorrectTenantOnly() {
   const hubOctokit = makeFakeHubOctokit();
   const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
   await processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'acme-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), hubOctokit, fetchImpl, dryRunOverride: true, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
   check('exactly one usage write happened', hubOctokit._writes.length === 1);
@@ -536,7 +595,7 @@ async function testNullQuotaMeansUnlimited() {
   hubOctokit._logs.acme = Array.from({ length: 500 }, (_, i) => ({ tenantId: 'acme', timestamp: '2026-08-01T00:00:00Z', eventType: 'review_run' }));
   const fetchImpl = makeFakeFetch(NO_FINDING_JSON);
   const { body } = await processRequest(
-    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug' },
+    { owner: 'acme-org', repo: 'acme-repo', mode: 'debug', callerKey: 'acme-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), hubOctokit, fetchImpl, dryRunOverride: true, spokesOverride: TWO_TENANT_SPOKES, tenantsOverride: TWO_TENANTS }
   );
   check('the AI was still called despite 500 prior events - null quota is unlimited', fetchImpl.callCount() === 1);
@@ -558,7 +617,7 @@ async function testDiffOrdersCodeFilesBeforeDocFilesWhenBothCantFit() {
   const octokit = makeFakeOctokit({ diffFiles });
   const fetchImpl = makeFakeFetchCapturing(NO_FINDING_JSON);
   await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   const prompt = fetchImpl.lastPrompt();
@@ -576,7 +635,7 @@ async function testDiffCapsAnySingleFileSoItCannotStarveTheRest() {
   const octokit = makeFakeOctokit({ diffFiles });
   const fetchImpl = makeFakeFetchCapturing(NO_FINDING_JSON);
   await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   const prompt = fetchImpl.lastPrompt();
@@ -598,7 +657,7 @@ async function testDiffNotesOmittedFilesWhenTheyDontFit() {
   const octokit = makeFakeOctokit({ diffFiles });
   const fetchImpl = makeFakeFetchCapturing(NO_FINDING_JSON);
   await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   const prompt = fetchImpl.lastPrompt();
@@ -614,7 +673,7 @@ async function testBotAuthoredCommitIsSkippedBeforeTheAiCall() {
   const octokit = makeFakeOctokit({ commitAuthorLogin: 'github-actions[bot]' });
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('AI was never called', fetchImpl.callCount() === 0);
@@ -631,7 +690,7 @@ async function testHumanCommitTouchingOnlyExportsPathIsSkipped() {
   const octokit = makeFakeOctokit({ diffFiles }); // no bot author set - a human pushed this
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { body } = await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('AI was never called', fetchImpl.callCount() === 0);
@@ -647,7 +706,7 @@ async function testNormalCommitFromABotIsNotSkippedIfPathsArentExcluded() {
   const octokit = makeFakeOctokit({ diffFiles }); // human author, mixed paths - NOT all excluded
   const fetchImpl = makeFakeFetch(FINDING_JSON);
   const { httpStatus } = await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   check('AI was still called - not every file matched the excluded prefix', fetchImpl.callCount() === 1);
@@ -659,7 +718,7 @@ async function testLocalContextSurvivesWhenOnlyOneFileIsMissing() {
   const octokit = makeFakeOctokit({ missingLocalFiles: ['NORTH_STAR.md'] });
   const fetchImpl = makeFakeFetchCapturing(NO_FINDING_JSON);
   await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   const prompt = fetchImpl.lastPrompt();
@@ -673,7 +732,7 @@ async function testLocalContextIsTheNoneFoundFallbackWhenBothFilesAreMissing() {
   const octokit = makeFakeOctokit({ missingLocalFiles: ['lessons.md', 'NORTH_STAR.md'] });
   const fetchImpl = makeFakeFetchCapturing(NO_FINDING_JSON);
   await processRequest(
-    { owner: 'o', repo: 'r', mode: 'debug' },
+    { owner: 'o', repo: 'r', mode: 'debug', callerKey: 'generic-caller-key' },
     { octokitFactory: makeFakeOctokitFactory(octokit), fetchImpl, dryRunOverride: true, spokesOverride: GENERIC_SPOKE, tenantsOverride: GENERIC_TENANT }
   );
   const prompt = fetchImpl.lastPrompt();
@@ -694,7 +753,10 @@ async function main() {
   await testRegisteredSpokeResolvesItsOwnTenantCredential();
   await testSuspendedTenantIsSkippedBeforeAnyGithubCall();
   await testTenantWithUnresolvableCredentialIsHardSkippedNeverFallsBackToGlobalToken();
-  await testCallerKeyEnforcedOnlyWhenTenantHasOneConfigured();
+  await testTenantWithNoCallerKeyRefIsRefused();
+  await testUnsetCallerKeySettingIsRefused();
+  await testMissingCallerKeyIsRefused();
+  testSecretsEqual();
   await testCallerKeyRejectedWhenWrongForATenantThatRequiresOne();
   await testCallerKeyAcceptedWhenCorrect();
   await testUsageEventRecordedForTheCorrectTenantOnly();

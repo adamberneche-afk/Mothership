@@ -2,10 +2,13 @@
 # workflow still pointing at the retired Vercel URL; gas/recursive-learning.
 # apps-script.example.yml is the template it was brought over from.
 #
-# NOTE: ?endpoint=recursive_learning has no caller-key check on the hub side
-# (only ?endpoint=autonomous_agent does), so no TENANT_CALLER_KEY is sent
-# here. Sending one the hub ignores would imply an authentication that is
-# not happening.
+# ?endpoint=recursive_learning is operator-only: the hub refuses it (401)
+# unless the POST body carries `adminToken` equal to the hub's
+# ADMIN_SETTINGS_TOKEN Script Property - the same token and the same check
+# as ?endpoint=install-triggers (gas/settings.js, requireAdminToken_). It
+# reads this repo's ADMIN_SETTINGS_TOKEN secret, the one
+# deploy-apps-script.yml already uses. jq builds the body so the token is
+# never spliced into JSON or the command line by hand.
 name: Recursive Learning
 
 on:
@@ -20,7 +23,9 @@ jobs:
       - name: Ping Hub for cross-spoke aggregation
         env:
           APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          ADMIN_SETTINGS_TOKEN: ${{ secrets.ADMIN_SETTINGS_TOKEN }}
         run: |
-          curl --fail-with-body -sS -X POST "${APPS_SCRIPT_URL}?endpoint=recursive_learning" \
-            -H "Content-Type: application/json" \
-            -d '{}'
+          jq -n --arg t "$ADMIN_SETTINGS_TOKEN" '{adminToken: $t}' \
+            | curl --fail-with-body -sS -X POST "${APPS_SCRIPT_URL}?endpoint=recursive_learning" \
+                -H "Content-Type: application/json" \
+                --data-binary @-
