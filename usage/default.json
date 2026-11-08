@@ -1121,5 +1121,13 @@
     "mode": "refactor",
     "owner": "adamberneche-afk",
     "repo": "kos"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-11-08T00:28:40.184Z",
+    "eventType": "review_run",
+    "mode": "refactor",
+    "owner": "adamberneche-afk",
+    "repo": "argoloth"
   }
 ]
