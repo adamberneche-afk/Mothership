@@ -1745,5 +1745,13 @@
     "mode": "hunt",
     "owner": "adamberneche-afk",
     "repo": "thinkos-server"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-11-11T13:03:48.143Z",
+    "eventType": "review_run",
+    "mode": "hunt",
+    "owner": "adamberneche-afk",
+    "repo": "kos"
   }
 ]
