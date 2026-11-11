@@ -57,7 +57,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # This CD pipeline needs real, operator-provisioned infrastructure
       # (a live Apps Script project, two existing deployments, a clasp
