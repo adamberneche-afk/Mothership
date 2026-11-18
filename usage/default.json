@@ -2673,5 +2673,13 @@
     "mode": "hunt",
     "owner": "adamberneche-afk",
     "repo": "kos"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-11-18T13:03:52.218Z",
+    "eventType": "review_run",
+    "mode": "hunt",
+    "owner": "adamberneche-afk",
+    "repo": "argoloth"
   }
 ]
