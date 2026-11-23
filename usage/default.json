@@ -3457,5 +3457,13 @@
     "mode": "debug",
     "owner": "adamberneche-afk",
     "repo": "tso"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-11-23T06:28:35.210Z",
+    "eventType": "review_run",
+    "mode": "debug",
+    "owner": "adamberneche-afk",
+    "repo": "thinkos-server"
   }
 ]
