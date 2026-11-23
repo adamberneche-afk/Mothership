@@ -702,5 +702,13 @@
     "outcome": "no_findings",
     "issueUrl": null,
     "summary": null
+  },
+  {
+    "timestamp": "2026-11-23T06:28:44.576Z",
+    "mode": "debug",
+    "commitSha": "cb8a42e4eb5308a41e5ff5bcefca5f6981ac6a5a",
+    "outcome": "no_findings",
+    "issueUrl": null,
+    "summary": null
   }
 ]
