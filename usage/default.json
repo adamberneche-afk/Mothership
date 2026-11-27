@@ -4145,5 +4145,13 @@
     "mode": "debug",
     "owner": "adamberneche-afk",
     "repo": "kos"
+  },
+  {
+    "tenantId": "default",
+    "timestamp": "2026-11-27T06:28:41.341Z",
+    "eventType": "review_run",
+    "mode": "debug",
+    "owner": "adamberneche-afk",
+    "repo": "argoloth"
   }
 ]
